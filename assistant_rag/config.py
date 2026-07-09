@@ -26,12 +26,21 @@ class RetrievalConfig:
     conversation_min_confidence: float
     knowledge_min_confidence: float
     max_results: int
+    bm25_top_k: int = 30
+    chroma_top_k: int = 30
+    min_confidence: float = 0.25
     rrf_k: int = 60
     lexical_weight: float = 1.0
     semantic_weight: float = 1.0
     rerank_candidate_limit: int = 32
     general_response_reminder_limit: int = 5
     general_response_reminder_statuses: tuple[str, ...] = ("scheduled", "notified")
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.conversation_min_confidence <= 1):
+            raise ValueError("conversation_min_confidence must be between 0 and 1")
+        if not (0 <= self.knowledge_min_confidence <= 1):
+            raise ValueError("knowledge_min_confidence must be between 0 and 1")
 
 
 @dataclass(frozen=True)
@@ -83,6 +92,14 @@ class MutationPolicyConfig:
     knowledge_not_found_policy: TargetNotFoundPolicy = TargetNotFoundPolicy.SKIP_NOT_FOUND
     unsupported_action_policy: UnsupportedActionPolicy = UnsupportedActionPolicy.REJECT_AND_SKIP
 
+    def __post_init__(self) -> None:
+        if not (0 <= self.knowledge_relevance_threshold <= 1):
+            raise ValueError("knowledge_relevance_threshold must be between 0 and 1")
+        if not (0 <= self.knowledge_ambiguity_margin <= 1):
+            raise ValueError("knowledge_ambiguity_margin must be between 0 and 1")
+        if not isinstance(self.partial_execution_policy, MutationPartialExecutionPolicy):
+            raise ValueError("partial_execution_policy must be a valid MutationPartialExecutionPolicy")
+
 
 @dataclass(frozen=True)
 class ReminderTargetResolverConfig:
@@ -113,6 +130,17 @@ class ReminderTargetResolverConfig:
     allowed_reminder_delete_statuses: tuple[str, ...]
     reminder_delete_status_policy: str
 
+    def __post_init__(self) -> None:
+        if not (0 <= self.reminder_target_relevance_threshold <= 1):
+            raise ValueError("reminder_target_relevance_threshold must be between 0 and 1")
+        if not (0 <= self.reminder_target_ambiguity_margin <= 1):
+            raise ValueError("reminder_target_ambiguity_margin must be between 0 and 1")
+        valid_statuses = {"scheduled", "notified", "cancelled", "dismissed"}
+        for status_list in [self.allowed_reminder_modify_statuses, self.allowed_reminder_turn_on_statuses, self.allowed_reminder_turn_off_statuses, self.allowed_reminder_delete_statuses]:
+            for status in status_list:
+                if status not in valid_statuses:
+                    raise ValueError(f"Invalid reminder status: {status}")
+
 
 @dataclass(frozen=True)
 class RetrievalValidationConfig:
@@ -131,10 +159,17 @@ class RetrievalValidationConfig:
 
     destructive_action_requires_unambiguous_target: bool
 
+    def __post_init__(self) -> None:
+        if not (0 <= self.knowledge_llm_validation_min_confidence <= 1):
+            raise ValueError("knowledge_llm_validation_min_confidence must be between 0 and 1")
+        if not (0 <= self.reminder_llm_validation_min_confidence <= 1):
+            raise ValueError("reminder_llm_validation_min_confidence must be between 0 and 1")
+
 
 @dataclass(frozen=True)
 class LastQAConfig:
     min_confidence: float = 0.4
+    skip_broad_retrieval_min_confidence: float = 0.85
     clarification_merge_min_confidence: float = 0.7
     skip_allowed_interaction_types: tuple[str, ...] = (
         "normal_follow_up",
@@ -150,6 +185,125 @@ class LastQAConfig:
 
 
 @dataclass(frozen=True)
+class ContextFilterConfig:
+    conversation_min_confidence: float = 0.10
+    conversation_approved_max_items: int = 8
+    conversation_duplicate_threshold: float = 0.92
+    knowledge_approved_max_items: int = 6
+    knowledge_duplicate_threshold: float = 0.95
+    low_information_text_patterns: tuple[str, ...] = (
+        "done", "saved", "updated successfully", "ok", "noted", "sure"
+    )
+    reminder_approved_max_items: int = 5
+    semantic_context_judge_enabled: bool = False
+    semantic_context_judge_failure_policy: str = "use_hard_rule_approved"
+    context_filter_debug_diagnostics_enabled: bool = False
+    low_information_min_chars: int = 10
+    conversation_retrieval_after_last_qa_enabled: bool = True
+    conversation_retrieval_before_intent_enabled: bool = True
+    expected_response_type_required: bool = True
+    expected_response_type_fallback_policy: str = "unknown"
+    clarification_expected_response_type_required: bool = True
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.conversation_min_confidence <= 1):
+            raise ValueError("conversation_min_confidence must be between 0 and 1")
+        if not (0 <= self.conversation_duplicate_threshold <= 1):
+            raise ValueError("conversation_duplicate_threshold must be between 0 and 1")
+        if not (0 <= self.knowledge_duplicate_threshold <= 1):
+            raise ValueError("knowledge_duplicate_threshold must be between 0 and 1")
+        if self.expected_response_type_fallback_policy not in {"unknown", "reject"}:
+            raise ValueError("expected_response_type_fallback_policy must be 'unknown' or 'reject'")
+
+
+_ALLOWED_PERSISTENCE_POLICIES = frozenset({"sub_branch_driven"})
+
+@dataclass(frozen=True)
+class GeneralPurposeConfig:
+    # Sub-branch detector
+    general_sub_branch_detector_enabled: bool = True
+    general_sub_branch_confidence_threshold: float = 0.55
+    general_sub_branch_fallback_mode: str = "new_conversation_topic"
+    general_sub_branch_detector_json_retry_count: int = 2
+
+    # Content composer
+    content_composer_enabled: bool = True
+    content_composer_max_iterations: int = 3
+    content_composer_tool_timeout_seconds: float = 60.0
+    content_composer_allowed_tools: tuple[str, ...] = (
+        "answer_generation",
+        "generate_excel",
+        "generate_pdf",
+        "generate_pptx",
+    )
+    content_composer_default_tool: str = "answer_generation"
+    content_composer_fallback_tool: str = "answer_generation"
+    content_composer_react_enabled: bool = True
+    content_composer_short_circuit_single_tool: bool = True
+    content_composer_debug_trace_enabled: bool = False
+
+    # config-driven keyword signals
+    excel_tool_signal_keywords: tuple[str, ...] = (
+        "excel", "spreadsheet", "workbook", "xlsx", "data table",
+        "tracker", "kpi dashboard", "financial model", "data grid",
+        "rows and columns",
+    )
+    pdf_tool_signal_keywords: tuple[str, ...] = (
+        "pdf", "report", "formal document", "business report", "proposal",
+        "memo", "white paper", "executive summary", "structured document",
+    )
+    pptx_tool_signal_keywords: tuple[str, ...] = (
+        "powerpoint", "pptx", "presentation", "slide deck", "slides",
+        "pitch deck", "slideshow", "deck", "make slides",
+    )
+
+    # HITL
+    hitl_supporting_question_enabled: bool = True
+    hitl_supporting_question_confidence_threshold: float = 0.65
+    hitl_supporting_question_recent_question_window: int = 3
+    hitl_supporting_question_max_length: int = 200
+    hitl_supporting_question_safety_mode: str = "standard"
+
+    # Persistence
+    general_response_persistence_policy: str = "sub_branch_driven"
+    sub_branch_prompt_mode: str = "sub_branch_driven"
+    general_response_default_topic_title: str = "General Conversation"
+
+    documents_dir: str | None = None
+    artifact_storage_dir: str = "assistant_data/artifacts"
+    artifact_download_base_url: str = "/artifacts"
+
+    def __post_init__(self) -> None:
+        if not (0.0 <= self.general_sub_branch_confidence_threshold <= 1.0):
+            raise ValueError("general_sub_branch_confidence_threshold must be in [0.0, 1.0]")
+        if self.content_composer_max_iterations < 1:
+            raise ValueError("content_composer_max_iterations must be >= 1")
+        if self.content_composer_tool_timeout_seconds <= 0:
+            raise ValueError("content_composer_tool_timeout_seconds must be > 0")
+        if self.content_composer_default_tool not in self.content_composer_allowed_tools:
+            raise ValueError(
+                f"content_composer_default_tool '{self.content_composer_default_tool}' "
+                f"must be in content_composer_allowed_tools"
+            )
+        if self.content_composer_fallback_tool not in self.content_composer_allowed_tools:
+            raise ValueError(
+                f"content_composer_fallback_tool '{self.content_composer_fallback_tool}' "
+                f"must be in content_composer_allowed_tools"
+            )
+        if not (0.0 <= self.hitl_supporting_question_confidence_threshold <= 1.0):
+            raise ValueError("hitl_supporting_question_confidence_threshold must be in [0.0, 1.0]")
+        if self.hitl_supporting_question_recent_question_window < 0:
+            raise ValueError("hitl_supporting_question_recent_question_window must be >= 0")
+        if self.hitl_supporting_question_max_length <= 0:
+            raise ValueError("hitl_supporting_question_max_length must be > 0")
+        if self.general_response_persistence_policy not in _ALLOWED_PERSISTENCE_POLICIES:
+            raise ValueError(
+                f"general_response_persistence_policy must be one of "
+                f"{sorted(_ALLOWED_PERSISTENCE_POLICIES)}"
+            )
+
+
+@dataclass(frozen=True)
 class AssistantConfig:
     retrieval: RetrievalConfig
     outbox: OutboxConfig
@@ -160,7 +314,14 @@ class AssistantConfig:
     mutation_policy: MutationPolicyConfig = field(default_factory=MutationPolicyConfig)
     question_generation: QuestionGenerationConfig = field(default_factory=QuestionGenerationConfig)
     last_qa: LastQAConfig = field(default_factory=LastQAConfig)
+    context_filter: ContextFilterConfig = field(default_factory=ContextFilterConfig)
+    general_purpose: GeneralPurposeConfig = field(default_factory=GeneralPurposeConfig)
     platform_channels: tuple[str, ...] = field(default_factory=tuple)
+    default_timezone: str = "UTC"
+    reminder_duplicate_similarity_threshold: float = 0.65
+    reminder_duplicate_time_window_minutes: int = 30
+    confirmation_expiry_minutes: int = 15
+    confirmation_high_confidence_threshold: float = 0.90
     response_type_intent_mapping: dict[ResponseType, Intent] = field(
         default_factory=lambda: dict(RESPONSE_TYPE_INTENT_MAPPING)
     )

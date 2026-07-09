@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 from typing import Any
 
 from .config import ClassificationConfig, LastQAConfig
@@ -13,6 +14,12 @@ from .contracts import (
 )
 from .llm import LLMClient, LLMTask, validate_json_schema
 from .prompts import DEFAULT_PROMPT_REGISTRY, PromptContext, PromptRegistry
+
+logger = logging.getLogger(__name__)
+
+
+def _log_llm_fallback(stage: str, exc: Exception) -> None:
+    logger.debug("%s LLM fallback engaged: %s", stage, exc)
 
 
 
@@ -35,11 +42,8 @@ class LLMQueryRewriter:
             "type": "object",
             "properties": {
                 "rewritten_query": {"type": "string"},
-                "confidence": {"type": "number"},
-                "missing_context": {"type": "array", "items": {"type": "string"}},
-                "reason_summary": {"type": "string"},
             },
-            "required": ["rewritten_query", "confidence", "missing_context", "reason_summary"],
+            "required": ["rewritten_query"],
         }
         try:
             payload = self.llm.generate_json(
@@ -52,7 +56,7 @@ class LLMQueryRewriter:
             )
             validate_json_schema(payload, schema)
         except Exception as e:
-            print('EXCEPTION:', e)
+            _log_llm_fallback("Query rewrite", e)
             return normalized
         rewritten = str(payload.get("rewritten_query") or normalized).strip()
         return rewritten or normalized
@@ -88,12 +92,11 @@ def can_skip_broad_retrieval(
     payload: dict[str, Any], state: LastQAState, interaction_type: LastQAInteractionType, config: LastQAConfig, request: ChatRequest
 ) -> bool:
     confidence = float(payload.get("confidence", 0.0))
-    if confidence < config.min_confidence:
+    if confidence < config.skip_broad_retrieval_min_confidence:
         return False
     if not payload.get("llm_suggested_skip_broad_retrieval") and not payload.get("skip_broad_retrieval"):
         return False
-    if payload.get("missing_context"):
-        return False
+        
         
     if interaction_type not in config.skip_allowed_interaction_types:
         return False
@@ -101,7 +104,7 @@ def can_skip_broad_retrieval(
     if interaction_type == LastQAInteractionType.NORMAL_FOLLOW_UP:
         return bool(state.linked_topic_id and state.linked_hop_id and state.last_response)
         
-    if interaction_type == LastQAInteractionType.HUMAN_SUPPORTING_QUESTION_ANSWER:
+    if interaction_type == LastQAInteractionType.SUPPORTING_QUESTION_ANSWER:
         return bool(state.linked_topic_id and state.linked_hop_id and state.last_response and payload.get("matched_question"))
         
     if interaction_type == LastQAInteractionType.REMINDER_NOTIFICATION_REPLY:
@@ -163,7 +166,7 @@ class LastQAResolver:
                     did_merge_query=False,
                     skip_broad_retrieval=skip, 
                     path=LastQAPath.LATEST_CONTEXT_INTERACTION if skip else LastQAPath.BROAD_RETRIEVAL_REQUIRED,
-                    interaction_type=LastQAInteractionType.HUMAN_SUPPORTING_QUESTION_ANSWER if skip else None,
+                    interaction_type=LastQAInteractionType.SUPPORTING_QUESTION_ANSWER if skip else None,
                     question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION if skip else QuestionSource.NONE,
                     linked_topic_id=state.linked_topic_id if skip else None,
                     linked_hop_id=state.linked_hop_id if skip else None,
@@ -236,7 +239,7 @@ class LLMLastQAResolver:
                 
             return payload
         except Exception as e:
-            print('EXCEPTION:', e)
+            _log_llm_fallback("Clarification merge", e)
             return None
 
     def resolve(
@@ -311,30 +314,8 @@ class LLMLastQAResolver:
             return res
 
         if state.response_type in (ResponseType.NORMAL, ResponseType.KNOWLEDGE_ACTION, ResponseType.REMINDER_ACTION, ResponseType.REMINDER_REPLY, ResponseType.ERROR):
-            schema = {
-                "type": "object",
-                "properties": {
-                    "interaction_detected": {"type": "boolean"},
-                    "interaction_type": {"type": "string"},
-                    "question_source": {"type": "string"},
-                    "matched_question": {"type": "string"},
-                    "confidence": {"type": "number"},
-                    "missing_context": {"type": "array", "items": {"type": "string"}},
-                    "llm_suggested_skip_broad_retrieval": {"type": "boolean"},
-                    "reason_summary": {"type": "string"},
-                },
-                "required": [
-                    "interaction_detected",
-                    "interaction_type",
-                    "question_source",
-                    "confidence",
-                    "missing_context",
-                    "llm_suggested_skip_broad_retrieval",
-                    "reason_summary",
-                ],
-            }
             try:
-                payload = self.llm.generate_json(
+                payload_str = self.llm.chat(
                     task=LLMTask.LAST_QA,
                     system_prompt=self.prompt_registry.system("last_qa"),
                     user_prompt=self.prompt_registry.user(
@@ -347,24 +328,32 @@ class LLMLastQAResolver:
                             platform_context=request.platform_context,
                             extra={"last_qa_state": state.__dict__},
                         )
-                    ),
-                    schema=schema,
+                    )
                 )
-                validate_json_schema(payload, schema)
                 
+                parts = [p.strip() for p in payload_str.split("|")]
+                if len(parts) >= 3:
+                    it_str = parts[0].strip("`\"'")
+                    skip_str = parts[1].strip("`\"'").lower()
+                    conf_str = parts[2].strip("`\"'")
+                    
+                    payload = {
+                        "interaction_type": it_str,
+                        "llm_suggested_skip_broad_retrieval": skip_str == "true",
+                        "confidence": float(conf_str) if conf_str.replace('.', '', 1).isdigit() else 0.0,
+                    }
+                else:
+                    payload = {}
+
                 it_str = payload.get("interaction_type")
-                qs_str = payload.get("question_source")
                 try:
                     interaction_type = LastQAInteractionType(it_str) if it_str else None
                 except ValueError:
                     interaction_type = None
-                    
-                try:
-                    question_source = QuestionSource(qs_str) if qs_str else QuestionSource.NONE
-                except ValueError:
-                    question_source = QuestionSource.NONE
 
-                if payload.get("interaction_detected") and interaction_type and float(payload.get("confidence", 0.0)) >= self.config.min_confidence:
+                interaction_detected = interaction_type is not None and interaction_type != LastQAInteractionType.UNRELATED
+                
+                if interaction_detected and interaction_type and float(payload.get("confidence", 0.0)) >= self.config.min_confidence:                    
                     skip = can_skip_broad_retrieval(payload, state, interaction_type, self.config, request)
                     
                     if skip:
@@ -373,20 +362,18 @@ class LLMLastQAResolver:
                         res = LastQAResolution(
                             path=LastQAPath.LATEST_CONTEXT_INTERACTION,
                             interaction_type=interaction_type,
-                            question_source=question_source,
                             rewritten_query=rewritten_query,
                             state=state,
                             did_merge_query=False,
                             skip_broad_retrieval=True,
                             linked_topic_id=state.linked_topic_id,
                             linked_hop_id=state.linked_hop_id,
-                            matched_question=payload.get("matched_question"),
                             reminder_id=md.get("reminder_id") or pc.get("reminder_id"),
                             notification_id=md.get("notification_id") or pc.get("notification_id"),
                             source_topic_id=md.get("source_topic_id") or pc.get("source_topic_id"),
                             source_hop_id=md.get("source_hop_id") or pc.get("source_hop_id"),
                             is_authoritative_state=True,
-                            missing_context=payload.get("missing_context", []),
+                            missing_context=[],
                             merge_reason="case_3_never_merges",
                             skip_reason="strong_latest_context_match_and_guard_passed"
                         )
@@ -406,7 +393,7 @@ class LLMLastQAResolver:
                         validate_last_qa_resolution(res)
                         return res
             except Exception as e:
-                print('EXCEPTION:', e)
+                _log_llm_fallback("Last-QA resolver", e)
                 res = LastQAResolution(
                     path=LastQAPath.BROAD_RETRIEVAL_REQUIRED,
                     rewritten_query=rewritten_query,
@@ -436,11 +423,95 @@ class LLMLastQAResolver:
 
 
 
-class IntentClassifier:
+from .contracts import ApprovedConversationContext
+
+class IntentClassifierProtocol:
+    def classify(
+        self, 
+        request: ChatRequest, 
+        rewritten_query: str, 
+        last_qa_resolution: LastQAResolution | None = None,
+        approved_conversation_context: ApprovedConversationContext | None = None
+    ) -> Intent:
+        ...
+
+@dataclass
+class LLMIntentClassifier(IntentClassifierProtocol):
+    llm: LLMClient
+    config: ClassificationConfig
+    prompt_registry: PromptRegistry = field(default_factory=lambda: DEFAULT_PROMPT_REGISTRY)
+
+    def classify(
+        self, 
+        request: ChatRequest, 
+        rewritten_query: str, 
+        last_qa_resolution: LastQAResolution | None = None,
+        approved_conversation_context: ApprovedConversationContext | None = None
+    ) -> Intent:
+        explicit_intent = request.metadata.get("intent")
+        if explicit_intent:
+            try:
+                return Intent(explicit_intent)
+            except ValueError:
+                pass
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "intent": {"type": "string", "enum": [e.value for e in Intent]},
+                "confidence": {"type": "number"},
+                "reason_summary": {"type": "string"},
+            },
+            "required": ["intent", "confidence", "reason_summary"],
+        }
+        
+        # Build context representing the retrieval precedence rule
+        conversation_status = approved_conversation_context.conversation_context_status if approved_conversation_context else "not_run"
+        context_extra = {
+            "conversation_context_status": conversation_status,
+            "has_approved_conversation": bool(approved_conversation_context and approved_conversation_context.approved_conversation_history),
+            "last_qa_path": last_qa_resolution.path.value if last_qa_resolution else "unknown",
+            "extracted_expected_response_types": [e.value for e in approved_conversation_context.extracted_expected_response_types] if approved_conversation_context else [],
+        }
+
+        try:
+            payload = self.llm.generate_json(
+                task=LLMTask.INTENT_CLASSIFICATION,
+                system_prompt=self.prompt_registry.system("intent_classifier"),
+                user_prompt=self.prompt_registry.user(
+                    PromptContext(
+                        stage="intent_classifier",
+                        user_id=request.user_id,
+                        raw_query=request.raw_query,
+                        rewritten_query=rewritten_query,
+                        metadata=request.metadata,
+                        platform_context=request.platform_context,
+                        extra=context_extra,
+                    )
+                ),
+                schema=schema,
+            )
+            validate_json_schema(payload, schema)
+            
+            intent_str = payload.get("intent")
+            if intent_str and float(payload.get("confidence", 0.0)) >= self.config.min_confidence:
+                return Intent(intent_str)
+        except Exception as e:
+            _log_llm_fallback("Intent classifier", e)
+
+        return Intent.GENERAL_RESPONSE
+
+class KeywordIntentClassifier(IntentClassifierProtocol):
     def __init__(self, config: ClassificationConfig) -> None:
         self.config = config
 
-    def classify(self, request: ChatRequest, rewritten_query: str) -> Intent:
+    def classify(
+        self, 
+        request: ChatRequest, 
+        rewritten_query: str, 
+        last_qa_resolution: LastQAResolution | None = None,
+        approved_conversation_context: ApprovedConversationContext | None = None
+    ) -> Intent:
         explicit_intent = request.metadata.get("intent")
         if explicit_intent:
             return Intent(explicit_intent)
@@ -449,3 +520,6 @@ class IntentClassifier:
             if any(keyword.casefold() in query for keyword in keywords):
                 return Intent(intent_name)
         return Intent.GENERAL_RESPONSE
+
+# Expose IntentClassifier as the base protocol for type hints
+IntentClassifier = IntentClassifierProtocol

@@ -205,7 +205,10 @@ class LLMActionDetector:
                     "items": {
                         "type": "object",
                         "properties": {
-                            "action": {"type": "string"},
+                            "action": {
+                                "type": "string",
+                                "enum": ["add", "delete", "modify"]
+                            },
                             "topic_title": {"type": "string"},
                             "text": {"type": "string"},
                             "target_description": {"type": "string"},
@@ -223,7 +226,10 @@ class LLMActionDetector:
                     "items": {
                         "type": "object",
                         "properties": {
-                            "action": {"type": "string"},
+                            "action": {
+                                "type": "string",
+                                "enum": ["add", "delete", "modify", "turn_on", "turn_off"]
+                            },
                             "subject": {"type": "string"},
                             "reminder_time": {"type": "string"},
                             "raw_reminder": {"type": "string"},

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
-import os
-import shlex
-from typing import Any, Iterable
+import sys
+from typing import Any, Callable
 
-from assistant_rag.bm25_opensearch import OpenSearchBM25Index
-from assistant_rag.autoscan import ReminderAutoscan
-from assistant_rag.action_detection import LLMActionDetector
-from assistant_rag.context_filter import HardRuleContextFilter, TwoLayerContextFilter
+from assistant_rag.branch_orchestration import (
+    KnowledgeTargetResolver,
+    ReminderTargetResolver,
+    ValidatedActionBuilder,
+)
 from assistant_rag.branches import (
     BranchRouter,
     ClarificationBranch,
@@ -18,664 +19,1355 @@ from assistant_rag.branches import (
     KnowledgeFactsBranch,
     ReminderBranch,
 )
-from assistant_rag.generation import LLMHumanInTheLoopStrategy, LLMClarificationStrategy, LLMReminderSupportingStrategy
-from assistant_rag.branch_orchestration import KnowledgeTargetResolver, ReminderTargetResolver, ValidatedActionBuilder
-from assistant_rag.retrieval_validation import KnowledgeRetrievalValidationStrategy, ReminderRetrievalValidationStrategy
 from assistant_rag.bundler import ChatOutput, ResponseBundler
-from assistant_rag.classification import LLMLastQAResolver, LLMQueryRewriter
-from assistant_rag.config import (
-    AssistantConfig,
-    AutoscanConfig,
-    ClassificationConfig,
-    OutboxConfig,
-    RetrievalConfig,
-    MutationPolicyConfig,
-    QuestionGenerationConfig,
-    LastQAConfig,
-)
+from assistant_rag.classification import LastQAResolver, QueryRewriter
+from assistant_rag.config import GeneralPurposeConfig
+from assistant_rag.context_filter import HardRuleContextFilter, TwoLayerContextFilter
+from assistant_rag.content_composer import AnswerGenerationTool, ContentToolRegistry, ReActContentComposer
 from assistant_rag.contracts import (
-    BranchResult,
+    ActionValidationResult,
     BundledResponse,
     ChatRequest,
+    ExpectedResponseType,
+    GeneratedQuestion,
     Intent,
-    PipelineContext,
+    LastQAState,
+    QuestionSource,
+    ResponseType,
     RetrievalResult,
 )
-from assistant_rag.chroma_index import ChromaPersistentVectorIndex
-from assistant_rag.database import SQLRepository
-from assistant_rag.embeddings import HashEmbeddingClient
-from assistant_rag.indexing import BackgroundIndexer
+from assistant_rag.database import SQLiteRepository, now_iso
 from assistant_rag.last_qa import InMemoryLastQAStore
-from assistant_rag.llm import LLMTask, OllamaIntentClassifier, OllamaLLMClient, OllamaModelRouter
-from assistant_rag.pipeline import AssistantPipeline
+from assistant_rag.llm import LLMTask, OllamaModelRouter
+from assistant_rag.observability import current_trace, new_request_id, start_trace
 from assistant_rag.platform import PlatformSelector
+from assistant_rag.production_factory import (
+    build_assistant_config,
+    build_production_pipeline,
+    build_production_repository,
+)
 from assistant_rag.prompts import DEFAULT_PROMPT_REGISTRY
-from assistant_rag.retrieval import HybridRetriever
-from assistant_rag.settings import ChromaSettings, OpenSearchSettings, ProductionSettings
+from assistant_rag.settings import ProductionSettings
 
 
-class DebugReranker:
-    def rerank(self, query: str, results: Iterable[RetrievalResult]) -> list[RetrievalResult]:
-        return sorted(results, key=lambda item: item.rerank_score, reverse=True)
+DEBUG_USER = "debug-user"
+
+
+def _debug_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def _debug_trace_lines(trace_summary: Any | None) -> list[str]:
+    if trace_summary is None:
+        return ["Debug trace: unavailable"]
+
+    lines = [
+        "Debug trace:",
+        f"  request_id: {trace_summary.request_id}",
+        f"  total_latency_ms: {trace_summary.total_latency_ms}",
+    ]
+    if not trace_summary.stages:
+        lines.append("  stages: none recorded")
+        return lines
+
+    lines.append("  stages:")
+    for index, stage in enumerate(trace_summary.stages, start=1):
+        lines.append(
+            f"    {index:02d}. {stage.stage} | {stage.latency_ms} ms"
+        )
+        if stage.metadata:
+            meta_copy = dict(stage.metadata)
+            operations = meta_copy.pop("operations", None)
+            if meta_copy:
+                lines.append("      metadata:")
+                try:
+                    formatted = json.dumps(meta_copy, indent=2, default=str)
+                    for line in formatted.splitlines():
+                        lines.append(f"        {line}")
+                except Exception as e:
+                    lines.append(f"        {meta_copy}")
+            if operations:
+                for op in operations:
+                    op_name = op.get("operation", "unknown")
+                    op_lat = op.get("latency_ms", 0.0)
+                    lines.append(f"      - {op_name} | {op_lat} ms")
+                    op_meta = {k: v for k, v in op.items() if k not in ("operation", "latency_ms")}
+                    if op_meta:
+                        try:
+                            formatted = json.dumps(op_meta, indent=2, default=str)
+                            for line in formatted.splitlines():
+                                if line.strip() not in ("{", "}"):
+                                    lines.append(f"          {line.strip()}")
+                        except Exception:
+                            lines.append(f"          {op_meta}")
+    return lines
+
+
+def _debug_response_lines(response: BundledResponse) -> list[str]:
+    lines = [
+        "Debug response:",
+        f"  response_type: {response.response_type.value}",
+        f"  conversation_topic_id: {response.conversation_topic_id or 'none'}",
+        f"  conversation_hop_id: {response.conversation_hop_id or 'none'}",
+    ]
+    
+    def _add_json_field(name: str, value: Any) -> None:
+        if not value:
+            lines.append(f"  {name}: {value}")
+            return
+        lines.append(f"  {name}:")
+        try:
+            formatted = json.dumps(value, indent=2, default=str)
+            for line in formatted.splitlines():
+                lines.append(f"    {line}")
+        except Exception:
+            lines.append(f"    {value}")
+
+    _add_json_field("warnings", response.warnings)
+    _add_json_field("actions_committed", response.actions_committed)
+    _add_json_field("actions_pending_confirmation", response.actions_pending_confirmation)
+
+    persistence = response.persistence_instructions or {}
+    if persistence:
+        _add_json_field("persistence", persistence)
+    return lines
+
+
+def _debug_llm_from_pipeline(pipeline: Any) -> Any | None:
+    for component_name in ("query_rewriter", "last_qa_resolver", "classifier"):
+        component = getattr(pipeline, component_name, None)
+        llm = getattr(component, "llm", None)
+        if llm is not None:
+            return llm
+    return None
+
+
+def _debug_llm_lines(llm: Any | None) -> list[str]:
+    if llm is None:
+        return ["Debug LLM: unavailable"]
+
+    settings = getattr(llm, "settings", None)
+    router = getattr(llm, "router", None)
+    last_error_by_task = getattr(llm, "last_error_by_task", {}) or {}
+    last_errors = {
+        getattr(task, "value", str(task)): str(error)
+        for task, error in last_error_by_task.items()
+    }
+    lines = [
+        "Debug LLM:",
+        f"  base_url: {getattr(settings, 'base_url', 'unknown')}",
+        f"  keep_alive: {getattr(settings, 'keep_alive', 'unknown')}",
+        f"  structured_attempts_for_json: {getattr(settings, 'structured_retry_count', 0) + 1 if settings else 'unknown'}",
+    ]
+    if not last_errors:
+        lines.append("  recent_errors: none")
+        return lines
+
+    lines.append("  recent_errors:")
+    for task in LLMTask:
+        error_text = last_errors.get(task.value)
+        if not error_text:
+            continue
+        payload: dict[str, Any] = {"task": task.value, "last_error": error_text}
+        if router is not None:
+            decision = router.decision_for_task(task)
+            payload.update(
+                {
+                    "model": decision.model,
+                    "single_call_timeout_seconds": decision.timeout_seconds,
+                    "temperature": decision.temperature,
+                    "num_ctx": decision.num_ctx,
+                    "reason": decision.reason_summary,
+                }
+            )
+        lines.append("    - error payload:")
+        try:
+            formatted = json.dumps(payload, indent=2, default=str)
+            for line in formatted.splitlines():
+                lines.append(f"      {line}")
+        except Exception:
+            lines.append(f"      {payload}")
+    return lines
+
+
+def print_debug_report(response: BundledResponse, llm: Any | None = None) -> None:
+    print()
+    for line in _debug_trace_lines(response.trace_summary):
+        print(line)
+    for line in _debug_response_lines(response):
+        print(line)
+    for line in _debug_llm_lines(llm):
+        print(line)
+
+
+def print_current_debug_trace() -> None:
+    trace = current_trace()
+    print()
+    for line in _debug_trace_lines(trace.summary() if trace else None):
+        print(line)
+
+
+def _debug_runtime_settings(settings: ProductionSettings) -> ProductionSettings:
+    """Apply settings.debug to runtime-facing settings for debug entrypoints."""
+
+    debug = settings.debug
+    return replace(
+        settings,
+        database=replace(settings.database, path=debug.db_path),
+        retrieval=replace(
+            settings.retrieval,
+            conversation_min_confidence=debug.conversation_min_confidence,
+            knowledge_min_confidence=debug.knowledge_min_confidence,
+            max_results=debug.max_results,
+            rrf_k=debug.rrf_k,
+            lexical_weight=debug.lexical_weight,
+            semantic_weight=debug.semantic_weight,
+            rerank_candidate_limit=debug.rerank_candidate_limit,
+        ),
+        worker=replace(
+            settings.worker,
+            outbox_max_attempts=debug.outbox_max_attempts,
+            outbox_batch_size=debug.outbox_batch_size,
+            outbox_retry_backoff_seconds=debug.outbox_retry_backoff_seconds,
+            outbox_processing_timeout_seconds=debug.outbox_processing_timeout_seconds,
+            autoscan_interval_seconds=debug.autoscan_interval_seconds,
+        ),
+        opensearch=replace(
+            settings.opensearch,
+            conversation_index=debug.opensearch_conversation_index,
+            knowledge_index=debug.opensearch_knowledge_index,
+            conversation_write_alias=debug.opensearch_conversation_write_alias,
+            knowledge_write_alias=debug.opensearch_knowledge_write_alias,
+            reminder_context_alias=debug.opensearch_reminder_context_alias,
+        ),
+        chroma=replace(
+            settings.chroma,
+            path=debug.chroma_path,
+            conversation_collection=debug.chroma_conversation_collection,
+            knowledge_collection=debug.chroma_knowledge_collection,
+        ),
+    )
+
+
+class MetadataIntentClassifier:
+    def classify(
+        self,
+        request: ChatRequest,
+        rewritten_query: str,
+        last_qa_resolution: Any | None = None,
+        approved_conversation_context: Any | None = None,
+    ) -> Intent:
+        return Intent(request.metadata.get("intent", Intent.GENERAL_RESPONSE.value))
+
+
+class DeterministicQuestionStrategy:
+    def generate(self, context: Any, **kwargs: Any) -> GeneratedQuestion:
+        expected = context.request.metadata.get(
+            "expected_response_type", ExpectedResponseType.FREE_TEXT_ANSWER.value
+        )
+        try:
+            expected_type = ExpectedResponseType(expected)
+        except ValueError:
+            expected_type = ExpectedResponseType.UNKNOWN
+        return GeneratedQuestion(
+            text=context.request.metadata.get(
+                "clarification_text", "I need one more detail before I can do that."
+            ),
+            source=QuestionSource.CLARIFICATION_QUESTION,
+            purpose="resolve_missing_info",
+            confidence=1.0,
+            expected_response_type=expected_type,
+        )
+
+
+class OptionalHITLStrategy:
+    def evaluate(
+        self, context: Any, response_text: str, confidence: float
+    ) -> tuple[list[GeneratedQuestion], dict[str, Any] | None]:
+        question_text = context.request.metadata.get("supporting_question")
+        if not question_text:
+            return [], {"triggered": False, "confidence": confidence, "question_count": 0}
+        question = GeneratedQuestion(
+            text=str(question_text),
+            source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+            purpose="optional_context",
+            confidence=1.0,
+            expected_response_type=ExpectedResponseType.FREE_TEXT_ANSWER,
+        )
+        return [question], {"triggered": True, "confidence": 1.0, "question_count": 1}
+
+
+class OptionalReminderSupportingStrategy:
+    def generate(self, context: Any, **kwargs: Any) -> GeneratedQuestion | None:
+        question_text = context.request.metadata.get("reminder_supporting_question")
+        if not question_text:
+            return None
+        return GeneratedQuestion(
+            text=str(question_text),
+            source=QuestionSource.REMINDER_SUPPORTING_QUESTION,
+            purpose="optional_context",
+            confidence=1.0,
+            expected_response_type=ExpectedResponseType.REMINDER_FOLLOWUP_ANSWER,
+        )
+
+
+class DeterministicRetriever:
+    def __init__(self, repository: SQLiteRepository) -> None:
+        self.repository = repository
+        self.conversation_calls = 0
+        self.knowledge_calls = 0
+
+    def retrieve_conversation(
+        self, *, user_id: str, query: str, limit: int, min_confidence: float
+    ) -> list[RetrievalResult]:
+        self.conversation_calls += 1
+        query_norm = _normalize(query)
+        rows = self.repository.connection.execute(
+            """
+            SELECT h.hop_id, h.topic_id, h.user_id, h.raw_user_query,
+                   h.raw_response, h.supporting_questions_json, h.entities_json
+            FROM conversation_hops h
+            WHERE h.user_id = ?
+            ORDER BY h.created_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+        results: list[RetrievalResult] = []
+        for row in rows:
+            text = f"User: {row['raw_user_query']}\nAssistant: {row['raw_response']}"
+            score = _token_overlap(query_norm, _normalize(text))
+            if score < min_confidence:
+                continue
+            payload = {
+                "hop_id": row["hop_id"],
+                "topic_id": row["topic_id"],
+                "user_id": row["user_id"],
+                "text": text,
+                "supporting_questions_json": row["supporting_questions_json"],
+                "entities_json": row["entities_json"],
+            }
+            results.append(
+                RetrievalResult(
+                    entity_type="conversation_hop",
+                    entity_id=row["hop_id"],
+                    source_store_evidence={"store": "debug_sql"},
+                    rerank_score=score,
+                    confidence=score,
+                    validation_status="deterministic_debug",
+                    payload=payload,
+                )
+            )
+        results.sort(key=lambda item: item.confidence, reverse=True)
+        return results[:limit]
+
+    def retrieve_knowledge(
+        self, *, user_id: str, query: str, limit: int, min_confidence: float
+    ) -> list[RetrievalResult]:
+        self.knowledge_calls += 1
+        query_norm = _normalize(query)
+        rows = self.repository.connection.execute(
+            """
+            SELECT chunk_id, knowledge_topic_id, user_id, raw_text, summary,
+                   is_deleted, version
+            FROM knowledge_chunks
+            WHERE user_id = ? AND is_deleted = 0
+            ORDER BY created_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+        results: list[RetrievalResult] = []
+        for row in rows:
+            text = str(row["raw_text"])
+            score = _token_overlap(query_norm, _normalize(text))
+            if score < min_confidence:
+                continue
+            payload = {
+                "chunk_id": row["chunk_id"],
+                "topic_id": row["knowledge_topic_id"],
+                "user_id": row["user_id"],
+                "text": text,
+                "summary": row["summary"],
+                "is_deleted": bool(row["is_deleted"]),
+                "version": row["version"],
+            }
+            results.append(
+                RetrievalResult(
+                    entity_type="knowledge_chunk",
+                    entity_id=row["chunk_id"],
+                    source_store_evidence={"store": "debug_sql"},
+                    rerank_score=score,
+                    confidence=score,
+                    validation_status="deterministic_debug",
+                    payload=payload,
+                )
+            )
+        results.sort(key=lambda item: item.confidence, reverse=True)
+        return results[:limit]
+
+
+class ScenarioLLM:
+    def chat(self, **kwargs: Any) -> str:
+        return "Start with Python basics, practice daily, then build small projects."
+
+    def generate_json(self, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "thought": "Use the default answer tool for a learning-plan question.",
+            "tool_name": "answer_generation",
+            "tool_input": {},
+            "is_final_answer": True,
+            "reason_summary": "General learning-plan answer.",
+        }
+
+
+def _normalize(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
+def _token_overlap(query: str, text: str) -> float:
+    query_terms = {term for term in query.split() if len(term) > 2}
+    text_terms = {term for term in text.split() if len(term) > 2}
+    if not query_terms or not text_terms:
+        return 0.0
+    if query and query in text:
+        return 1.0
+    return len(query_terms & text_terms) / len(query_terms)
 
 
 @dataclass
-class DebugRuntime:
-    repository: SQLRepository
-    pipeline: AssistantPipeline
-    bm25: OpenSearchBM25Index
-    chroma: ChromaPersistentVectorIndex
-    config: AssistantConfig
-    settings: ProductionSettings
-    model_router: OllamaModelRouter
-    llm: OllamaLLMClient
+class ScenarioState:
+    repository: SQLiteRepository
+    pipeline: Any
+    retriever: DeterministicRetriever
+    user_id: str
 
 
-def build_config(settings: ProductionSettings) -> AssistantConfig:
-    return AssistantConfig(
-        retrieval=RetrievalConfig(
-            conversation_min_confidence=settings.debug.conversation_min_confidence,
-            knowledge_min_confidence=settings.debug.knowledge_min_confidence,
-            max_results=settings.debug.max_results,
-            rrf_k=settings.debug.rrf_k,
-            lexical_weight=settings.debug.lexical_weight,
-            semantic_weight=settings.debug.semantic_weight,
-            rerank_candidate_limit=settings.debug.rerank_candidate_limit,
-        ),
-        outbox=OutboxConfig(
-            max_attempts=settings.debug.outbox_max_attempts,
-            batch_size=settings.debug.outbox_batch_size,
-            retry_backoff_seconds=settings.debug.outbox_retry_backoff_seconds,
-            processing_timeout_seconds=settings.debug.outbox_processing_timeout_seconds,
-        ),
-        autoscan=AutoscanConfig(interval_seconds=settings.debug.autoscan_interval_seconds),
-        classification=ClassificationConfig(
-            intent_keywords={
-                Intent.KNOWLEDGE_FACTS.value: ("remember", "knowledge"),
-                Intent.REMINDER.value: ("remind", "reminder"),
-            }
-        ),
-        mutation_policy=MutationPolicyConfig(
-            partial_execution_policy=settings.prompt_policy.mutation_partial_execution_policy,
-            knowledge_relevance_threshold=settings.prompt_policy.knowledge_target_relevance_threshold,
-            knowledge_ambiguity_margin=settings.prompt_policy.knowledge_target_ambiguity_margin,
-            knowledge_not_found_policy=settings.prompt_policy.knowledge_target_not_found_policy,
-            unsupported_action_policy=settings.prompt_policy.unsupported_action_policy,
-        ),
-        question_generation=QuestionGenerationConfig(
-            enabled=settings.prompt_policy.question_generation_enabled,
-            clarification_model=settings.ollama.clarification_question_model,
-            human_supporting_model=settings.ollama.human_supporting_question_model,
-            reminder_supporting_model=settings.ollama.reminder_supporting_question_model,
-            clarification_temperature=settings.ollama.clarification_question_temperature,
-            human_supporting_temperature=settings.ollama.human_supporting_question_temperature,
-            reminder_supporting_temperature=settings.ollama.reminder_supporting_question_temperature,
-            timeout_seconds=settings.ollama.question_generation_timeout,
-            clarification_max_tokens=settings.ollama.clarification_question_max_tokens,
-            human_supporting_max_tokens=settings.ollama.human_supporting_question_max_tokens,
-            reminder_supporting_max_tokens=settings.ollama.reminder_supporting_question_max_tokens,
-            clarification_retry_count=settings.ollama.clarification_question_json_retry_count,
-            human_supporting_retry_count=settings.ollama.human_supporting_question_json_retry_count,
-            reminder_supporting_retry_count=settings.ollama.reminder_supporting_question_json_retry_count,
-            question_generation_confidence_threshold=settings.prompt_policy.question_generation_confidence_threshold,
-            reminder_supporting_enabled=settings.prompt_policy.reminder_supporting_question_enabled,
-            reminder_supporting_min_confidence=settings.prompt_policy.reminder_supporting_question_min_confidence,
-            human_supporting_max_count=settings.prompt_policy.human_supporting_question_max_count,
-            fallback_policy=settings.prompt_policy.question_generation_fallback_policy,
-        ),
-        last_qa=LastQAConfig(
-            min_confidence=settings.prompt_policy.last_qa_min_confidence,
-            clarification_merge_min_confidence=settings.prompt_policy.clarification_merge_min_confidence,
-            skip_allowed_interaction_types=settings.prompt_policy.skip_broad_retrieval_allowed_relationships,
-            semantic_match_model=settings.ollama.last_qa_model,
-            clarification_merge_model=settings.ollama.clarification_merge_model,
-            json_retry_count=settings.ollama.last_qa_json_retry_count,
-            clarification_merge_json_retry_count=settings.ollama.clarification_merge_json_retry_count,
-            enable_reminder_metadata_reply=settings.prompt_policy.last_qa_enable_reminder_metadata_reply,
-            clarification_merge_enabled=settings.prompt_policy.clarification_merge_enabled,
-        ),
-        reminder_resolver=settings.reminder_resolver,
-        retrieval_validation=settings.retrieval_validation,
-    )
+@dataclass(frozen=True)
+class ScenarioResult:
+    name: str
+    passed: bool
+    details: str
 
 
-def build_runtime() -> DebugRuntime:
-    settings = debug_settings()
-    os.makedirs(os.path.dirname(settings.debug.db_path), exist_ok=True)
-    repository = SQLRepository.persistent(
-        settings.debug.db_path,
-        enable_wal=settings.database.enable_wal,
-        busy_timeout_ms=settings.database.busy_timeout_ms,
-    )
+ScenarioFn = Callable[[ProductionSettings], ScenarioResult]
+
+
+def build_scenario_state(settings: ProductionSettings) -> ScenarioState:
+    debug_settings = _debug_runtime_settings(settings)
+    config = build_assistant_config(debug_settings)
+    repository = SQLiteRepository.in_memory()
     repository.initialize_schema()
-    config = build_config(settings)
-    bm25 = OpenSearchBM25Index(settings.opensearch)
-    bm25.initialize()
-    chroma = ChromaPersistentVectorIndex(settings.chroma, HashEmbeddingClient())
-    prompt_registry = DEFAULT_PROMPT_REGISTRY
-    model_router = OllamaModelRouter(settings.ollama)
-    llm = OllamaLLMClient(settings.ollama, model_router)
-    retriever = HybridRetriever(
-        bm25=bm25,
-        chroma=chroma,
-        reranker=DebugReranker(),
-        rrf_k=config.retrieval.rrf_k,
-        lexical_weight=config.retrieval.lexical_weight,
-        semantic_weight=config.retrieval.semantic_weight,
-        rerank_candidate_limit=config.retrieval.rerank_candidate_limit,
+    retriever = DeterministicRetriever(repository)
+    hard_filter = HardRuleContextFilter(
+        knowledge_min_confidence=debug_settings.prompt_policy.context_filter_knowledge_min_confidence,
+        allowed_reminder_statuses=debug_settings.prompt_policy.context_filter_allowed_reminder_statuses,
+        conversation_min_confidence=debug_settings.context_filter.conversation_min_confidence,
+        conversation_approved_max_items=debug_settings.context_filter.conversation_approved_max_items,
+        conversation_duplicate_threshold=debug_settings.context_filter.conversation_duplicate_threshold,
+        knowledge_approved_max_items=debug_settings.context_filter.knowledge_approved_max_items,
+        knowledge_duplicate_threshold=debug_settings.context_filter.knowledge_duplicate_threshold,
+        low_information_text_patterns=debug_settings.context_filter.low_information_text_patterns,
+        reminder_approved_max_items=debug_settings.context_filter.reminder_approved_max_items,
+        reminder_min_confidence=debug_settings.context_filter.reminder_min_confidence,
+        low_information_min_chars=debug_settings.context_filter.low_information_min_chars,
     )
-    action_detector = LLMActionDetector(
-        llm=llm,
-        prompt_registry=prompt_registry,
-        min_confidence=settings.prompt_policy.action_min_confidence,
-        risky_action_validation_enabled=settings.prompt_policy.risky_action_validation_enabled,
-        risky_action_operations=settings.prompt_policy.risky_action_operations,
-        risky_action_confidence_threshold=settings.prompt_policy.risky_action_confidence_threshold,
-    )
-    
-    hard_rule_filter = HardRuleContextFilter(
-        knowledge_min_confidence=settings.prompt_policy.context_filter_knowledge_min_confidence,
-        allowed_reminder_statuses=settings.prompt_policy.context_filter_allowed_reminder_statuses,
-    )
-    context_filter = TwoLayerContextFilter(
-        hard_rule_filter=hard_rule_filter,
-        llm_judge=None,
-    )
-
-    clarification_strategy = LLMClarificationStrategy(
-        llm=llm,
-        prompt_registry=prompt_registry,
-        config=config.question_generation,
-    )
-    hitl_strategy = LLMHumanInTheLoopStrategy(
-        llm=llm,
-        prompt_registry=prompt_registry,
-        config=config.question_generation,
-    )
-    reminder_supporting_strategy = LLMReminderSupportingStrategy(
-        llm=llm,
-        prompt_registry=prompt_registry,
-        config=config.question_generation,
-    )
-
-    knowledge_llm_validator = KnowledgeRetrievalValidationStrategy(
-        config=config.retrieval_validation,
-        llm=llm,
-        prompts=prompt_registry,
-    )
-    reminder_llm_validator = ReminderRetrievalValidationStrategy(
-        config=config.retrieval_validation,
-        llm=llm,
-        prompts=prompt_registry,
-    )
-
-    knowledge_target_resolver = KnowledgeTargetResolver(
-        retriever=retriever,
+    context_filter = TwoLayerContextFilter(hard_rule_filter=hard_filter)
+    clarification_strategy = DeterministicQuestionStrategy()
+    reminder_resolver = ReminderTargetResolver(config=config)
+    knowledge_resolver = KnowledgeTargetResolver(retriever=retriever, config=config)
+    validated_builder = ValidatedActionBuilder(
         config=config,
-        repository=repository,
-        llm_validator=knowledge_llm_validator,
+        knowledge_resolver=knowledge_resolver,
+        reminder_resolver=reminder_resolver,
     )
-    reminder_target_resolver = ReminderTargetResolver(
-        repository=repository,
-        config=config,
-        llm_validator=reminder_llm_validator,
+    gp_config = GeneralPurposeConfig(
+        general_sub_branch_detector_enabled=False,
+        content_composer_enabled=False,
+        hitl_supporting_question_enabled=False,
     )
-    validated_action_builder = ValidatedActionBuilder(
-        config=config,
-        knowledge_resolver=knowledge_target_resolver,
-        reminder_resolver=reminder_target_resolver,
-    )
-
     router = BranchRouter(
         {
             Intent.CLARIFICATION: ClarificationBranch(
-                prompt_registry=prompt_registry,
+                prompt_registry=DEFAULT_PROMPT_REGISTRY,
                 config=config,
                 clarification_strategy=clarification_strategy,
             ),
             Intent.GENERAL_RESPONSE: GeneralResponseBranch(
-                repository,
-                retriever,
-                config,
+                retriever=retriever,
+                config=config,
                 context_filter=context_filter,
-                llm=llm,
-                prompt_registry=prompt_registry,
-                hitl_strategy=hitl_strategy,
+                prompt_registry=DEFAULT_PROMPT_REGISTRY,
+                hitl_strategy=OptionalHITLStrategy(),
+                general_purpose_config=gp_config,
             ),
             Intent.KNOWLEDGE_FACTS: KnowledgeFactsBranch(
-                repository=repository,
                 config=config,
-                action_detector=action_detector,
+                action_detector=None,
                 clarification_strategy=clarification_strategy,
-                prompt_registry=prompt_registry,
-                validated_action_builder=validated_action_builder,
+                prompt_registry=DEFAULT_PROMPT_REGISTRY,
+                validated_action_builder=validated_builder,
+                retriever=retriever,
+                context_filter=context_filter,
+                llm=None,
             ),
             Intent.REMINDER: ReminderBranch(
-                repository=repository,
                 config=config,
-                action_detector=action_detector,
+                action_detector=None,
                 clarification_strategy=clarification_strategy,
-                reminder_supporting_strategy=reminder_supporting_strategy,
-                prompt_registry=prompt_registry,
-                validated_action_builder=validated_action_builder,
+                reminder_supporting_strategy=OptionalReminderSupportingStrategy(),
+                prompt_registry=DEFAULT_PROMPT_REGISTRY,
+                validated_action_builder=validated_builder,
+                retriever=retriever,
+                context_filter=context_filter,
+                llm=None,
             ),
         }
     )
+    from assistant_rag.pipeline import AssistantPipeline
+
     pipeline = AssistantPipeline(
         config=config,
         last_qa_store=InMemoryLastQAStore(),
-        query_rewriter=LLMQueryRewriter(llm, prompt_registry),
-        last_qa_resolver=LLMLastQAResolver(
-            llm=llm,
-            config=config.last_qa,
-            prompt_registry=prompt_registry,
-        ),
+        query_rewriter=QueryRewriter(),
+        last_qa_resolver=LastQAResolver(),
         retriever=retriever,
-        classifier=OllamaIntentClassifier(
-            llm,
-            prompt_registry,
-            min_confidence=settings.prompt_policy.intent_min_confidence,
-        ),
+        context_filter=context_filter,
+        classifier=MetadataIntentClassifier(),
         router=router,
-        bundler=ResponseBundler(prompt_registry),
+        bundler=ResponseBundler(DEFAULT_PROMPT_REGISTRY),
         platform_selector=PlatformSelector(),
         chat_output=ChatOutput(),
-        prompt_registry=prompt_registry,
+        prompt_registry=DEFAULT_PROMPT_REGISTRY,
     )
-    runtime = DebugRuntime(
+    return ScenarioState(
         repository=repository,
         pipeline=pipeline,
-        bm25=bm25,
-        chroma=chroma,
-        config=config,
-        settings=settings,
-        model_router=model_router,
-        llm=llm,
+        retriever=retriever,
+        user_id=settings.debug.user_id or DEBUG_USER,
     )
-    rebuild_indexes(runtime)
-    return runtime
 
 
-def debug_settings() -> ProductionSettings:
-    base = ProductionSettings.from_env()
-    return replace(
-        base,
-        opensearch=OpenSearchSettings(
-            url=base.opensearch.url,
-            username=base.opensearch.username,
-            password=base.opensearch.password,
-            verify_certs=base.opensearch.verify_certs,
-            conversation_index=base.debug.opensearch_conversation_index,
-            knowledge_index=base.debug.opensearch_knowledge_index,
-            conversation_write_alias=base.debug.opensearch_conversation_write_alias,
-            knowledge_write_alias=base.debug.opensearch_knowledge_write_alias,
-            reminder_context_alias=base.debug.opensearch_reminder_context_alias,
-            analyzer_name=base.opensearch.analyzer_name,
-            timeout_seconds=base.opensearch.timeout_seconds,
-            max_retries=base.opensearch.max_retries,
+def run_request(
+    state: ScenarioState,
+    query: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+    platform_context: dict[str, Any] | None = None,
+) -> BundledResponse:
+    return state.pipeline.handle(
+        ChatRequest(
+            user_id=state.user_id,
+            raw_query=query,
+            metadata=metadata or {},
+            platform_context=platform_context or {},
         ),
-        chroma=ChromaSettings(
-            path=base.debug.chroma_path,
-            host=base.chroma.host,
-            port=base.chroma.port,
-            conversation_collection=base.debug.chroma_conversation_collection,
-            knowledge_collection=base.debug.chroma_knowledge_collection,
-        ),
+        state.repository,
     )
 
 
-def log_step(name: str, payload: Any) -> None:
-    print(f"\n--- {name} ---")
-    print(to_jsonable(payload))
-
-
-def log_model_decision(runtime: DebugRuntime, stage: str, task: Any) -> None:
-    decision = runtime.model_router.decision_for_task(task)
-    log_step(
-        f"{stage} Model Decision",
-        {
-            "task": decision.task.value,
-            "model": decision.model,
-            "temperature": decision.temperature,
-            "timeout_seconds": decision.timeout_seconds,
-            "reason_summary": decision.reason_summary,
-        },
-    )
-
-
-def log_llm_stage_status(runtime: DebugRuntime, stage: str, task: LLMTask) -> None:
-    error = runtime.llm.last_error_by_task.get(task)
-    if error:
-        log_step(
-            f"{stage} LLM Fallback",
-            {
-                "task": task.value,
-                "fallback_used": True,
-                "error": error,
-            },
+def seed_conversation(
+    state: ScenarioState,
+    *,
+    title: str,
+    query: str,
+    response: str,
+    supporting_questions: list[dict[str, Any]] | None = None,
+) -> tuple[str, str]:
+    with state.repository.transaction() as cursor:
+        topic_id = state.repository.ensure_topic(
+            cursor, user_id=state.user_id, title=title
         )
-
-
-def to_jsonable(value: Any) -> str:
-    try:
-        return json.dumps(value, indent=2, default=str)
-    except TypeError:
-        return str(value)
-
-
-def summarize_results(results: list[RetrievalResult]) -> list[dict[str, Any]]:
-    return [
-        {
-            "entity_type": item.entity_type,
-            "entity_id": item.entity_id,
-            "confidence": item.confidence,
-            "rerank_score": item.rerank_score,
-            "text": item.payload.get("text"),
-        }
-        for item in results
-    ]
-
-
-def summarize_branch(branch_result: BranchResult) -> dict[str, Any]:
-    return {
-        "response_type": branch_result.response_type.value,
-        "normal_response_text": branch_result.normal_response_text,
-        "clarification_question": branch_result.clarification_question,
-        "human_supporting_questions": branch_result.human_supporting_questions,
-        "reminder_supporting_question": branch_result.reminder_supporting_question,
-        "knowledge_operation_results": [
-            result.__dict__ for result in branch_result.knowledge_operation_results
-        ],
-        "reminder_operation_results": [
-            result.__dict__ for result in branch_result.reminder_operation_results
-        ],
-        "database_write_result": branch_result.database_write_result,
-        "indexing_job_result": branch_result.indexing_job_result,
-        "linked_topic_id": branch_result.linked_topic_id,
-        "linked_hop_id": branch_result.linked_hop_id,
-        "human_in_the_loop_result": getattr(branch_result, "human_in_the_loop_result", None),
-    }
-
-
-def summarize_bundled(response: BundledResponse) -> dict[str, Any]:
-    return {
-        "final_chat_text": response.final_chat_text,
-        "response_type": response.response_type.value,
-        "last_qa_state": response.last_qa_state.__dict__,
-        "persistence_instructions": response.persistence_instructions,
-    }
-
-
-def handle_with_logs(runtime: DebugRuntime, request: ChatRequest) -> BundledResponse:
-    pipeline = runtime.pipeline
-    log_step("0. Incoming ChatRequest", request.__dict__)
-
-    log_model_decision(runtime, "1. Query Rewrite", LLMTask.QUERY_REWRITE)
-    rewritten = pipeline.query_rewriter.rewrite(request.raw_query)
-    log_llm_stage_status(runtime, "1. Query Rewrite", LLMTask.QUERY_REWRITE)
-    log_step("1. Query Rewrite", {"raw_query": request.raw_query, "rewritten_query": rewritten})
-
-    last_state = pipeline.last_qa_store.get(request.user_id)
-    log_step("2. Load Last-QA State", None if last_state is None else last_state.__dict__)
-
-    if last_state is not None:
-        log_model_decision(runtime, "3. Last-QA Resolver", LLMTask.LAST_QA)
-    resolution = pipeline.last_qa_resolver.resolve(request, rewritten, last_state)
-    if last_state is not None:
-        log_llm_stage_status(runtime, "3. Last-QA Resolver", LLMTask.LAST_QA)
-    log_step(
-        "3. Last-QA Resolver",
-        {
-            "rewritten_query": resolution.rewritten_query,
-            "skip_broad_retrieval": resolution.skip_broad_retrieval,
-            "state": None if resolution.state is None else resolution.state.__dict__,
-        },
-    )
-
-    conversation_results: list[RetrievalResult] = []
-    if not resolution.skip_broad_retrieval:
-        conversation_results = pipeline.retriever.retrieve_conversation(
-            user_id=request.user_id,
-            query=resolution.rewritten_query,
-            limit=pipeline.config.retrieval.max_results,
-            min_confidence=pipeline.config.retrieval.conversation_min_confidence,
+        hop = state.repository.append_conversation_hop(
+            cursor,
+            topic_id=topic_id,
+            user_id=state.user_id,
+            intent=Intent.GENERAL_RESPONSE.value,
+            raw_user_query=query,
+            rewritten_user_query=query,
+            raw_response=response,
+            response_type=ResponseType.NORMAL.value,
+            supporting_questions=supporting_questions or [],
         )
-    log_step("4. Optional Conversation Retrieval", summarize_results(conversation_results))
-
-    log_model_decision(runtime, "5. Intent Classifier", LLMTask.INTENT)
-    intent = pipeline.classifier.classify(request, resolution.rewritten_query)
-    log_llm_stage_status(runtime, "5. Intent Classifier", LLMTask.INTENT)
-    log_step("5. Intent Classifier", {"intent": intent.value})
+    return topic_id, hop.hop_id
 
 
-    context = PipelineContext(
-        request=request,
-        rewritten_query=resolution.rewritten_query,
-        last_qa_state=resolution.state,
-        conversation_results=conversation_results,
-        intent=intent,
-    )
-    log_step(
-        "7. PipelineContext",
-        {
-            "rewritten_query": context.rewritten_query,
-            "intent": context.intent.value,
-            "conversation_result_count": len(context.conversation_results),
-            "metadata": context.request.metadata,
-        },
-    )
-
-    if context.intent is Intent.GENERAL_RESPONSE:
-        log_model_decision(runtime, "8. General Answer Generation", LLMTask.ANSWER)
-    branch_result = pipeline.router.route(context)
-    if context.intent is Intent.GENERAL_RESPONSE:
-        log_llm_stage_status(runtime, "8. General Answer Generation", LLMTask.ANSWER)
-    log_step("8. Branch Router Result", summarize_branch(branch_result))
-
-    bundled = pipeline.bundler.bundle(
-        request=request,
-        rewritten_query=resolution.rewritten_query,
-        branch_result=branch_result,
-    )
-    log_step("9. Response Bundler", summarize_bundled(bundled))
-
-    platform_payload = pipeline.platform_selector.select(bundled, request)
-    log_step("10. Platform Selector", platform_payload)
-
-    pipeline.last_qa_store.save(request.user_id, bundled.last_qa_state)
-    log_step("11. Save Last-QA", bundled.last_qa_state.__dict__)
-
-    emitted = pipeline.chat_output.emit(bundled)
-    log_step("12. Chat Output", {"emitted_text": emitted})
-
-    indexed = process_outbox(runtime)
-    log_step("13. indexing_outbox Processing", {"indexed_jobs": indexed})
-
-    return bundled
-
-
-def make_request(line: str, *, user_id: str) -> ChatRequest:
-    if line.startswith("ask "):
-        return ChatRequest(user_id=user_id, raw_query=line.removeprefix("ask ").strip())
-    if line.startswith("remember "):
-        fact = line.removeprefix("remember ").strip()
-        return ChatRequest(
-            user_id=user_id,
-            raw_query=line,
-            metadata={
-                "intent": Intent.KNOWLEDGE_FACTS.value,
-                "knowledge_actions": [
-                    {
-                        "action": "add",
-                        "topic_title": "Debug Facts",
-                        "text": fact,
-                        "summary": DEFAULT_PROMPT_REGISTRY.message("knowledge_added"),
-                    }
-                ],
-            },
+def seed_knowledge(state: ScenarioState, *, title: str, text: str) -> str:
+    with state.repository.transaction() as cursor:
+        _, chunk_id, _ = state.repository.add_knowledge_chunk(
+            cursor, user_id=state.user_id, title=title, text=text
         )
-    if line.startswith("remind "):
-        subject, reminder_time = parse_reminder(line.removeprefix("remind ").strip())
-        return ChatRequest(
-            user_id=user_id,
-            raw_query=line,
-            metadata={
-                "intent": Intent.REMINDER.value,
-                "reminder_actions": [
-                    {
-                        "action": "add",
-                        "reminder_time": reminder_time,
-                        "raw_reminder": line,
-                        "reminder_summary": subject,
-                        "subject": subject,
-                        "summary": DEFAULT_PROMPT_REGISTRY.message(
-                            "reminder_changed", action="add"
-                        ),
-                    }
-                ],
-            },
+    return chunk_id
+
+
+def seed_reminder(
+    state: ScenarioState,
+    *,
+    subject: str,
+    summary: str,
+    reminder_time: datetime,
+    status: str = "scheduled",
+) -> str:
+    topic_id, hop_id = seed_conversation(
+        state,
+        title="Seeded Reminders",
+        query=f"Create reminder for {subject}",
+        response=f"Reminder seed for {subject}",
+    )
+    with state.repository.transaction() as cursor:
+        reminder_id = state.repository.add_reminder(
+            cursor,
+            user_id=state.user_id,
+            source_topic_id=topic_id,
+            source_hop_id=hop_id,
+            reminder_time=reminder_time.isoformat(),
+            raw_reminder=summary,
+            reminder_summary=summary,
+            subject=subject,
         )
-    return ChatRequest(user_id=user_id, raw_query=line)
-
-
-def parse_reminder(text: str) -> tuple[str, str]:
-    if " at " not in text:
-        return text, (datetime.now(UTC) + timedelta(days=1)).isoformat()
-    subject, reminder_time = text.rsplit(" at ", 1)
-    return subject.strip(), reminder_time.strip()
-
-
-def process_outbox(runtime: DebugRuntime) -> int:
-    indexer = BackgroundIndexer(
-        connection=runtime.repository.connection,
-        bm25=runtime.bm25,
-        chroma=runtime.chroma,
-        config=runtime.config.outbox,
-    )
-    return indexer.process_pending()
-
-
-def rebuild_indexes(runtime: DebugRuntime) -> None:
-    indexer = BackgroundIndexer(
-        connection=runtime.repository.connection,
-        bm25=runtime.bm25,
-        chroma=runtime.chroma,
-        config=runtime.config.outbox,
-    )
-    indexer.rebuild_from_sql()
-
-
-def show_tables(runtime: DebugRuntime) -> None:
-    log_step(
-        "SQL Table Counts",
-        {
-            table_name: runtime.repository.table_count(table_name)
-            for table_name in (
-                "conversation_topics",
-                "conversation_hops",
-                "knowledge_topics",
-                "knowledge_chunks",
-                "reminders",
-                "reminder_notifications",
-                "indexing_outbox",
+        if status != "scheduled":
+            state.repository.update_reminder_status(
+                cursor,
+                user_id=state.user_id,
+                reminder_id=reminder_id,
+                status=status,
             )
+    return reminder_id
+
+
+def assert_response(
+    response: BundledResponse,
+    expected_type: ResponseType,
+    expected_text: str | None = None,
+) -> None:
+    if response.response_type != expected_type:
+        raise AssertionError(
+            f"expected {expected_type.value}, got {response.response_type.value}: {response.final_chat_text}"
+        )
+    if expected_text and expected_text.casefold() not in response.final_chat_text.casefold():
+        raise AssertionError(
+            f"expected text containing {expected_text!r}, got {response.final_chat_text!r}"
+        )
+
+
+def scenario_clarification_direct(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    response = run_request(
+        state,
+        "Need to update it",
+        metadata={
+            "intent": Intent.CLARIFICATION.value,
+            "clarification_text": "Which item should I update?",
         },
     )
+    assert_response(response, ResponseType.CLARIFICATION, "Which item")
+    return ScenarioResult("clarification_direct", True, "clarification branch returned a question")
 
 
-def show_notifications(runtime: DebugRuntime) -> None:
-    log_step(
-        "Reminder Notifications",
-        runtime.repository.list_notifications(user_id=runtime.settings.debug.user_id),
+def scenario_general_new_conversation(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    response = run_request(
+        state,
+        "Explain the release checklist",
+        metadata={
+            "intent": Intent.GENERAL_RESPONSE.value,
+            "normal_response_text": "Use the release checklist in order.",
+        },
+    )
+    assert_response(response, ResponseType.NORMAL, "release checklist")
+    if state.repository.table_count("conversation_hops") != 1:
+        raise AssertionError("general response did not persist a conversation hop")
+    return ScenarioResult("general_new_conversation", True, "new conversation persisted hop and outbox job")
+
+
+def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResult:
+    default_settings = ProductionSettings()
+    router = OllamaModelRouter(default_settings.ollama)
+    expected = {
+        LLMTask.QUERY_REWRITE: "qwen2.5:3b",
+        LLMTask.LAST_QA: "qwen2.5:3b",
+        LLMTask.GENERAL_SUB_BRANCH_DETECTION: "qwen2.5:3b",
+        LLMTask.CONTENT_COMPOSER_REACT: "qwen2.5:3b",
+        LLMTask.INTENT: "qwen2.5:3b",
+        LLMTask.ACTION_EXTRACTION: "qwen2.5:3b",
+        LLMTask.ACTION_PLANNING: "qwen2.5:3b",
+        LLMTask.RISKY_ACTION: "qwen2.5:3b",
+        LLMTask.ANSWER: "qwen2.5:3b",
+        LLMTask.WRITING: "qwen2.5:3b",
+    }
+    actual = {task: router.model_for_task(task) for task in expected}
+    mismatches = {
+        task.value: {"expected": expected_model, "actual": actual[task]}
+        for task, expected_model in expected.items()
+        if actual[task] != expected_model
+    }
+    if mismatches:
+        raise AssertionError(f"model routing mismatches: {mismatches}")
+    policy_values = {
+        "query_rewrite_temperature": default_settings.ollama.query_rewrite_temperature,
+        "last_qa_temperature": default_settings.ollama.last_qa_temperature,
+        "intent_classifier_temperature": default_settings.ollama.intent_classifier_temperature,
+        "action_detection_temperature": default_settings.ollama.action_detection_temperature,
+        "risky_action_temperature": default_settings.ollama.risky_action_temperature,
+        "answer_temperature": default_settings.ollama.answer_temperature,
+        "writing_temperature": default_settings.ollama.writing_temperature,
+        "timeout_fast": default_settings.ollama.timeout_fast,
+        "timeout_balanced": default_settings.ollama.timeout_balanced,
+        "timeout_accurate": default_settings.ollama.timeout_accurate,
+        "timeout_writing": default_settings.ollama.timeout_writing,
+        "timeout_risky_action": default_settings.ollama.timeout_risky_action,
+        "num_ctx_fast": default_settings.ollama.num_ctx_fast,
+        "num_ctx_balanced": default_settings.ollama.num_ctx_balanced,
+        "num_ctx_accurate": default_settings.ollama.num_ctx_accurate,
+        "num_ctx_writing": default_settings.ollama.num_ctx_writing,
+        "bm25_top_k": default_settings.retrieval.bm25_top_k,
+        "chroma_top_k": default_settings.retrieval.chroma_top_k,
+        "rrf_k": default_settings.retrieval.rrf_k,
+        "reranker_top_k": default_settings.retrieval.rerank_candidate_limit,
+        "reranker_min_score": default_settings.reranker.min_score,
+        "reranker_batch_size": default_settings.reranker.batch_size,
+        "final_context_top_k": default_settings.retrieval.max_results,
+        "retrieval_min_confidence": default_settings.retrieval.min_confidence,
+        "knowledge_context_min_confidence": default_settings.retrieval.knowledge_min_confidence,
+        "conversation_context_min_confidence": default_settings.retrieval.conversation_min_confidence,
+        "last_qa_min_confidence": default_settings.prompt_policy.last_qa_min_confidence,
+        "last_qa_clarification_merge_min_confidence": default_settings.prompt_policy.clarification_merge_min_confidence,
+        "last_qa_skip_broad_retrieval_min_confidence": default_settings.prompt_policy.last_qa_skip_broad_retrieval_min_confidence,
+        "action_min_confidence": default_settings.prompt_policy.action_min_confidence,
+        "risky_action_confidence_threshold": default_settings.prompt_policy.risky_action_confidence_threshold,
+        "reminder_candidate_limit": default_settings.reminder_resolver.reminder_target_candidate_limit,
+        "reminder_target_min_score": default_settings.reminder_resolver.reminder_target_relevance_threshold,
+        "reminder_target_ambiguity_margin": default_settings.reminder_resolver.reminder_target_ambiguity_margin,
+        "reminder_fuzzy_match_threshold": default_settings.reminder_resolver.reminder_fuzzy_match_threshold,
+        "reminder_context_min_confidence": default_settings.context_filter.reminder_min_confidence,
+        "knowledge_chunk_size_tokens": default_settings.knowledge_chunks.chunk_size_tokens,
+        "knowledge_chunk_overlap_tokens": default_settings.knowledge_chunks.chunk_overlap_tokens,
+        "knowledge_min_chunk_tokens": default_settings.knowledge_chunks.min_chunk_tokens,
+        "knowledge_max_chunk_tokens": default_settings.knowledge_chunks.max_chunk_tokens,
+        "embedding_batch_size": default_settings.embeddings.batch_size,
+        "embedding_max_length": default_settings.embeddings.max_length,
+        "outbox_batch_size": default_settings.worker.outbox_batch_size,
+        "outbox_max_retries": default_settings.worker.outbox_max_attempts,
+        "outbox_retry_backoff_seconds": default_settings.worker.outbox_retry_backoff_seconds,
+        "outbox_stale_processing_after_seconds": default_settings.worker.outbox_processing_timeout_seconds,
+        "outbox_worker_interval_seconds": default_settings.worker.outbox_worker_interval_seconds,
+        "reminder_autoscan_interval_seconds": default_settings.worker.autoscan_interval_seconds,
+    }
+    expected_policy_values = {
+        "query_rewrite_temperature": 0.0,
+        "last_qa_temperature": 0.0,
+        "intent_classifier_temperature": 0.0,
+        "action_detection_temperature": 0.0,
+        "risky_action_temperature": 0.0,
+        "answer_temperature": 0.25,
+        "writing_temperature": 0.45,
+        "timeout_fast": 20.0,
+        "timeout_balanced": 45.0,
+        "timeout_accurate": 90.0,
+        "timeout_writing": 120.0,
+        "timeout_risky_action": 90.0,
+        "num_ctx_fast": 8192,
+        "num_ctx_balanced": 16384,
+        "num_ctx_accurate": 32768,
+        "num_ctx_writing": 32768,
+        "bm25_top_k": 30,
+        "chroma_top_k": 30,
+        "rrf_k": 60,
+        "reranker_top_k": 20,
+        "reranker_min_score": 0.35,
+        "reranker_batch_size": 16,
+        "final_context_top_k": 8,
+        "retrieval_min_confidence": 0.25,
+        "knowledge_context_min_confidence": 0.35,
+        "conversation_context_min_confidence": 0.40,
+        "last_qa_min_confidence": 0.75,
+        "last_qa_clarification_merge_min_confidence": 0.80,
+        "last_qa_skip_broad_retrieval_min_confidence": 0.85,
+        "action_min_confidence": 0.70,
+        "risky_action_confidence_threshold": 0.85,
+        "reminder_candidate_limit": 20,
+        "reminder_target_min_score": 0.72,
+        "reminder_target_ambiguity_margin": 0.12,
+        "reminder_fuzzy_match_threshold": 0.78,
+        "reminder_context_min_confidence": 0.50,
+        "knowledge_chunk_size_tokens": 700,
+        "knowledge_chunk_overlap_tokens": 100,
+        "knowledge_min_chunk_tokens": 80,
+        "knowledge_max_chunk_tokens": 1000,
+        "embedding_batch_size": 32,
+        "embedding_max_length": 8192,
+        "outbox_batch_size": 50,
+        "outbox_max_retries": 5,
+        "outbox_retry_backoff_seconds": 30,
+        "outbox_stale_processing_after_seconds": 300,
+        "outbox_worker_interval_seconds": 5,
+        "reminder_autoscan_interval_seconds": 60,
+    }
+    policy_mismatches = {
+        key: {"expected": expected_policy_values[key], "actual": policy_values[key]}
+        for key in expected_policy_values
+        if policy_values[key] != expected_policy_values[key]
+    }
+    if policy_mismatches:
+        raise AssertionError(f"policy default mismatches: {policy_mismatches}")
+    if default_settings.prompt_policy.risky_action_operations != ("delete", "modify", "turn_off"):
+        raise AssertionError(f"risky action operations mismatch: {default_settings.prompt_policy.risky_action_operations}")
+    if not default_settings.retrieval_validation.reminder_llm_validation_enabled:
+        raise AssertionError("reminder LLM validation should be enabled by default")
+    if not default_settings.embeddings.normalize_embeddings:
+        raise AssertionError("embedding normalization should be enabled")
+    if default_settings.embeddings.model_name != "BAAI/bge-m3":
+        raise AssertionError(f"embedding model mismatch: {default_settings.embeddings.model_name}")
+    if router.decision_for_task(LLMTask.ANSWER).num_ctx != 32768:
+        raise AssertionError("answer task should use writing context window")
+    expected_timeouts = {
+        LLMTask.QUERY_REWRITE: 20.0,
+        LLMTask.LAST_QA: 20.0,
+        LLMTask.INTENT: 45.0,
+        LLMTask.ACTION_EXTRACTION: 45.0,
+        LLMTask.RISKY_ACTION: 90.0,
+        LLMTask.RETRIEVAL_VALIDATION: 90.0,
+        LLMTask.ANSWER: 120.0,
+        LLMTask.WRITING: 120.0,
+    }
+    timeout_mismatches = {
+        task.value: {"expected": expected_timeout, "actual": router.decision_for_task(task).timeout_seconds}
+        for task, expected_timeout in expected_timeouts.items()
+        if router.decision_for_task(task).timeout_seconds != expected_timeout
+    }
+    if timeout_mismatches:
+        raise AssertionError(f"LLM timeout mismatches: {timeout_mismatches}")
+    return ScenarioResult("model_routing_policy", True, "LLM task routing, retrieval, action, context, and worker defaults match policy")
+
+
+def scenario_content_composer_general_react(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    config = GeneralPurposeConfig(
+        content_composer_enabled=True,
+        content_composer_max_iterations=1,
+        content_composer_fallback_tool="answer_generation",
+        content_composer_default_tool="answer_generation",
+    )
+    llm = ScenarioLLM()
+    registry = ContentToolRegistry(
+        tools=[AnswerGenerationTool(llm=llm, prompt_registry=DEFAULT_PROMPT_REGISTRY)],
+        config=config,
+    )
+    composer = ReActContentComposer(
+        registry=registry,
+        llm=llm,
+        prompt_registry=DEFAULT_PROMPT_REGISTRY,
+        config=config,
+    )
+    from assistant_rag.contracts import (
+        ContentComposerInput,
+        GeneralSubBranch,
+        PersistenceMode,
+        SubBranchPromptContext,
     )
 
-
-def reset_debug_database() -> DebugRuntime:
-    settings = debug_settings()
-    if os.path.exists(settings.debug.db_path):
-        os.remove(settings.debug.db_path)
-    return build_runtime()
-
-
-def print_help() -> None:
-    print(
-        """
-Commands:
-  ask <question>              Run a normal question through every pipeline stage.
-  remember <fact>             Add a knowledge fact and index it through the outbox.
-  remind <subject> at <time>  Add a reminder. Time should be ISO text.
-  autoscan [time]             Run SQL-only reminder autoscan and print notifications.
-  notifications               Print reminder notification rows.
-  tables                      Print SQL table counts.
-  rebuild                     Rebuild local derived indexes from SQL.
-  reset                       Delete only the debug SQLite DB and start fresh.
-  help                        Show this help.
-  quit                        Exit.
-
-Free text without a command is treated like: ask <text>
-""".strip()
+    result = composer.compose(
+        ContentComposerInput(
+            user_id=state.user_id,
+            raw_user_query="I want to learn Python from zero.",
+            rewritten_query="I want to learn Python from zero.",
+            sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
+            persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
+            approved_conversation_history=[],
+            human_supporting_questions=[],
+            reminder_supporting_questions=[],
+            extracted_expected_response_types=[],
+            approved_knowledge_evidence=[],
+            approved_reminder_context=[],
+            metadata={},
+            platform_context={},
+            sub_branch_prompt_context=SubBranchPromptContext(
+                sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
+                persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
+                chat_history_role="new conversation",
+                response_goal="answer directly",
+                database_update_mode="create",
+                allowed_database_updates=("conversation_hop_append",),
+                prohibited_database_updates=("knowledge_mutation",),
+            ),
+            sub_branch_supporting_prompt="Answer directly.",
+        ),
+        config,
     )
+    if not result.final_response_text:
+        raise AssertionError("content composer returned an empty answer")
+    return ScenarioResult("content_composer_general_react", True, "composer handled flattened approved conversation context")
 
 
-def main() -> None:
-    try:
-        runtime = build_runtime()
-    except Exception as exc:
-        print("Debug pipeline storage bootstrap failed.")
-        print("SQL files and Chroma collections can be created by this project.")
-        print("OpenSearch indexes can also be created automatically, but the OpenSearch server must already be running.")
-        print(f"Default expected URL: {ProductionSettings.from_env().opensearch.url}")
-        print(f"Error: {exc}")
-        return
-    print("Debug pipeline runner")
-    print(f"Storage: {runtime.settings.debug.db_path}")
-    print("This does not start Streamlit or FastAPI.")
-    print(f"OpenSearch URL: {runtime.settings.opensearch.url}")
-    print(f"OpenSearch indexes: {runtime.settings.opensearch.conversation_index}, {runtime.settings.opensearch.knowledge_index}")
-    print(f"Chroma storage: {runtime.settings.chroma.path}")
-    print_help()
+def scenario_general_broad_retrieval_approved(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    seed_conversation(
+        state,
+        title="Atlas Context",
+        query="Project Atlas context",
+        response="Atlas deployment requires a freeze window and QA signoff.",
+        supporting_questions=[
+            {
+                "question_text": "Which environment should I focus on?",
+                "question_source": QuestionSource.HUMAN_SUPPORTING_QUESTION.value,
+                "purpose": "optional_context",
+                "confidence": 1.0,
+                "expected_response_type": ExpectedResponseType.FREE_TEXT_ANSWER.value,
+            }
+        ],
+    )
+    response = run_request(
+        state,
+        "Continue Atlas context with QA signoff",
+        metadata={
+            "intent": Intent.GENERAL_RESPONSE.value,
+            "normal_response_text": "Continuing from the approved Atlas context.",
+        },
+    )
+    assert_response(response, ResponseType.NORMAL, "approved Atlas")
+    if state.retriever.conversation_calls < 1:
+        raise AssertionError("broad conversation retrieval did not run")
+    return ScenarioResult("general_broad_retrieval_approved", True, "approved conversation retrieval path ran")
+
+
+def scenario_lastqa_supporting_skip(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    topic_id, hop_id = seed_conversation(
+        state,
+        title="Answer Draft",
+        query="Draft the answer",
+        response="Draft created.",
+    )
+    state.pipeline.last_qa_store.save(
+        state.user_id,
+        LastQAState(
+            last_user_query="Draft the answer",
+            last_response="Draft created.",
+            response_type=ResponseType.NORMAL,
+            supporting_questions=[
+                GeneratedQuestion(
+                    text="Which format should I use for the answer?",
+                    source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+                    purpose="optional_context",
+                    confidence=1.0,
+                )
+            ],
+            linked_topic_id=topic_id,
+            linked_hop_id=hop_id,
+        ),
+    )
+    before_calls = state.retriever.conversation_calls
+    response = run_request(
+        state,
+        "format",
+        metadata={
+            "intent": Intent.GENERAL_RESPONSE.value,
+            "normal_response_text": "Using that format for the prior answer.",
+        },
+    )
+    assert_response(response, ResponseType.NORMAL, "prior answer")
+    if state.retriever.conversation_calls != before_calls:
+        raise AssertionError("last-QA supporting-question path should skip broad retrieval")
+    return ScenarioResult("lastqa_supporting_skip", True, "latest-context Last-QA path skipped broad retrieval")
+
+
+def scenario_knowledge_add(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    response = run_request(
+        state,
+        "Remember Atlas retention is 30 days",
+        metadata={
+            "intent": Intent.KNOWLEDGE_FACTS.value,
+            "knowledge_actions": [
+                {
+                    "action": "add",
+                    "text": "Project Atlas retention is 30 days.",
+                    "topic_title": "Project Atlas",
+                }
+            ],
+        },
+    )
+    assert_response(response, ResponseType.KNOWLEDGE_ACTION, "Added new knowledge")
+    if state.repository.table_count("knowledge_chunks") != 1:
+        raise AssertionError("knowledge add did not create a chunk")
+    entities = state.repository.list_all_outbox_entities()
+    for entity_type, entity_id in entities:
+        state.repository.load_outbox_entity(entity_type=entity_type, entity_id=entity_id)
+    return ScenarioResult("knowledge_add_and_outbox_load", True, "knowledge add and outbox entity loading succeeded")
+
+
+def scenario_knowledge_modify(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    seed_knowledge(state, title="Project Atlas", text="Project Atlas retention is 30 days.")
+    response = run_request(
+        state,
+        "Change Project Atlas retention to 45 days",
+        metadata={
+            "intent": Intent.KNOWLEDGE_FACTS.value,
+            "knowledge_actions": [
+                {
+                    "action": "modify",
+                    "target_description": "Project Atlas retention 30 days",
+                    "replacement_text": "Project Atlas retention is 45 days.",
+                }
+            ],
+        },
+    )
+    assert_response(response, ResponseType.KNOWLEDGE_ACTION, "confirm")
+    if not response.actions_pending_confirmation:
+        raise AssertionError("knowledge modify should require confirmation before mutating")
+    active = state.repository.connection.execute(
+        "SELECT raw_text FROM knowledge_chunks WHERE user_id = ? AND is_deleted = 0",
+        (state.user_id,),
+    ).fetchall()
+    if [row["raw_text"] for row in active] != ["Project Atlas retention is 30 days."]:
+        raise AssertionError("knowledge modify mutated before confirmation")
+    return ScenarioResult("knowledge_modify", True, "knowledge modify requires confirmation before replacing the active chunk")
+
+
+def scenario_knowledge_delete_not_found(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    response = run_request(
+        state,
+        "Delete a missing fact",
+        metadata={
+            "intent": Intent.KNOWLEDGE_FACTS.value,
+            "knowledge_actions": [
+                {"action": "delete", "target_description": "missing project codename"}
+            ],
+        },
+    )
+    assert_response(response, ResponseType.KNOWLEDGE_ACTION, "No matching knowledge")
+    return ScenarioResult("knowledge_delete_not_found", True, "missing target produced safe no-op")
+
+
+def scenario_knowledge_modify_missing_replacement(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    seed_knowledge(state, title="Project Atlas", text="Project Atlas owner is Mina.")
+    response = run_request(
+        state,
+        "Modify Atlas owner",
+        metadata={
+            "intent": Intent.KNOWLEDGE_FACTS.value,
+            "knowledge_actions": [
+                {"action": "modify", "target_description": "Project Atlas owner Mina"}
+            ],
+            "clarification_text": "What should replace the current knowledge?",
+        },
+    )
+    assert_response(response, ResponseType.CLARIFICATION, "replace")
+    return ScenarioResult("knowledge_modify_missing_replacement", True, "missing replacement asks clarification")
+
+
+def scenario_reminder_add(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    response = run_request(
+        state,
+        "Remind me to submit payroll tomorrow",
+        metadata={
+            "intent": Intent.REMINDER.value,
+            "reminder_actions": [
+                {
+                    "action": "add",
+                    "subject": "Submit payroll",
+                    "reminder_summary": "Submit payroll",
+                    "reminder_time": "2026-07-10T09:00:00+00:00",
+                }
+            ],
+        },
+    )
+    assert_response(response, ResponseType.REMINDER_ACTION, "Added reminder")
+    if state.repository.table_count("reminders") != 1:
+        raise AssertionError("reminder add did not create a reminder")
+    return ScenarioResult("reminder_add", True, "reminder add committed")
+
+
+def scenario_reminder_modify(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    seed_reminder(
+        state,
+        subject="Submit tax form",
+        summary="Submit tax form",
+        reminder_time=datetime(2026, 7, 10, 9, tzinfo=timezone.utc),
+    )
+    response = run_request(
+        state,
+        "Move tax form reminder",
+        metadata={
+            "intent": Intent.REMINDER.value,
+            "reminder_actions": [
+                {
+                    "action": "modify",
+                    "target_description": "Submit tax form",
+                    "new_subject": "Submit tax form final",
+                    "new_reminder_time": "2026-07-11T10:00:00+00:00",
+                }
+            ],
+        },
+    )
+    assert_response(response, ResponseType.REMINDER_ACTION, "Modified reminder")
+    rows = state.repository.list_reminders(user_id=state.user_id)
+    statuses = sorted(row["status"] for row in rows)
+    if statuses != ["cancelled", "scheduled"]:
+        raise AssertionError(f"expected one cancelled and one scheduled reminder, got {statuses}")
+    return ScenarioResult("reminder_modify", True, "reminder modify cancelled old row and created replacement")
+
+
+def scenario_reminder_turn_off(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    reminder_id = seed_reminder(
+        state,
+        subject="Call finance",
+        summary="Call finance",
+        reminder_time=datetime(2026, 7, 10, 9, tzinfo=timezone.utc),
+    )
+    response = run_request(
+        state,
+        "Turn off finance reminder",
+        metadata={
+            "intent": Intent.REMINDER.value,
+            "reminder_actions": [
+                {"action": "turn_off", "target_description": "Call finance"}
+            ],
+        },
+    )
+    assert_response(response, ResponseType.REMINDER_ACTION, "cancelled")
+    row = state.repository.list_reminders(user_id=state.user_id)[0]
+    if row["reminder_id"] != reminder_id or row["status"] != "cancelled":
+        raise AssertionError("turn_off did not cancel the reminder")
+    return ScenarioResult("reminder_turn_off", True, "turn_off moved scheduled reminder to cancelled")
+
+
+def scenario_reminder_turn_on(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    seed_reminder(
+        state,
+        subject="Renew license",
+        summary="Renew license",
+        reminder_time=datetime(2026, 7, 10, 9, tzinfo=timezone.utc),
+        status="cancelled",
+    )
+    response = run_request(
+        state,
+        "Turn on license reminder",
+        metadata={
+            "intent": Intent.REMINDER.value,
+            "reminder_actions": [
+                {"action": "turn_on", "target_description": "Renew license"}
+            ],
+        },
+    )
+    assert_response(response, ResponseType.REMINDER_ACTION, "scheduled")
+    row = state.repository.list_reminders(user_id=state.user_id)[0]
+    if row["status"] != "scheduled":
+        raise AssertionError("turn_on did not reschedule the reminder")
+    return ScenarioResult("reminder_turn_on", True, "turn_on moved cancelled reminder to scheduled")
+
+
+def scenario_reminder_delete(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    seed_reminder(
+        state,
+        subject="Legacy review",
+        summary="Legacy review",
+        reminder_time=datetime(2026, 7, 10, 9, tzinfo=timezone.utc),
+    )
+    response = run_request(
+        state,
+        "Delete legacy reminder",
+        metadata={
+            "intent": Intent.REMINDER.value,
+            "reminder_actions": [
+                {"action": "delete", "target_description": "Legacy review"}
+            ],
+        },
+    )
+    assert_response(response, ResponseType.REMINDER_ACTION, "confirm")
+    if not response.actions_pending_confirmation:
+        raise AssertionError("reminder delete should require confirmation before mutating")
+    row = state.repository.list_reminders(user_id=state.user_id)[0]
+    if row["status"] != "scheduled":
+        raise AssertionError("delete mutated before confirmation")
+    return ScenarioResult("reminder_delete", True, "delete requires confirmation before dismissing the reminder")
+
+
+def scenario_reminder_missing_time(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    response = run_request(
+        state,
+        "Remind me to file expenses",
+        metadata={
+            "intent": Intent.REMINDER.value,
+            "reminder_actions": [{"action": "add", "subject": "File expenses"}],
+            "clarification_text": "When should I remind you?",
+            "expected_response_type": ExpectedResponseType.TIME_OR_DATE_ANSWER.value,
+        },
+    )
+    assert_response(response, ResponseType.CLARIFICATION, "When")
+    return ScenarioResult("reminder_missing_time", True, "missing reminder time asks clarification")
+
+
+def scenario_autoscan_notification_reply(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    reminder_id = seed_reminder(
+        state,
+        subject="Join standup",
+        summary="Join standup",
+        reminder_time=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    notified = state.repository.scan_due_reminders(now_value=now_iso(), limit=10)
+    if notified != [reminder_id]:
+        raise AssertionError(f"autoscan did not notify expected reminder: {notified}")
+    notifications = state.repository.list_notifications(user_id=state.user_id)
+    if len(notifications) != 1:
+        raise AssertionError("autoscan did not create one notification")
+    notification_id = notifications[0]["notification_id"]
+    context = state.repository.load_reminder_reply_context(
+        user_id=state.user_id,
+        reminder_id=reminder_id,
+        notification_id=notification_id,
+    )
+    if context.get("subject") != "Join standup":
+        raise AssertionError("reply context did not restore reminder subject")
+    write = state.repository.append_reminder_reply(
+        user_id=state.user_id,
+        reminder_id=reminder_id,
+        notification_id=notification_id,
+        reply_text="Done",
+        response_text="Marked your response.",
+    )
+    if not write.hop_id:
+        raise AssertionError("reminder reply did not append a conversation hop")
+    return ScenarioResult("autoscan_notification_reply", True, "autoscan, notification, context load, and reply append passed")
+
+
+SCENARIOS: tuple[ScenarioFn, ...] = (
+    scenario_clarification_direct,
+    scenario_general_new_conversation,
+    scenario_model_routing_policy,
+    scenario_content_composer_general_react,
+    scenario_general_broad_retrieval_approved,
+    scenario_lastqa_supporting_skip,
+    scenario_knowledge_add,
+    scenario_knowledge_modify,
+    scenario_knowledge_delete_not_found,
+    scenario_knowledge_modify_missing_replacement,
+    scenario_reminder_add,
+    scenario_reminder_modify,
+    scenario_reminder_turn_off,
+    scenario_reminder_turn_on,
+    scenario_reminder_delete,
+    scenario_reminder_missing_time,
+    scenario_autoscan_notification_reply,
+)
+
+
+def run_scenario_suite(settings: ProductionSettings, names: set[str] | None = None) -> int:
+    selected = []
+    for scenario in SCENARIOS:
+        scenario_name = scenario.__name__.removeprefix("scenario_")
+        if names and scenario_name not in names:
+            continue
+        selected.append((scenario_name, scenario))
+    if names:
+        known = {scenario.__name__.removeprefix("scenario_") for scenario in SCENARIOS}
+        unknown = sorted(names - known)
+        if unknown:
+            print(f"Unknown scenario(s): {', '.join(unknown)}", file=sys.stderr)
+            return 2
+
+    print(f"Running debug pipeline scenario suite ({len(selected)} scenario(s))...")
+    failures: list[ScenarioResult] = []
+    for scenario_name, scenario in selected:
+        try:
+            result = scenario(settings)
+        except Exception as exc:
+            result = ScenarioResult(scenario_name, False, f"{type(exc).__name__}: {exc}")
+        marker = "PASS" if result.passed else "FAIL"
+        print(f"[{marker}] {result.name}: {result.details}")
+        if not result.passed:
+            failures.append(result)
+
+    if failures:
+        print(f"\n{len(failures)} scenario(s) failed.", file=sys.stderr)
+        return 1
+    print("\nAll debug pipeline scenarios passed.")
+    return 0
+
+
+def interactive_main(settings: ProductionSettings) -> None:
+    print("Initializing SQL-First RAG Assistant Pipeline (CLI Mode)...")
+    debug_settings = _debug_runtime_settings(settings)
+    pipeline = build_production_pipeline(debug_settings)
+    repository = build_production_repository(debug_settings)
+    llm = _debug_llm_from_pipeline(pipeline)
+
+    user_id = input(f"User ID [default: {debug_settings.debug.user_id}]: ").strip() or debug_settings.debug.user_id
+    gmail_username = input("Gmail username [default: '']: ").strip()
+
+    print("\nAssistant is ready! Type '/exit' or Ctrl+C to quit.")
     while True:
         try:
-            line = input("\nYou> ").strip()
-        except EOFError:
-            print()
-            break
-        if not line:
-            continue
-        parts = shlex.split(line)
-        command = parts[0].casefold() if parts else ""
-        if command in {"quit", "exit"}:
-            break
-        if command == "help":
-            print_help()
-            continue
-        if command == "tables":
-            show_tables(runtime)
-            continue
-        if command == "notifications":
-            show_notifications(runtime)
-            continue
-        if command == "rebuild":
-            rebuild_indexes(runtime)
-            log_step("Rebuild", "Rebuilt local derived indexes from authoritative SQL.")
-            continue
-        if command == "reset":
-            runtime = reset_debug_database()
-            log_step("Reset", f"Deleted and recreated {runtime.settings.debug.db_path}.")
-            continue
-        if command == "autoscan":
-            now_value = parts[1] if len(parts) > 1 else datetime.now(UTC).isoformat()
-            notified = ReminderAutoscan(runtime.repository).scan_due(now_value=now_value)
-            log_step("Reminder Autoscan", {"now": now_value, "notified_reminders": notified})
-            show_notifications(runtime)
-            continue
+            query = input("\nAsk the assistant: ").strip()
+            if not query:
+                continue
+            if query.lower() == "/exit":
+                print("Exiting...")
+                break
 
-        response = handle_with_logs(
-            runtime,
-            make_request(line, user_id=runtime.settings.debug.user_id),
-        )
-        print(f"\nAssistant> {response.final_chat_text}")
+            request_id = new_request_id()
+            start_trace(request_id)
+            response = pipeline.handle(
+                ChatRequest(
+                    user_id=user_id,
+                    raw_query=query,
+                    platform_context={
+                        "gmail_username": gmail_username,
+                    },
+                ),
+                repository,
+            )
+            print_debug_report(response, llm=llm)
+            print(f"\nAssistant:\n{response.final_chat_text}")
+        except KeyboardInterrupt:
+            print("\nExiting...")
+            break
+        except Exception as exc:
+            print_current_debug_trace()
+            print(f"\nError running pipeline: {exc}", file=sys.stderr)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Debug and scenario-test the assistant pipeline.")
+    parser.add_argument(
+        "--scenario-suite",
+        action="store_true",
+        help="Run deterministic architecture/path scenarios and exit.",
+    )
+    parser.add_argument(
+        "--scenario",
+        action="append",
+        default=[],
+        help="Run one named scenario from --list-scenarios. May be repeated.",
+    )
+    parser.add_argument(
+        "--list-scenarios",
+        action="store_true",
+        help="Print deterministic scenario names and exit.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    if args.list_scenarios:
+        for scenario in SCENARIOS:
+            print(scenario.__name__.removeprefix("scenario_"))
+        return 0
+    settings = ProductionSettings.from_env()
+    if args.scenario_suite or args.scenario:
+        return run_scenario_suite(settings, set(args.scenario) if args.scenario else None)
+    interactive_main(settings)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

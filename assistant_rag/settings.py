@@ -47,19 +47,41 @@ class DatabaseSettings:
 @dataclass(frozen=True)
 class OllamaSettings:
     base_url: str = "http://localhost:11434"
-    fast_model: str = "llama3.2:3b"
-    balanced_model: str = "llama3.2:3b"
-    accurate_model: str | None = None
-    writing_model: str | None = None
-    last_qa_model: str | None = None
+    fast_model: str = "qwen2.5:1.5b"
+    balanced_model: str = "qwen3.5:4b"
+    accurate_model: str | None = "qwen2.5:7b"
+    writing_model: str | None = "qwen3.5:4b"
+    intent_model: str | None = "qwen2.5:3b"
+    action_extraction_model: str | None = "qwen3.5:4b"
+    heavy_production_model: str | None = "qwen2.5:7b"
+    heavy_production_enabled: bool = False
+    last_qa_model: str | None = "qwen2.5:3b"
     clarification_merge_model: str | None = None
     structured_retry_count: int = 2
-    keep_alive: str = "10m"
-    default_temperature: float = 0.1
-    answer_temperature: float = 0.4
-    timeout_seconds: float = 60.0
+    keep_alive: int | str = -1
+    default_temperature: float = 0.0
+    query_rewrite_temperature: float = 0.0
+    last_qa_temperature: float = 0.0
+    intent_classifier_temperature: float = 0.0
+    action_detection_temperature: float = 0.0
+    risky_action_temperature: float = 0.0
+    answer_temperature: float = 0.25
+    writing_temperature: float = 0.45
+    timeout_fast: float = 120.0
+    timeout_balanced: float = 120.0
+    timeout_accurate: float = 120.0
+    timeout_writing: float = 120.0
+    timeout_risky_action: float = 120.0
+    num_ctx_fast: int = 1024
+    num_predict_fast: int = 128
+    num_ctx_balanced: int = 4096
+    num_ctx_accurate: int = 8192
+    num_ctx_writing: int = 4096
+    num_predict_writing: int = 1536
+    timeout_seconds: float = 120.0
     last_qa_timeout_seconds: float = 60.0
     clarification_merge_timeout_seconds: float = 60.0
+    general_sub_branch_detector_model: str | None = None
     clarification_question_model: str | None = None
     human_supporting_question_model: str | None = None
     reminder_supporting_question_model: str | None = None
@@ -73,7 +95,7 @@ class OllamaSettings:
     clarification_question_json_retry_count: int = 2
     human_supporting_question_json_retry_count: int = 2
     reminder_supporting_question_json_retry_count: int = 2
-    risky_action_model: str | None = None
+    risky_action_model: str | None = "qwen2.5:3b"
     risky_action_json_retry_count: int = 2
     last_qa_json_retry_count: int = 2
     clarification_merge_json_retry_count: int = 2
@@ -81,13 +103,16 @@ class OllamaSettings:
 
 @dataclass(frozen=True)
 class RetrievalSettings:
-    max_results: int = 6
-    conversation_min_confidence: float = 0.10
-    knowledge_min_confidence: float = 0.15
+    max_results: int = 8
+    bm25_top_k: int = 30
+    chroma_top_k: int = 30
+    min_confidence: float = 0.25
+    conversation_min_confidence: float = 0.40
+    knowledge_min_confidence: float = 0.35
     rrf_k: int = 60
     lexical_weight: float = 1.0
     semantic_weight: float = 1.0
-    rerank_candidate_limit: int = 24
+    rerank_candidate_limit: int = 20
 
 
 @dataclass(frozen=True)
@@ -117,10 +142,11 @@ class ChromaSettings:
 
 @dataclass(frozen=True)
 class EmbeddingSettings:
-    model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    model_name: str = "BAAI/bge-m3"
     device: str | None = None
     batch_size: int = 32
     normalize_embeddings: bool = True
+    max_length: int = 8192
 
 
 @dataclass(frozen=True)
@@ -128,6 +154,7 @@ class RerankerSettings:
     model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     endpoint_url: str | None = None
     timeout_seconds: float = 10.0
+    min_score: float = 0.35
     device: str | None = None
     batch_size: int = 16
     max_candidates: int = 32
@@ -141,11 +168,12 @@ class LastQASettings:
 
 @dataclass(frozen=True)
 class WorkerSettings:
-    outbox_batch_size: int = 25
+    outbox_batch_size: int = 50
     outbox_max_attempts: int = 5
+    outbox_worker_interval_seconds: int = 5
     outbox_retry_backoff_seconds: int = 30
     outbox_processing_timeout_seconds: int = 300
-    autoscan_interval_seconds: int = 10
+    autoscan_interval_seconds: int = 60
 
 
 @dataclass(frozen=True)
@@ -158,6 +186,25 @@ class UISettings:
 class APISettings:
     host: str = "127.0.0.1"
     port: int = 8000
+
+
+@dataclass(frozen=True)
+class SafetySettings:
+    default_timezone: str = "UTC"
+    reminder_duplicate_similarity_threshold: float = 0.65
+    reminder_duplicate_time_window_minutes: int = 30
+    confirmation_expiry_minutes: int = 15
+    confirmation_high_confidence_threshold: float = 0.90
+    allow_missing_idempotency_key: bool = True
+
+
+@dataclass(frozen=True)
+class AuthSettings:
+    issuer: str | None = None
+    audience: str | None = None
+    jwks_url: str | None = None
+    public_key: str | None = None
+    required_scopes: tuple[str, ...] = ()
 
 
 class MutationPartialExecutionPolicy(str, Enum):
@@ -178,10 +225,11 @@ class UnsupportedActionPolicy(str, Enum):
 @dataclass(frozen=True)
 class PromptPolicySettings:
     intent_min_confidence: float = 0.45
-    action_min_confidence: float = 0.55
-    last_qa_min_confidence: float = 0.4
+    action_min_confidence: float = 0.70
+    last_qa_min_confidence: float = 0.75
+    last_qa_skip_broad_retrieval_min_confidence: float = 0.85
     human_in_the_loop_min_confidence: float = 0.6
-    clarification_merge_min_confidence: float = 0.7
+    clarification_merge_min_confidence: float = 0.80
     supporting_question_match_threshold: float = 0.7
     skip_broad_retrieval_allowed_relationships: tuple[str, ...] = (
         "supporting_question_answer",
@@ -191,10 +239,10 @@ class PromptPolicySettings:
     clarification_merge_enabled: bool = True
     last_qa_enable_reminder_metadata_reply: bool = True
     risky_action_validation_enabled: bool = True
-    risky_action_operations: tuple[str, ...] = ("delete", "modify")
-    risky_action_confidence_threshold: float = 0.7
+    risky_action_operations: tuple[str, ...] = ("delete", "modify", "turn_off")
+    risky_action_confidence_threshold: float = 0.85
     knowledge_modify_requires_replacement_text: bool = True
-    context_filter_knowledge_min_confidence: float = 0.15
+    context_filter_knowledge_min_confidence: float = 0.35
     context_filter_allowed_reminder_statuses: tuple[str, ...] = ("scheduled", "notified")
     question_generation_enabled: bool = True
     reminder_supporting_question_enabled: bool = True
@@ -207,6 +255,24 @@ class PromptPolicySettings:
     knowledge_target_ambiguity_margin: float = 0.1
     knowledge_target_not_found_policy: TargetNotFoundPolicy = TargetNotFoundPolicy.SKIP_NOT_FOUND
     unsupported_action_policy: UnsupportedActionPolicy = UnsupportedActionPolicy.REJECT_AND_SKIP
+    conversation_retrieval_after_last_qa_enabled: bool = True
+    conversation_retrieval_before_intent_enabled: bool = True
+    expected_response_type_required: bool = True
+    expected_response_type_fallback_policy: str = "unknown"
+    clarification_expected_response_type_required: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.conversation_retrieval_after_last_qa_enabled, bool):
+            raise ValueError("conversation_retrieval_after_last_qa_enabled must be a boolean")
+        if not isinstance(self.conversation_retrieval_before_intent_enabled, bool):
+            raise ValueError("conversation_retrieval_before_intent_enabled must be a boolean")
+        if not isinstance(self.expected_response_type_required, bool):
+            raise ValueError("expected_response_type_required must be a boolean")
+        if not isinstance(self.clarification_expected_response_type_required, bool):
+            raise ValueError("clarification_expected_response_type_required must be a boolean")
+        if self.expected_response_type_fallback_policy not in {"unknown", "reject"}:
+            raise ValueError("expected_response_type_fallback_policy must be 'unknown' or 'reject'")
+
 
 
 @dataclass(frozen=True)
@@ -219,8 +285,8 @@ class ReminderTargetResolverSettings:
     reminder_status_weight: float = 0.2
     reminder_recency_weight: float = 0.1
     
-    reminder_target_relevance_threshold: float = 0.5
-    reminder_target_ambiguity_margin: float = 0.1
+    reminder_target_relevance_threshold: float = 0.72
+    reminder_target_ambiguity_margin: float = 0.12
     
     reminder_llm_rerank_enabled: bool = False
     reminder_llm_rerank_threshold: float = 0.85
@@ -229,6 +295,7 @@ class ReminderTargetResolverSettings:
     reminder_llm_rerank_json_retry_count: int = 2
     
     reminder_fuzzy_matcher: str = "rapidfuzz"
+    reminder_fuzzy_match_threshold: float = 0.78
     reminder_target_not_found_policy: TargetNotFoundPolicy = TargetNotFoundPolicy.SKIP_NOT_FOUND
     reminder_target_candidate_limit: int = 20
     
@@ -249,6 +316,7 @@ class ReminderTargetResolverSettings:
 
         if not (0.0 <= self.reminder_target_relevance_threshold <= 1.0): raise ValueError("reminder_target_relevance_threshold invalid")
         if not (0.0 <= self.reminder_target_ambiguity_margin <= 1.0): raise ValueError("reminder_target_ambiguity_margin invalid")
+        if not (0.0 <= self.reminder_fuzzy_match_threshold <= 1.0): raise ValueError("reminder_fuzzy_match_threshold invalid")
         if not (0.0 <= self.reminder_llm_rerank_threshold <= 1.0): raise ValueError("reminder_llm_rerank_threshold invalid")
 
         if self.reminder_target_candidate_limit <= 0: raise ValueError("reminder_target_candidate_limit <= 0")
@@ -271,7 +339,7 @@ class RetrievalValidationSettings:
     knowledge_llm_validation_max_candidates: int = 5
     knowledge_llm_validation_failure_policy: str = "fail_closed"
 
-    reminder_llm_validation_enabled: bool = False
+    reminder_llm_validation_enabled: bool = True
     reminder_llm_validation_model: str | None = None
     reminder_llm_validation_min_confidence: float = 0.8
     reminder_llm_validation_json_retry_count: int = 2
@@ -297,11 +365,49 @@ class RetrievalValidationSettings:
 
 
 @dataclass(frozen=True)
+class KnowledgeChunkSettings:
+    chunk_size_tokens: int = 700
+    chunk_overlap_tokens: int = 100
+    min_chunk_tokens: int = 80
+    max_chunk_tokens: int = 1000
+
+    def __post_init__(self) -> None:
+        if self.chunk_size_tokens <= 0:
+            raise ValueError("chunk_size_tokens must be > 0")
+        if self.chunk_overlap_tokens < 0:
+            raise ValueError("chunk_overlap_tokens must be >= 0")
+        if self.min_chunk_tokens <= 0:
+            raise ValueError("min_chunk_tokens must be > 0")
+        if self.max_chunk_tokens < self.min_chunk_tokens:
+            raise ValueError("max_chunk_tokens must be >= min_chunk_tokens")
+
+
+@dataclass(frozen=True)
 class ServiceWaitSettings:
     timeout_seconds: int = 180
     probe_timeout_seconds: int = 5
     poll_interval_seconds: int = 2
     auto_pull_ollama_models: bool = True
+
+
+@dataclass(frozen=True)
+class OperationsSettings:
+    structured_logs_enabled: bool = True
+    log_raw_content: bool = False
+    debug_trace_responses: bool = False
+    metrics_enabled: bool = True
+    health_strict_opensearch: bool = False
+    health_strict_chroma: bool = False
+    health_strict_ollama: bool = False
+    health_strict_redis: bool = False
+    health_strict_storage: bool = False
+    index_rebuild_batch_size: int = 100
+    drift_repair_enabled: bool = False
+    recurrence_default_timezone: str = "UTC"
+    eval_top_1_threshold: float = 0.70
+    eval_top_3_threshold: float = 0.85
+    eval_wrong_target_rate_max: float = 0.02
+    eval_false_mutation_rate_max: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -331,6 +437,66 @@ class DebugSettings:
 
 
 @dataclass(frozen=True)
+class ContextFilterSettings:
+    conversation_min_confidence: float = 0.40
+    conversation_approved_max_items: int = 8
+    conversation_duplicate_threshold: float = 0.92
+    knowledge_approved_max_items: int = 8
+    knowledge_duplicate_threshold: float = 0.95
+    low_information_text_patterns: tuple[str, ...] = (
+        "done", "saved", "updated successfully", "ok", "noted", "sure"
+    )
+    reminder_approved_max_items: int = 8
+    reminder_min_confidence: float = 0.50
+    semantic_context_judge_enabled: bool = False
+    context_filter_debug_diagnostics_enabled: bool = False
+    low_information_min_chars: int = 10
+
+
+@dataclass(frozen=True)
+class GeneralPurposeSettings:
+    general_sub_branch_detector_enabled: bool = True
+    general_sub_branch_confidence_threshold: float = 0.55
+    general_sub_branch_fallback_mode: str = "new_conversation_topic"
+    general_sub_branch_detector_json_retry_count: int = 2
+    content_composer_enabled: bool = True
+    content_composer_max_iterations: int = 3
+    content_composer_tool_timeout_seconds: float = 60.0
+    content_composer_allowed_tools: tuple[str, ...] = (
+        "answer_generation", "generate_excel", "generate_pdf", "generate_pptx",
+    )
+    content_composer_default_tool: str = "answer_generation"
+    content_composer_fallback_tool: str = "answer_generation"
+    content_composer_react_enabled: bool = True
+    content_composer_short_circuit_single_tool: bool = True
+    content_composer_debug_trace_enabled: bool = False
+    excel_tool_signal_keywords: tuple[str, ...] = (
+        "excel", "spreadsheet", "workbook", "xlsx", "data table",
+        "tracker", "kpi dashboard", "financial model", "data grid",
+        "rows and columns",
+    )
+    pdf_tool_signal_keywords: tuple[str, ...] = (
+        "pdf", "report", "formal document", "business report", "proposal",
+        "memo", "white paper", "executive summary", "structured document",
+    )
+    pptx_tool_signal_keywords: tuple[str, ...] = (
+        "powerpoint", "pptx", "presentation", "slide deck", "slides",
+        "pitch deck", "slideshow", "deck", "make slides",
+    )
+    hitl_supporting_question_enabled: bool = True
+    hitl_supporting_question_confidence_threshold: float = 0.65
+    hitl_supporting_question_recent_question_window: int = 3
+    hitl_supporting_question_max_length: int = 200
+    hitl_supporting_question_safety_mode: str = "standard"
+    general_response_persistence_policy: str = "sub_branch_driven"
+    sub_branch_prompt_mode: str = "sub_branch_driven"
+    general_response_default_topic_title: str = "General Conversation"
+    documents_dir: str | None = None
+    artifact_storage_dir: str = "assistant_data/artifacts"
+    artifact_download_base_url: str = "/artifacts"
+
+
+@dataclass(frozen=True)
 class ProductionSettings:
     database: DatabaseSettings = field(default_factory=DatabaseSettings)
     ollama: OllamaSettings = field(default_factory=OllamaSettings)
@@ -343,11 +509,17 @@ class ProductionSettings:
     worker: WorkerSettings = field(default_factory=WorkerSettings)
     ui: UISettings = field(default_factory=UISettings)
     api: APISettings = field(default_factory=APISettings)
+    safety: SafetySettings = field(default_factory=SafetySettings)
+    auth: AuthSettings = field(default_factory=AuthSettings)
     prompt_policy: PromptPolicySettings = field(default_factory=PromptPolicySettings)
     reminder_resolver: ReminderTargetResolverSettings = field(default_factory=ReminderTargetResolverSettings)
     retrieval_validation: RetrievalValidationSettings = field(default_factory=RetrievalValidationSettings)
+    knowledge_chunks: KnowledgeChunkSettings = field(default_factory=KnowledgeChunkSettings)
     service_wait: ServiceWaitSettings = field(default_factory=ServiceWaitSettings)
+    operations: OperationsSettings = field(default_factory=OperationsSettings)
     debug: DebugSettings = field(default_factory=DebugSettings)
+    context_filter: ContextFilterSettings = field(default_factory=ContextFilterSettings)
+    general_purpose: GeneralPurposeSettings = field(default_factory=GeneralPurposeSettings)
 
     @classmethod
     def from_env(cls) -> "ProductionSettings":
@@ -370,20 +542,76 @@ class ProductionSettings:
                 balanced_model=os.getenv(
                     "OLLAMA_BALANCED_MODEL", OllamaSettings.balanced_model
                 ),
-                accurate_model=os.getenv("OLLAMA_ACCURATE_MODEL") or None,
-                writing_model=os.getenv("OLLAMA_WRITING_MODEL") or None,
-                last_qa_model=os.getenv("OLLAMA_LAST_QA_MODEL") or None,
+                accurate_model=os.getenv("OLLAMA_ACCURATE_MODEL", OllamaSettings.accurate_model or "") or None,
+                writing_model=os.getenv("OLLAMA_WRITING_MODEL", OllamaSettings.writing_model or "") or None,
+                intent_model=os.getenv("OLLAMA_INTENT_MODEL", OllamaSettings.intent_model or "") or None,
+                action_extraction_model=os.getenv("OLLAMA_ACTION_EXTRACTION_MODEL", OllamaSettings.action_extraction_model or "") or None,
+                heavy_production_model=os.getenv("OLLAMA_HEAVY_PRODUCTION_MODEL", OllamaSettings.heavy_production_model or "") or None,
+                heavy_production_enabled=_get_bool("OLLAMA_HEAVY_PRODUCTION_ENABLED", OllamaSettings.heavy_production_enabled),
+                last_qa_model=os.getenv("OLLAMA_LAST_QA_MODEL", OllamaSettings.last_qa_model or "") or None,
                 clarification_merge_model=os.getenv("OLLAMA_CLARIFICATION_MERGE_MODEL") or None,
                 structured_retry_count=_get_int(
                     "OLLAMA_STRUCTURED_RETRY_COUNT",
                     OllamaSettings.structured_retry_count,
                 ),
-                keep_alive=os.getenv("OLLAMA_KEEP_ALIVE", OllamaSettings.keep_alive),
+                keep_alive=-1 if os.getenv("OLLAMA_KEEP_ALIVE", str(OllamaSettings.keep_alive)) == "-1" else os.getenv("OLLAMA_KEEP_ALIVE", OllamaSettings.keep_alive),
                 default_temperature=_get_float(
                     "OLLAMA_DEFAULT_TEMPERATURE", OllamaSettings.default_temperature
                 ),
+                query_rewrite_temperature=_get_float(
+                    "QUERY_REWRITE_TEMPERATURE", OllamaSettings.query_rewrite_temperature
+                ),
+                last_qa_temperature=_get_float(
+                    "LAST_QA_TEMPERATURE", OllamaSettings.last_qa_temperature
+                ),
+                intent_classifier_temperature=_get_float(
+                    "INTENT_CLASSIFIER_TEMPERATURE", OllamaSettings.intent_classifier_temperature
+                ),
+                action_detection_temperature=_get_float(
+                    "ACTION_DETECTION_TEMPERATURE", OllamaSettings.action_detection_temperature
+                ),
+                risky_action_temperature=_get_float(
+                    "RISKY_ACTION_TEMPERATURE", OllamaSettings.risky_action_temperature
+                ),
                 answer_temperature=_get_float(
-                    "OLLAMA_ANSWER_TEMPERATURE", OllamaSettings.answer_temperature
+                    "ANSWER_GENERATION_TEMPERATURE",
+                    _get_float("OLLAMA_ANSWER_TEMPERATURE", OllamaSettings.answer_temperature),
+                ),
+                writing_temperature=_get_float(
+                    "WRITING_TEMPERATURE", OllamaSettings.writing_temperature
+                ),
+                timeout_fast=_get_float(
+                    "OLLAMA_TIMEOUT_FAST", OllamaSettings.timeout_fast
+                ),
+                timeout_balanced=_get_float(
+                    "OLLAMA_TIMEOUT_BALANCED", OllamaSettings.timeout_balanced
+                ),
+                timeout_accurate=_get_float(
+                    "OLLAMA_TIMEOUT_ACCURATE", OllamaSettings.timeout_accurate
+                ),
+                timeout_writing=_get_float(
+                    "OLLAMA_TIMEOUT_WRITING", OllamaSettings.timeout_writing
+                ),
+                timeout_risky_action=_get_float(
+                    "OLLAMA_TIMEOUT_RISKY_ACTION", OllamaSettings.timeout_risky_action
+                ),
+                num_ctx_fast=_get_int(
+                    "OLLAMA_NUM_CTX_FAST", OllamaSettings.num_ctx_fast
+                ),
+                num_predict_fast=_get_int(
+                    "OLLAMA_NUM_PREDICT_FAST", OllamaSettings.num_predict_fast
+                ),
+                num_ctx_balanced=_get_int(
+                    "OLLAMA_NUM_CTX_BALANCED", OllamaSettings.num_ctx_balanced
+                ),
+                num_ctx_accurate=_get_int(
+                    "OLLAMA_NUM_CTX_ACCURATE", OllamaSettings.num_ctx_accurate
+                ),
+                num_ctx_writing=_get_int(
+                    "OLLAMA_NUM_CTX_WRITING", OllamaSettings.num_ctx_writing
+                ),
+                num_predict_writing=_get_int(
+                    "OLLAMA_NUM_PREDICT_WRITING", OllamaSettings.num_predict_writing
                 ),
                 timeout_seconds=_get_float(
                     "OLLAMA_TIMEOUT_SECONDS", OllamaSettings.timeout_seconds
@@ -394,6 +622,7 @@ class ProductionSettings:
                 clarification_merge_timeout_seconds=_get_float(
                     "OLLAMA_CLARIFICATION_MERGE_TIMEOUT_SECONDS", OllamaSettings.clarification_merge_timeout_seconds
                 ),
+                general_sub_branch_detector_model=os.getenv("GENERAL_SUB_BRANCH_DETECTOR_MODEL") or None,
                 clarification_question_model=os.getenv("OLLAMA_CLARIFICATION_QUESTION_MODEL") or None,
                 human_supporting_question_model=os.getenv("OLLAMA_HUMAN_SUPPORTING_QUESTION_MODEL") or None,
                 reminder_supporting_question_model=os.getenv("OLLAMA_REMINDER_SUPPORTING_QUESTION_MODEL") or None,
@@ -407,22 +636,26 @@ class ProductionSettings:
                 clarification_question_json_retry_count=_get_int("OLLAMA_CLARIFICATION_QUESTION_JSON_RETRY_COUNT", OllamaSettings.clarification_question_json_retry_count),
                 human_supporting_question_json_retry_count=_get_int("OLLAMA_HUMAN_SUPPORTING_QUESTION_JSON_RETRY_COUNT", OllamaSettings.human_supporting_question_json_retry_count),
                 reminder_supporting_question_json_retry_count=_get_int("OLLAMA_REMINDER_SUPPORTING_QUESTION_JSON_RETRY_COUNT", OllamaSettings.reminder_supporting_question_json_retry_count),
-                risky_action_model=os.getenv("OLLAMA_RISKY_ACTION_MODEL") or None,
+                risky_action_model=os.getenv("OLLAMA_RISKY_ACTION_MODEL", OllamaSettings.risky_action_model or "") or None,
                 risky_action_json_retry_count=_get_int("OLLAMA_RISKY_ACTION_JSON_RETRY_COUNT", OllamaSettings.risky_action_json_retry_count),
                 last_qa_json_retry_count=_get_int("OLLAMA_LAST_QA_JSON_RETRY_COUNT", OllamaSettings.last_qa_json_retry_count),
                 clarification_merge_json_retry_count=_get_int("OLLAMA_CLARIFICATION_MERGE_JSON_RETRY_COUNT", OllamaSettings.clarification_merge_json_retry_count),
             ),
+
             retrieval=RetrievalSettings(
-                max_results=_get_int("ASSISTANT_MAX_RESULTS", RetrievalSettings.max_results),
+                max_results=_get_int("FINAL_CONTEXT_TOP_K", _get_int("ASSISTANT_MAX_RESULTS", RetrievalSettings.max_results)),
+                bm25_top_k=_get_int("BM25_TOP_K", RetrievalSettings.bm25_top_k),
+                chroma_top_k=_get_int("CHROMA_TOP_K", RetrievalSettings.chroma_top_k),
+                min_confidence=_get_float("RETRIEVAL_MIN_CONFIDENCE", RetrievalSettings.min_confidence),
                 conversation_min_confidence=_get_float(
-                    "ASSISTANT_CONVERSATION_MIN_CONFIDENCE",
-                    RetrievalSettings.conversation_min_confidence,
+                    "CONVERSATION_CONTEXT_MIN_CONFIDENCE",
+                    _get_float("ASSISTANT_CONVERSATION_MIN_CONFIDENCE", RetrievalSettings.conversation_min_confidence),
                 ),
                 knowledge_min_confidence=_get_float(
-                    "ASSISTANT_KNOWLEDGE_MIN_CONFIDENCE",
-                    RetrievalSettings.knowledge_min_confidence,
+                    "KNOWLEDGE_CONTEXT_MIN_CONFIDENCE",
+                    _get_float("ASSISTANT_KNOWLEDGE_MIN_CONFIDENCE", RetrievalSettings.knowledge_min_confidence),
                 ),
-                rrf_k=_get_int("ASSISTANT_RRF_K", RetrievalSettings.rrf_k),
+                rrf_k=_get_int("RRF_K", _get_int("ASSISTANT_RRF_K", RetrievalSettings.rrf_k)),
                 lexical_weight=_get_float(
                     "ASSISTANT_RRF_LEXICAL_WEIGHT", RetrievalSettings.lexical_weight
                 ),
@@ -430,8 +663,8 @@ class ProductionSettings:
                     "ASSISTANT_RRF_SEMANTIC_WEIGHT", RetrievalSettings.semantic_weight
                 ),
                 rerank_candidate_limit=_get_int(
-                    "ASSISTANT_RERANK_CANDIDATE_LIMIT",
-                    RetrievalSettings.rerank_candidate_limit,
+                    "RERANKER_TOP_K",
+                    _get_int("ASSISTANT_RERANK_CANDIDATE_LIMIT", RetrievalSettings.rerank_candidate_limit),
                 ),
             ),
             opensearch=OpenSearchSettings(
@@ -484,16 +717,19 @@ class ProductionSettings:
             ),
             embeddings=EmbeddingSettings(
                 model_name=os.getenv(
-                    "ASSISTANT_EMBEDDING_MODEL", EmbeddingSettings.model_name
+                    "EMBEDDING_MODEL_NAME",
+                    os.getenv("ASSISTANT_EMBEDDING_MODEL", EmbeddingSettings.model_name),
                 ),
                 device=os.getenv("ASSISTANT_EMBEDDING_DEVICE") or None,
                 batch_size=_get_int(
-                    "ASSISTANT_EMBEDDING_BATCH_SIZE", EmbeddingSettings.batch_size
+                    "EMBEDDING_BATCH_SIZE",
+                    _get_int("ASSISTANT_EMBEDDING_BATCH_SIZE", EmbeddingSettings.batch_size),
                 ),
                 normalize_embeddings=_get_bool(
-                    "ASSISTANT_EMBEDDING_NORMALIZE",
-                    EmbeddingSettings.normalize_embeddings,
+                    "EMBEDDING_NORMALIZE",
+                    _get_bool("ASSISTANT_EMBEDDING_NORMALIZE", EmbeddingSettings.normalize_embeddings),
                 ),
+                max_length=_get_int("EMBEDDING_MAX_LENGTH", EmbeddingSettings.max_length),
             ),
             reranker=RerankerSettings(
                 model_name=os.getenv("ASSISTANT_RERANKER_MODEL", RerankerSettings.model_name),
@@ -502,8 +738,12 @@ class ProductionSettings:
                     "ASSISTANT_RERANKER_TIMEOUT_SECONDS",
                     RerankerSettings.timeout_seconds,
                 ),
+                min_score=_get_float("RERANKER_MIN_SCORE", RerankerSettings.min_score),
                 device=os.getenv("ASSISTANT_RERANKER_DEVICE") or None,
-                batch_size=_get_int("ASSISTANT_RERANKER_BATCH_SIZE", RerankerSettings.batch_size),
+                batch_size=_get_int(
+                    "RERANKER_BATCH_SIZE",
+                    _get_int("ASSISTANT_RERANKER_BATCH_SIZE", RerankerSettings.batch_size),
+                ),
                 max_candidates=_get_int(
                     "ASSISTANT_RERANKER_MAX_CANDIDATES", RerankerSettings.max_candidates
                 ),
@@ -514,22 +754,28 @@ class ProductionSettings:
             ),
             worker=WorkerSettings(
                 outbox_batch_size=_get_int(
-                    "ASSISTANT_OUTBOX_BATCH_SIZE", WorkerSettings.outbox_batch_size
+                    "OUTBOX_BATCH_SIZE",
+                    _get_int("ASSISTANT_OUTBOX_BATCH_SIZE", WorkerSettings.outbox_batch_size),
                 ),
                 outbox_max_attempts=_get_int(
-                    "ASSISTANT_OUTBOX_MAX_ATTEMPTS", WorkerSettings.outbox_max_attempts
+                    "OUTBOX_MAX_RETRIES",
+                    _get_int("ASSISTANT_OUTBOX_MAX_ATTEMPTS", WorkerSettings.outbox_max_attempts),
+                ),
+                outbox_worker_interval_seconds=_get_int(
+                    "OUTBOX_WORKER_INTERVAL_SECONDS",
+                    WorkerSettings.outbox_worker_interval_seconds,
                 ),
                 outbox_retry_backoff_seconds=_get_int(
-                    "ASSISTANT_OUTBOX_RETRY_BACKOFF_SECONDS",
-                    WorkerSettings.outbox_retry_backoff_seconds,
+                    "OUTBOX_RETRY_BACKOFF_SECONDS",
+                    _get_int("ASSISTANT_OUTBOX_RETRY_BACKOFF_SECONDS", WorkerSettings.outbox_retry_backoff_seconds),
                 ),
                 outbox_processing_timeout_seconds=_get_int(
-                    "ASSISTANT_OUTBOX_PROCESSING_TIMEOUT_SECONDS",
-                    WorkerSettings.outbox_processing_timeout_seconds,
+                    "OUTBOX_STALE_PROCESSING_AFTER_SECONDS",
+                    _get_int("ASSISTANT_OUTBOX_PROCESSING_TIMEOUT_SECONDS", WorkerSettings.outbox_processing_timeout_seconds),
                 ),
                 autoscan_interval_seconds=_get_int(
-                    "ASSISTANT_AUTOSCAN_INTERVAL_SECONDS",
-                    WorkerSettings.autoscan_interval_seconds,
+                    "REMINDER_AUTOSCAN_INTERVAL_SECONDS",
+                    _get_int("ASSISTANT_AUTOSCAN_INTERVAL_SECONDS", WorkerSettings.autoscan_interval_seconds),
                 ),
             ),
             ui=UISettings(
@@ -543,26 +789,65 @@ class ProductionSettings:
                 host=os.getenv("ASSISTANT_API_HOST", APISettings.host),
                 port=_get_int("ASSISTANT_API_PORT", APISettings.port),
             ),
+            safety=SafetySettings(
+                default_timezone=os.getenv("ASSISTANT_DEFAULT_TIMEZONE", SafetySettings.default_timezone),
+                reminder_duplicate_similarity_threshold=_get_float(
+                    "ASSISTANT_REMINDER_DUPLICATE_SIMILARITY_THRESHOLD",
+                    SafetySettings.reminder_duplicate_similarity_threshold,
+                ),
+                reminder_duplicate_time_window_minutes=_get_int(
+                    "ASSISTANT_REMINDER_DUPLICATE_TIME_WINDOW_MINUTES",
+                    SafetySettings.reminder_duplicate_time_window_minutes,
+                ),
+                confirmation_expiry_minutes=_get_int(
+                    "ASSISTANT_CONFIRMATION_EXPIRY_MINUTES",
+                    SafetySettings.confirmation_expiry_minutes,
+                ),
+                confirmation_high_confidence_threshold=_get_float(
+                    "ASSISTANT_CONFIRMATION_HIGH_CONFIDENCE_THRESHOLD",
+                    SafetySettings.confirmation_high_confidence_threshold,
+                ),
+                allow_missing_idempotency_key=_get_bool(
+                    "ASSISTANT_ALLOW_MISSING_IDEMPOTENCY_KEY",
+                    SafetySettings.allow_missing_idempotency_key,
+                ),
+            ),
+            auth=AuthSettings(
+                issuer=os.getenv("AUTH_JWT_ISSUER") or None,
+                audience=os.getenv("AUTH_JWT_AUDIENCE") or None,
+                jwks_url=os.getenv("AUTH_JWKS_URL") or None,
+                public_key=os.getenv("AUTH_JWT_PUBLIC_KEY") or None,
+                required_scopes=_get_tuple("AUTH_REQUIRED_SCOPES", AuthSettings.required_scopes),
+            ),
             prompt_policy=PromptPolicySettings(
+                conversation_retrieval_after_last_qa_enabled=_get_bool("ASSISTANT_CONVERSATION_RETRIEVAL_AFTER_LAST_QA", PromptPolicySettings.conversation_retrieval_after_last_qa_enabled),
+                conversation_retrieval_before_intent_enabled=_get_bool("ASSISTANT_CONVERSATION_RETRIEVAL_BEFORE_INTENT", PromptPolicySettings.conversation_retrieval_before_intent_enabled),
+                expected_response_type_required=_get_bool("ASSISTANT_EXPECTED_RESPONSE_TYPE_REQUIRED", PromptPolicySettings.expected_response_type_required),
+                clarification_expected_response_type_required=_get_bool("ASSISTANT_CLARIFICATION_EXPECTED_RESPONSE_TYPE_REQUIRED", PromptPolicySettings.clarification_expected_response_type_required),
+                expected_response_type_fallback_policy=os.getenv("ASSISTANT_EXPECTED_RESPONSE_TYPE_FALLBACK_POLICY", PromptPolicySettings.expected_response_type_fallback_policy),
                 intent_min_confidence=_get_float(
                     "PROMPT_INTENT_MIN_CONFIDENCE",
                     PromptPolicySettings.intent_min_confidence,
                 ),
                 action_min_confidence=_get_float(
-                    "PROMPT_ACTION_MIN_CONFIDENCE",
-                    PromptPolicySettings.action_min_confidence,
+                    "ACTION_MIN_CONFIDENCE",
+                    _get_float("PROMPT_ACTION_MIN_CONFIDENCE", PromptPolicySettings.action_min_confidence),
                 ),
                 last_qa_min_confidence=_get_float(
-                    "PROMPT_LAST_QA_MIN_CONFIDENCE",
-                    PromptPolicySettings.last_qa_min_confidence,
+                    "LAST_QA_MIN_CONFIDENCE",
+                    _get_float("PROMPT_LAST_QA_MIN_CONFIDENCE", PromptPolicySettings.last_qa_min_confidence),
+                ),
+                last_qa_skip_broad_retrieval_min_confidence=_get_float(
+                    "LAST_QA_SKIP_BROAD_RETRIEVAL_MIN_CONFIDENCE",
+                    PromptPolicySettings.last_qa_skip_broad_retrieval_min_confidence,
                 ),
                 human_in_the_loop_min_confidence=_get_float(
                     "PROMPT_HITL_MIN_CONFIDENCE",
                     PromptPolicySettings.human_in_the_loop_min_confidence,
                 ),
                 clarification_merge_min_confidence=_get_float(
-                    "PROMPT_CLARIFICATION_MERGE_MIN_CONFIDENCE",
-                    PromptPolicySettings.clarification_merge_min_confidence,
+                    "LAST_QA_CLARIFICATION_MERGE_MIN_CONFIDENCE",
+                    _get_float("PROMPT_CLARIFICATION_MERGE_MIN_CONFIDENCE", PromptPolicySettings.clarification_merge_min_confidence),
                 ),
                 supporting_question_match_threshold=_get_float(
                     "PROMPT_SUPPORTING_QUESTION_MATCH_THRESHOLD",
@@ -581,24 +866,24 @@ class ProductionSettings:
                     PromptPolicySettings.last_qa_enable_reminder_metadata_reply,
                 ),
                 risky_action_validation_enabled=_get_bool(
-                    "PROMPT_RISKY_ACTION_VALIDATION_ENABLED",
-                    PromptPolicySettings.risky_action_validation_enabled,
+                    "RISKY_ACTION_VALIDATION_ENABLED",
+                    _get_bool("PROMPT_RISKY_ACTION_VALIDATION_ENABLED", PromptPolicySettings.risky_action_validation_enabled),
                 ),
                 risky_action_operations=_get_tuple(
-                    "PROMPT_RISKY_ACTION_OPERATIONS",
-                    PromptPolicySettings.risky_action_operations,
+                    "RISKY_ACTION_OPERATIONS",
+                    _get_tuple("PROMPT_RISKY_ACTION_OPERATIONS", PromptPolicySettings.risky_action_operations),
                 ),
                 risky_action_confidence_threshold=_get_float(
-                    "PROMPT_RISKY_ACTION_CONFIDENCE_THRESHOLD",
-                    PromptPolicySettings.risky_action_confidence_threshold,
+                    "RISKY_ACTION_CONFIDENCE_THRESHOLD",
+                    _get_float("PROMPT_RISKY_ACTION_CONFIDENCE_THRESHOLD", PromptPolicySettings.risky_action_confidence_threshold),
                 ),
                 knowledge_modify_requires_replacement_text=_get_bool(
                     "PROMPT_KNOWLEDGE_MODIFY_REQUIRES_REPLACEMENT_TEXT",
                     PromptPolicySettings.knowledge_modify_requires_replacement_text,
                 ),
                 context_filter_knowledge_min_confidence=_get_float(
-                    "PROMPT_CONTEXT_FILTER_KNOWLEDGE_MIN_CONFIDENCE",
-                    PromptPolicySettings.context_filter_knowledge_min_confidence,
+                    "KNOWLEDGE_CONTEXT_MIN_CONFIDENCE",
+                    _get_float("PROMPT_CONTEXT_FILTER_KNOWLEDGE_MIN_CONFIDENCE", PromptPolicySettings.context_filter_knowledge_min_confidence),
                 ),
                 context_filter_allowed_reminder_statuses=_get_tuple(
                     "PROMPT_CONTEXT_FILTER_ALLOWED_REMINDER_STATUSES",
@@ -663,7 +948,7 @@ class ProductionSettings:
                 reminder_entity_weight=_get_float("REMINDER_ENTITY_WEIGHT", ReminderTargetResolverSettings.reminder_entity_weight),
                 reminder_status_weight=_get_float("REMINDER_STATUS_WEIGHT", ReminderTargetResolverSettings.reminder_status_weight),
                 reminder_recency_weight=_get_float("REMINDER_RECENCY_WEIGHT", ReminderTargetResolverSettings.reminder_recency_weight),
-                reminder_target_relevance_threshold=_get_float("REMINDER_TARGET_RELEVANCE_THRESHOLD", ReminderTargetResolverSettings.reminder_target_relevance_threshold),
+                reminder_target_relevance_threshold=_get_float("REMINDER_TARGET_MIN_SCORE", _get_float("REMINDER_TARGET_RELEVANCE_THRESHOLD", ReminderTargetResolverSettings.reminder_target_relevance_threshold)),
                 reminder_target_ambiguity_margin=_get_float("REMINDER_TARGET_AMBIGUITY_MARGIN", ReminderTargetResolverSettings.reminder_target_ambiguity_margin),
                 reminder_llm_rerank_enabled=_get_bool("REMINDER_LLM_RERANK_ENABLED", ReminderTargetResolverSettings.reminder_llm_rerank_enabled),
                 reminder_llm_rerank_threshold=_get_float("REMINDER_LLM_RERANK_THRESHOLD", ReminderTargetResolverSettings.reminder_llm_rerank_threshold),
@@ -671,8 +956,9 @@ class ProductionSettings:
                 reminder_llm_rerank_model=os.getenv("REMINDER_LLM_RERANK_MODEL") or None,
                 reminder_llm_rerank_json_retry_count=_get_int("REMINDER_LLM_RERANK_JSON_RETRY_COUNT", ReminderTargetResolverSettings.reminder_llm_rerank_json_retry_count),
                 reminder_fuzzy_matcher=os.getenv("REMINDER_FUZZY_MATCHER", ReminderTargetResolverSettings.reminder_fuzzy_matcher),
+                reminder_fuzzy_match_threshold=_get_float("REMINDER_FUZZY_MATCH_THRESHOLD", ReminderTargetResolverSettings.reminder_fuzzy_match_threshold),
                 reminder_target_not_found_policy=TargetNotFoundPolicy(os.getenv("REMINDER_TARGET_NOT_FOUND_POLICY", ReminderTargetResolverSettings.reminder_target_not_found_policy.value)),
-                reminder_target_candidate_limit=_get_int("REMINDER_TARGET_CANDIDATE_LIMIT", ReminderTargetResolverSettings.reminder_target_candidate_limit),
+                reminder_target_candidate_limit=_get_int("REMINDER_CANDIDATE_LIMIT", _get_int("REMINDER_TARGET_CANDIDATE_LIMIT", ReminderTargetResolverSettings.reminder_target_candidate_limit)),
                 allowed_reminder_modify_statuses=_get_tuple("ALLOWED_REMINDER_MODIFY_STATUSES", ReminderTargetResolverSettings.allowed_reminder_modify_statuses),
                 allowed_reminder_turn_on_statuses=_get_tuple("ALLOWED_REMINDER_TURN_ON_STATUSES", ReminderTargetResolverSettings.allowed_reminder_turn_on_statuses),
                 allowed_reminder_turn_off_statuses=_get_tuple("ALLOWED_REMINDER_TURN_OFF_STATUSES", ReminderTargetResolverSettings.allowed_reminder_turn_off_statuses),
@@ -693,6 +979,12 @@ class ProductionSettings:
                 reminder_llm_validation_max_candidates=_get_int("REMINDER_LLM_VALIDATION_MAX_CANDIDATES", RetrievalValidationSettings.reminder_llm_validation_max_candidates),
                 destructive_action_requires_unambiguous_target=_get_bool("DESTRUCTIVE_ACTION_REQUIRES_UNAMBIGUOUS_TARGET", RetrievalValidationSettings.destructive_action_requires_unambiguous_target),
             ),
+            knowledge_chunks=KnowledgeChunkSettings(
+                chunk_size_tokens=_get_int("KNOWLEDGE_CHUNK_SIZE_TOKENS", KnowledgeChunkSettings.chunk_size_tokens),
+                chunk_overlap_tokens=_get_int("KNOWLEDGE_CHUNK_OVERLAP_TOKENS", KnowledgeChunkSettings.chunk_overlap_tokens),
+                min_chunk_tokens=_get_int("KNOWLEDGE_MIN_CHUNK_TOKENS", KnowledgeChunkSettings.min_chunk_tokens),
+                max_chunk_tokens=_get_int("KNOWLEDGE_MAX_CHUNK_TOKENS", KnowledgeChunkSettings.max_chunk_tokens),
+            ),
             service_wait=ServiceWaitSettings(
                 timeout_seconds=_get_int(
                     "ASSISTANT_SERVICE_WAIT_SECONDS",
@@ -710,6 +1002,24 @@ class ProductionSettings:
                     "ASSISTANT_AUTO_PULL_OLLAMA_MODELS",
                     ServiceWaitSettings.auto_pull_ollama_models,
                 ),
+            ),
+            operations=OperationsSettings(
+                structured_logs_enabled=_get_bool("ASSISTANT_STRUCTURED_LOGS_ENABLED", OperationsSettings.structured_logs_enabled),
+                log_raw_content=_get_bool("ASSISTANT_LOG_RAW_CONTENT", OperationsSettings.log_raw_content),
+                debug_trace_responses=_get_bool("ASSISTANT_DEBUG_TRACE_RESPONSES", OperationsSettings.debug_trace_responses),
+                metrics_enabled=_get_bool("ASSISTANT_METRICS_ENABLED", OperationsSettings.metrics_enabled),
+                health_strict_opensearch=_get_bool("ASSISTANT_HEALTH_STRICT_OPENSEARCH", OperationsSettings.health_strict_opensearch),
+                health_strict_chroma=_get_bool("ASSISTANT_HEALTH_STRICT_CHROMA", OperationsSettings.health_strict_chroma),
+                health_strict_ollama=_get_bool("ASSISTANT_HEALTH_STRICT_OLLAMA", OperationsSettings.health_strict_ollama),
+                health_strict_redis=_get_bool("ASSISTANT_HEALTH_STRICT_REDIS", OperationsSettings.health_strict_redis),
+                health_strict_storage=_get_bool("ASSISTANT_HEALTH_STRICT_STORAGE", OperationsSettings.health_strict_storage),
+                index_rebuild_batch_size=_get_int("ASSISTANT_INDEX_REBUILD_BATCH_SIZE", OperationsSettings.index_rebuild_batch_size),
+                drift_repair_enabled=_get_bool("ASSISTANT_DRIFT_REPAIR_ENABLED", OperationsSettings.drift_repair_enabled),
+                recurrence_default_timezone=os.getenv("ASSISTANT_RECURRENCE_DEFAULT_TIMEZONE", OperationsSettings.recurrence_default_timezone),
+                eval_top_1_threshold=_get_float("ASSISTANT_EVAL_TOP_1_THRESHOLD", OperationsSettings.eval_top_1_threshold),
+                eval_top_3_threshold=_get_float("ASSISTANT_EVAL_TOP_3_THRESHOLD", OperationsSettings.eval_top_3_threshold),
+                eval_wrong_target_rate_max=_get_float("ASSISTANT_EVAL_WRONG_TARGET_RATE_MAX", OperationsSettings.eval_wrong_target_rate_max),
+                eval_false_mutation_rate_max=_get_float("ASSISTANT_EVAL_FALSE_MUTATION_RATE_MAX", OperationsSettings.eval_false_mutation_rate_max),
             ),
             debug=DebugSettings(
                 db_path=os.getenv("ASSISTANT_DEBUG_DB_PATH", DebugSettings.db_path),
@@ -783,5 +1093,44 @@ class ProductionSettings:
                     "DEBUG_CHROMA_KNOWLEDGE_COLLECTION",
                     DebugSettings.chroma_knowledge_collection,
                 ),
+            ),
+            context_filter=ContextFilterSettings(
+                conversation_min_confidence=_get_float("CONVERSATION_CONTEXT_MIN_CONFIDENCE", _get_float("CONTEXT_FILTER_CONVERSATION_MIN_CONFIDENCE", ContextFilterSettings.conversation_min_confidence)),
+                conversation_approved_max_items=_get_int("FINAL_CONTEXT_TOP_K", _get_int("CONTEXT_FILTER_CONVERSATION_MAX_ITEMS", ContextFilterSettings.conversation_approved_max_items)),
+                conversation_duplicate_threshold=_get_float("CONTEXT_FILTER_CONVERSATION_DEDUP_THRESHOLD", ContextFilterSettings.conversation_duplicate_threshold),
+                knowledge_approved_max_items=_get_int("FINAL_CONTEXT_TOP_K", _get_int("CONTEXT_FILTER_KNOWLEDGE_MAX_ITEMS", ContextFilterSettings.knowledge_approved_max_items)),
+                knowledge_duplicate_threshold=_get_float("CONTEXT_FILTER_KNOWLEDGE_DEDUP_THRESHOLD", ContextFilterSettings.knowledge_duplicate_threshold),
+                low_information_text_patterns=_get_tuple("CONTEXT_FILTER_LOW_INFO_PATTERNS", ContextFilterSettings.low_information_text_patterns),
+                reminder_approved_max_items=_get_int("FINAL_CONTEXT_TOP_K", _get_int("CONTEXT_FILTER_REMINDER_MAX_ITEMS", ContextFilterSettings.reminder_approved_max_items)),
+                reminder_min_confidence=_get_float("REMINDER_CONTEXT_MIN_CONFIDENCE", ContextFilterSettings.reminder_min_confidence),
+                semantic_context_judge_enabled=_get_bool("CONTEXT_FILTER_SEMANTIC_JUDGE_ENABLED", ContextFilterSettings.semantic_context_judge_enabled),
+                context_filter_debug_diagnostics_enabled=_get_bool("CONTEXT_FILTER_DEBUG_DIAGNOSTICS", ContextFilterSettings.context_filter_debug_diagnostics_enabled),
+                low_information_min_chars=_get_int("CONTEXT_FILTER_LOW_INFO_MIN_CHARS", ContextFilterSettings.low_information_min_chars),
+            ),
+            general_purpose=GeneralPurposeSettings(
+                general_sub_branch_detector_enabled=_get_bool("GENERAL_SUB_BRANCH_DETECTOR_ENABLED", GeneralPurposeSettings.general_sub_branch_detector_enabled),
+                general_sub_branch_confidence_threshold=_get_float("GENERAL_SUB_BRANCH_CONFIDENCE_THRESHOLD", GeneralPurposeSettings.general_sub_branch_confidence_threshold),
+                general_sub_branch_fallback_mode=os.getenv("GENERAL_SUB_BRANCH_FALLBACK_MODE", GeneralPurposeSettings.general_sub_branch_fallback_mode),
+                general_sub_branch_detector_json_retry_count=_get_int("GENERAL_SUB_BRANCH_DETECTOR_JSON_RETRY_COUNT", GeneralPurposeSettings.general_sub_branch_detector_json_retry_count),
+                content_composer_enabled=_get_bool("CONTENT_COMPOSER_ENABLED", GeneralPurposeSettings.content_composer_enabled),
+                content_composer_max_iterations=_get_int("CONTENT_COMPOSER_MAX_ITERATIONS", GeneralPurposeSettings.content_composer_max_iterations),
+                content_composer_tool_timeout_seconds=_get_float("CONTENT_COMPOSER_TOOL_TIMEOUT_SECONDS", GeneralPurposeSettings.content_composer_tool_timeout_seconds),
+                content_composer_allowed_tools=_get_tuple("CONTENT_COMPOSER_ALLOWED_TOOLS", GeneralPurposeSettings.content_composer_allowed_tools),
+                content_composer_default_tool=os.getenv("CONTENT_COMPOSER_DEFAULT_TOOL", GeneralPurposeSettings.content_composer_default_tool),
+                content_composer_fallback_tool=os.getenv("CONTENT_COMPOSER_FALLBACK_TOOL", GeneralPurposeSettings.content_composer_fallback_tool),
+                content_composer_debug_trace_enabled=_get_bool("CONTENT_COMPOSER_DEBUG_TRACE_ENABLED", GeneralPurposeSettings.content_composer_debug_trace_enabled),
+                excel_tool_signal_keywords=_get_tuple("CONTENT_COMPOSER_EXCEL_KEYWORDS", GeneralPurposeSettings.excel_tool_signal_keywords),
+                pdf_tool_signal_keywords=_get_tuple("CONTENT_COMPOSER_PDF_KEYWORDS", GeneralPurposeSettings.pdf_tool_signal_keywords),
+                pptx_tool_signal_keywords=_get_tuple("CONTENT_COMPOSER_PPTX_KEYWORDS", GeneralPurposeSettings.pptx_tool_signal_keywords),
+                hitl_supporting_question_enabled=_get_bool("HITL_SUPPORTING_QUESTION_ENABLED", GeneralPurposeSettings.hitl_supporting_question_enabled),
+                hitl_supporting_question_confidence_threshold=_get_float("HITL_SUPPORTING_QUESTION_CONFIDENCE_THRESHOLD", GeneralPurposeSettings.hitl_supporting_question_confidence_threshold),
+                hitl_supporting_question_recent_question_window=_get_int("HITL_SUPPORTING_QUESTION_RECENT_QUESTION_WINDOW", GeneralPurposeSettings.hitl_supporting_question_recent_question_window),
+                hitl_supporting_question_max_length=_get_int("HITL_SUPPORTING_QUESTION_MAX_LENGTH", GeneralPurposeSettings.hitl_supporting_question_max_length),
+                hitl_supporting_question_safety_mode=os.getenv("HITL_SUPPORTING_QUESTION_SAFETY_MODE", GeneralPurposeSettings.hitl_supporting_question_safety_mode),
+                general_response_persistence_policy=os.getenv("GENERAL_RESPONSE_PERSISTENCE_POLICY", GeneralPurposeSettings.general_response_persistence_policy),
+                general_response_default_topic_title=os.getenv("GENERAL_RESPONSE_DEFAULT_TOPIC_TITLE", GeneralPurposeSettings.general_response_default_topic_title),
+                documents_dir=os.getenv("ASSISTANT_DOCUMENTS_DIR", GeneralPurposeSettings.documents_dir),
+                artifact_storage_dir=os.getenv("ASSISTANT_ARTIFACT_STORAGE_DIR", GeneralPurposeSettings.artifact_storage_dir),
+                artifact_download_base_url=os.getenv("ASSISTANT_ARTIFACT_DOWNLOAD_BASE_URL", GeneralPurposeSettings.artifact_download_base_url),
             ),
         )

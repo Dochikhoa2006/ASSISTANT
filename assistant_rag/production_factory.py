@@ -16,9 +16,9 @@ from .branch_orchestration import KnowledgeTargetResolver, ReminderTargetResolve
 from .bundler import ChatOutput, ResponseBundler
 from .chroma_index import ChromaPersistentVectorIndex
 from .classification import LLMLastQAResolver, LLMQueryRewriter
-from .config import AssistantConfig, AutoscanConfig, ClassificationConfig, OutboxConfig, RetrievalConfig, QuestionGenerationConfig, MutationPolicyConfig
+from .config import AssistantConfig, AutoscanConfig, ClassificationConfig, OutboxConfig, RetrievalConfig, QuestionGenerationConfig, MutationPolicyConfig, ContextFilterConfig, GeneralPurposeConfig, LastQAConfig
 from .contracts import Intent
-from .database import SQLRepository
+from .database import AssistantRepository
 from .embeddings import SentenceTransformerEmbeddingClient
 from .last_qa import DiskCacheLastQAStore
 from .llm import OllamaIntentClassifier, OllamaLLMClient, OllamaModelRouter
@@ -29,9 +29,18 @@ from .retrieval import HybridRetriever
 from .reranking import SentenceTransformerCrossEncoderReranker
 from .action_detection import LLMActionDetector
 from .context_filter import HardRuleContextFilter, TwoLayerContextFilter
-from .generation import LLMClarificationStrategy, LLMHumanInTheLoopStrategy, LLMReminderSupportingStrategy
+from .generation import LLMClarificationStrategy, LLMHumanInTheLoopStrategy, LLMReminderSupportingStrategy, LLMGeneralHITLStrategy
 from .retrieval_validation import KnowledgeRetrievalValidationStrategy, ReminderRetrievalValidationStrategy
 from .settings import ProductionSettings
+from .general_sub_branch import GeneralSubBranchDetector
+from .content_composer import (
+    AnswerGenerationTool,
+    GenerateExcelTool,
+    GeneratePDFTool,
+    GeneratePPTXTool,
+    ContentToolRegistry,
+    ReActContentComposer,
+)
 
 
 def build_assistant_config(settings: ProductionSettings) -> AssistantConfig:
@@ -40,6 +49,9 @@ def build_assistant_config(settings: ProductionSettings) -> AssistantConfig:
             conversation_min_confidence=settings.retrieval.conversation_min_confidence,
             knowledge_min_confidence=settings.retrieval.knowledge_min_confidence,
             max_results=settings.retrieval.max_results,
+            bm25_top_k=settings.retrieval.bm25_top_k,
+            chroma_top_k=settings.retrieval.chroma_top_k,
+            min_confidence=settings.retrieval.min_confidence,
             rrf_k=settings.retrieval.rrf_k,
             lexical_weight=settings.retrieval.lexical_weight,
             semantic_weight=settings.retrieval.semantic_weight,
@@ -85,6 +97,7 @@ def build_assistant_config(settings: ProductionSettings) -> AssistantConfig:
         ),
         last_qa=LastQAConfig(
             min_confidence=settings.prompt_policy.last_qa_min_confidence,
+            skip_broad_retrieval_min_confidence=settings.prompt_policy.last_qa_skip_broad_retrieval_min_confidence,
             clarification_merge_min_confidence=settings.prompt_policy.clarification_merge_min_confidence,
             skip_allowed_interaction_types=settings.prompt_policy.skip_broad_retrieval_allowed_relationships,
             semantic_match_model=settings.ollama.last_qa_model,
@@ -94,14 +107,44 @@ def build_assistant_config(settings: ProductionSettings) -> AssistantConfig:
             enable_reminder_metadata_reply=settings.prompt_policy.last_qa_enable_reminder_metadata_reply,
             clarification_merge_enabled=settings.prompt_policy.clarification_merge_enabled,
         ),
+        context_filter=ContextFilterConfig(
+            conversation_min_confidence=settings.context_filter.conversation_min_confidence,
+            conversation_approved_max_items=settings.context_filter.conversation_approved_max_items,
+            conversation_duplicate_threshold=settings.context_filter.conversation_duplicate_threshold,
+            knowledge_approved_max_items=settings.context_filter.knowledge_approved_max_items,
+            knowledge_duplicate_threshold=settings.context_filter.knowledge_duplicate_threshold,
+            low_information_text_patterns=settings.context_filter.low_information_text_patterns,
+            reminder_approved_max_items=settings.context_filter.reminder_approved_max_items,
+            semantic_context_judge_enabled=settings.context_filter.semantic_context_judge_enabled,
+            context_filter_debug_diagnostics_enabled=settings.context_filter.context_filter_debug_diagnostics_enabled,
+            low_information_min_chars=settings.context_filter.low_information_min_chars,
+        ),
+        default_timezone=settings.safety.default_timezone,
+        reminder_duplicate_similarity_threshold=settings.safety.reminder_duplicate_similarity_threshold,
+        reminder_duplicate_time_window_minutes=settings.safety.reminder_duplicate_time_window_minutes,
+        confirmation_expiry_minutes=settings.safety.confirmation_expiry_minutes,
+        confirmation_high_confidence_threshold=settings.safety.confirmation_high_confidence_threshold,
     )
 
 
-def build_production_repository(settings: ProductionSettings) -> SQLRepository:
+def build_production_repository(settings: ProductionSettings) -> AssistantRepository:
+    if os.environ.get("ASSISTANT_DATABASE_URL"):
+        from .postgres_repository import PostgresRepository
+        url = os.environ.get("ASSISTANT_DATABASE_URL")
+        # Ensure it's not a sqlite url if it's meant to be postgres, 
+        # but Alembic dummy run uses sqlite URL. We can just pass it directly.
+        repository = PostgresRepository.create(
+            url,
+            pool_size=settings.database.pool_size if hasattr(settings.database, 'pool_size') else 10,
+            max_overflow=settings.database.max_overflow if hasattr(settings.database, 'max_overflow') else 20
+        )
+        return repository
+    
+    from .database import SQLiteRepository
     directory = os.path.dirname(settings.database.path)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    repository = SQLRepository.persistent(
+    repository = SQLiteRepository.persistent(
         settings.database.path,
         enable_wal=settings.database.enable_wal,
         busy_timeout_ms=settings.database.busy_timeout_ms,
@@ -111,7 +154,6 @@ def build_production_repository(settings: ProductionSettings) -> SQLRepository:
 
 
 def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline:
-    repository = build_production_repository(settings)
     assistant_config = build_assistant_config(settings)
     bm25 = OpenSearchBM25Index(settings.opensearch)
     bm25.initialize()
@@ -129,17 +171,27 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
         lexical_weight=assistant_config.retrieval.lexical_weight,
         semantic_weight=assistant_config.retrieval.semantic_weight,
         rerank_candidate_limit=assistant_config.retrieval.rerank_candidate_limit,
+        bm25_top_k=assistant_config.retrieval.bm25_top_k,
+        chroma_top_k=assistant_config.retrieval.chroma_top_k,
     )
     action_detector = LLMActionDetector(
         llm,
         prompt_registry,
         min_confidence=settings.prompt_policy.action_min_confidence,
-        risky_action_terms=settings.prompt_policy.risky_action_terms,
     )
     
     hard_rule_filter = HardRuleContextFilter(
         knowledge_min_confidence=settings.prompt_policy.context_filter_knowledge_min_confidence,
         allowed_reminder_statuses=settings.prompt_policy.context_filter_allowed_reminder_statuses,
+        conversation_min_confidence=settings.context_filter.conversation_min_confidence,
+        conversation_approved_max_items=settings.context_filter.conversation_approved_max_items,
+        conversation_duplicate_threshold=settings.context_filter.conversation_duplicate_threshold,
+        knowledge_approved_max_items=settings.context_filter.knowledge_approved_max_items,
+        knowledge_duplicate_threshold=settings.context_filter.knowledge_duplicate_threshold,
+        low_information_text_patterns=settings.context_filter.low_information_text_patterns,
+        reminder_approved_max_items=settings.context_filter.reminder_approved_max_items,
+        reminder_min_confidence=settings.context_filter.reminder_min_confidence,
+        low_information_min_chars=settings.context_filter.low_information_min_chars,
     )
     context_filter = TwoLayerContextFilter(
         hard_rule_filter=hard_rule_filter,
@@ -176,11 +228,9 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
     knowledge_target_resolver = KnowledgeTargetResolver(
         retriever=retriever,
         config=assistant_config,
-        repository=repository,
         llm_validator=knowledge_llm_validator,
     )
     reminder_target_resolver = ReminderTargetResolver(
-        repository=repository,
         config=assistant_config,
         llm_validator=reminder_llm_validator,
     )
@@ -190,6 +240,33 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
         reminder_resolver=reminder_target_resolver,
     )
 
+    import dataclasses
+    gp_config = GeneralPurposeConfig(**dataclasses.asdict(settings.general_purpose))
+
+    sub_branch_detector = GeneralSubBranchDetector(
+        llm=llm, prompt_registry=prompt_registry,
+    ) if gp_config.general_sub_branch_detector_enabled else None
+
+    answer_gen_tool = AnswerGenerationTool(llm=llm, prompt_registry=prompt_registry)
+    excel_tool = GenerateExcelTool(llm=llm, prompt_registry=prompt_registry, config=gp_config)
+    pdf_tool = GeneratePDFTool(llm=llm, prompt_registry=prompt_registry, config=gp_config)
+    pptx_tool = GeneratePPTXTool(llm=llm, prompt_registry=prompt_registry, config=gp_config)
+
+    tool_registry = ContentToolRegistry(
+        tools=[answer_gen_tool, excel_tool, pdf_tool, pptx_tool],
+        config=gp_config,
+    )
+
+    content_composer = ReActContentComposer(
+        registry=tool_registry, llm=llm,
+        prompt_registry=prompt_registry, config=gp_config,
+    ) if gp_config.content_composer_enabled else None
+
+    general_hitl = LLMGeneralHITLStrategy(
+        llm=llm, prompt_registry=prompt_registry,
+        config=gp_config,
+    ) if gp_config.hitl_supporting_question_enabled else None
+
     router = BranchRouter(
         {
             Intent.CLARIFICATION: ClarificationBranch(
@@ -198,30 +275,37 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
                 clarification_strategy=clarification_strategy,
             ),
             Intent.GENERAL_RESPONSE: GeneralResponseBranch(
-                repository,
-                retriever,
-                assistant_config,
+                retriever=retriever,
+                config=assistant_config,
                 context_filter=context_filter,
-                llm=llm,
                 prompt_registry=prompt_registry,
                 hitl_strategy=hitl_strategy,
+                llm=llm,
+                sub_branch_detector=sub_branch_detector,
+                content_composer=content_composer,
+                general_hitl_strategy=general_hitl,
+                general_purpose_config=gp_config,
             ),
             Intent.KNOWLEDGE_FACTS: KnowledgeFactsBranch(
-                repository=repository,
                 config=assistant_config,
                 action_detector=action_detector,
                 clarification_strategy=clarification_strategy,
                 prompt_registry=prompt_registry,
                 validated_action_builder=validated_action_builder,
+                retriever=retriever,
+                context_filter=context_filter,
+                llm=llm,
             ),
             Intent.REMINDER: ReminderBranch(
-                repository=repository,
                 config=assistant_config,
                 action_detector=action_detector,
                 clarification_strategy=clarification_strategy,
-                reminder_supporting_strategy=reminder_supporting_strategy,
                 prompt_registry=prompt_registry,
+                reminder_supporting_strategy=reminder_supporting_strategy,
                 validated_action_builder=validated_action_builder,
+                retriever=retriever,
+                context_filter=context_filter,
+                llm=llm,
             ),
         }
     )
@@ -233,9 +317,9 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
         ),
         query_rewriter=LLMQueryRewriter(llm, prompt_registry),
         last_qa_resolver=LLMLastQAResolver(
-            llm,
-            prompt_registry,
-            min_confidence=settings.prompt_policy.last_qa_min_confidence,
+            llm=llm,
+            config=assistant_config.last_qa,
+            prompt_registry=prompt_registry,
         ),
         retriever=retriever,
         classifier=OllamaIntentClassifier(
@@ -244,6 +328,7 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
             min_confidence=settings.prompt_policy.intent_min_confidence,
         ),
         router=router,
+        context_filter=context_filter,
         bundler=ResponseBundler(prompt_registry),
         platform_selector=PlatformSelector(),
         chat_output=ChatOutput(),

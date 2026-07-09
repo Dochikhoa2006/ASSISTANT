@@ -34,15 +34,6 @@ services:
     volumes:
       - chroma_data:/chroma/chroma
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: assistant-ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-
 volumes:
   opensearch_data:
   chroma_data:
-  ollama_data:

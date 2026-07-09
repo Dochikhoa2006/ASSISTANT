@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any, Protocol
 
-from .config import QuestionGenerationConfig
-from .contracts import GeneratedQuestion, PipelineContext, QuestionSource
+from .config import GeneralPurposeConfig, QuestionGenerationConfig
+from .contracts import ContentComposerResult, GeneratedQuestion, HumanSupportingDecision, PipelineContext, QuestionSource, ExpectedResponseType
 from .llm import LLMClient, LLMTask
 from .prompts import PromptContext, PromptRegistry
+
+logger = logging.getLogger(__name__)
 
 
 class QuestionGenerationStrategy(Protocol):
@@ -34,9 +37,13 @@ class LLMClarificationStrategy:
                 "purpose": {"type": "string"},
                 "confidence": {"type": "number"},
                 "should_ask": {"type": "boolean"},
+                "expected_response_type": {
+                    "type": "string",
+                    "enum": [e.value for e in ExpectedResponseType]
+                },
                 "reason_summary": {"type": "string"}
             },
-            "required": ["question_text", "question_source", "purpose", "confidence", "should_ask", "reason_summary"]
+            "required": ["question_text", "question_source", "purpose", "confidence", "should_ask", "expected_response_type", "reason_summary"]
         }
         
         try:
@@ -69,6 +76,7 @@ class LLMClarificationStrategy:
                 purpose=str(payload.get("purpose", "resolve_missing_info")),
                 confidence=float(payload.get("confidence", 1.0)),
                 should_ask=True,
+                expected_response_type=ExpectedResponseType(payload.get("expected_response_type", ExpectedResponseType.UNKNOWN.value)),
             )
         except Exception:
             return None
@@ -100,9 +108,13 @@ class LLMHumanInTheLoopStrategy:
                             "purpose": {"type": "string"},
                             "confidence": {"type": "number"},
                             "should_ask": {"type": "boolean"},
+                            "expected_response_type": {
+                                "type": "string",
+                                "enum": [e.value for e in ExpectedResponseType]
+                            },
                             "reason_summary": {"type": "string"}
                         },
-                        "required": ["question_text", "question_source", "purpose", "confidence", "should_ask", "reason_summary"]
+                        "required": ["question_text", "question_source", "purpose", "confidence", "should_ask", "expected_response_type", "reason_summary"]
                     }
                 }
             },
@@ -140,6 +152,7 @@ class LLMHumanInTheLoopStrategy:
                         purpose=str(q.get("purpose", "optional_context")),
                         confidence=float(q.get("confidence", 1.0)),
                         should_ask=True,
+                        expected_response_type=ExpectedResponseType(q.get("expected_response_type", ExpectedResponseType.UNKNOWN.value)),
                     )
                 )
             
@@ -174,9 +187,13 @@ class LLMReminderSupportingStrategy:
                 "purpose": {"type": "string"},
                 "confidence": {"type": "number"},
                 "should_ask": {"type": "boolean"},
+                "expected_response_type": {
+                    "type": "string",
+                    "enum": [e.value for e in ExpectedResponseType]
+                },
                 "reason_summary": {"type": "string"}
             },
-            "required": ["question_text", "question_source", "purpose", "confidence", "should_ask", "reason_summary"]
+            "required": ["question_text", "question_source", "purpose", "confidence", "should_ask", "expected_response_type", "reason_summary"]
         }
 
         try:
@@ -211,6 +228,96 @@ class LLMReminderSupportingStrategy:
                 purpose=str(payload.get("purpose", "reminder_followup")),
                 confidence=confidence,
                 should_ask=True,
+                expected_response_type=ExpectedResponseType(payload.get("expected_response_type", ExpectedResponseType.UNKNOWN.value)),
             )
         except Exception:
             return None
+
+
+@dataclass
+class LLMGeneralHITLStrategy:
+    llm: LLMClient
+    prompt_registry: PromptRegistry
+    config: GeneralPurposeConfig
+
+    def evaluate(self, context: PipelineContext, composer_result: ContentComposerResult) -> HumanSupportingDecision:
+        if not self.config.hitl_supporting_question_enabled:
+            return HumanSupportingDecision(
+                should_ask=False, question="", confidence=1.0,
+                question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+                expected_response_type=ExpectedResponseType.UNKNOWN,
+                reason_summary="Disabled by config", risk_flags=()
+            )
+            
+        if composer_result.confidence >= self.config.hitl_supporting_question_confidence_threshold:
+            return HumanSupportingDecision(
+                should_ask=False, question="", confidence=composer_result.confidence,
+                question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+                expected_response_type=ExpectedResponseType.UNKNOWN,
+                reason_summary="Confidence high enough", risk_flags=()
+            )
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question_text": {"type": "string"},
+                            "question_source": {"type": "string"},
+                            "purpose": {"type": "string"},
+                            "confidence": {"type": "number"},
+                            "should_ask": {"type": "boolean"},
+                            "expected_response_type": {
+                                "type": "string",
+                                "enum": [e.value for e in ExpectedResponseType]
+                            },
+                            "reason_summary": {"type": "string"}
+                        },
+                        "required": ["question_text", "question_source", "purpose", "confidence", "should_ask", "expected_response_type", "reason_summary"]
+                    }
+                }
+            },
+            "required": ["questions"]
+        }
+
+        try:
+            payload = self.llm.generate_json(
+                task=LLMTask.GENERATE_HUMAN_SUPPORTING,
+                system_prompt=self.prompt_registry.system("question_generation"),
+                user_prompt=self.prompt_registry.user(
+                    PromptContext(
+                        stage="general_hitl_evaluation",
+                        rewritten_query=context.rewritten_query,
+                        extra={
+                            "composer_result": composer_result.final_response_text,
+                            "confidence": composer_result.confidence,
+                        },
+                    )
+                ),
+                schema=schema,
+            )
+
+            questions = payload.get("questions", [])
+            for q in questions:
+                if q.get("should_ask"):
+                    return HumanSupportingDecision(
+                        should_ask=True,
+                        question=str(q["question_text"]),
+                        confidence=float(q.get("confidence", 1.0)),
+                        question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+                        expected_response_type=ExpectedResponseType(q.get("expected_response_type", ExpectedResponseType.UNKNOWN.value)),
+                        reason_summary=str(q.get("reason_summary", "")),
+                        risk_flags=(),
+                    )
+        except Exception as e:
+            logger.debug("General HITL evaluation failed: %s", e)
+
+        return HumanSupportingDecision(
+            should_ask=False, question="", confidence=0.0,
+            question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+            expected_response_type=ExpectedResponseType.UNKNOWN,
+            reason_summary="HITL generation failed", risk_flags=()
+        )

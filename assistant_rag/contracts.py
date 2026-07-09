@@ -1,11 +1,10 @@
-"""Shared contracts used by every pipeline stage and branch."""
-
 from __future__ import annotations
+"""Shared contracts used by every pipeline stage and branch."""
 
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 
 class Intent(str, Enum):
@@ -50,6 +49,111 @@ class ReminderAction(str, Enum):
     MODIFY = "modify"
 
 
+class ReminderStatus(str, Enum):
+    SCHEDULED = "scheduled"
+    NOTIFIED = "notified"
+    CANCELLED = "cancelled"
+    DISMISSED = "dismissed"
+    COMPLETED = "completed"
+
+
+class NotificationUIStatus(str, Enum):
+    UNREAD = "unread"
+    READ = "read"
+    DELETED = "deleted"
+
+
+class NotificationDeliveryStatus(str, Enum):
+    PENDING = "pending"
+    SENT = "sent"
+    FAILED = "failed"
+    RETRYING = "retrying"
+
+
+class MutationRequestStatus(str, Enum):
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class ConfirmationStatus(str, Enum):
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+
+
+class KnowledgeSourceStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    INDEXED = "indexed"
+    FAILED = "failed"
+    DELETED = "deleted"
+
+
+class ArtifactStatus(str, Enum):
+    CREATED = "created"
+    DELETED = "deleted"
+    FAILED = "failed"
+
+
+class ArtifactFileType(str, Enum):
+    XLSX = "xlsx"
+    PDF = "pdf"
+    PPTX = "pptx"
+    TXT = "txt"
+    CSV = "csv"
+
+
+class LifecycleStatus(str, Enum):
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+    DELETED = "deleted"
+    EXPIRED = "expired"
+
+
+class HealthStatus(str, Enum):
+    OK = "ok"
+    DEGRADED = "degraded"
+    UNHEALTHY = "unhealthy"
+
+
+class DependencyStatus(str, Enum):
+    OK = "ok"
+    DEGRADED = "degraded"
+    UNHEALTHY = "unhealthy"
+    NOT_CONFIGURED = "not_configured"
+
+
+class RecurrenceFrequency(str, Enum):
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+
+
+class TraceStage(str, Enum):
+    API_RECEIVED = "api_received"
+    AUTH_VERIFIED = "auth_verified"
+    RATE_LIMIT_CHECKED = "rate_limit_checked"
+    REWRITE = "rewrite"
+    LAST_QA = "last_qa"
+    RETRIEVAL = "retrieval"
+    RETRIEVAL_BM25 = "retrieval_bm25"
+    RETRIEVAL_CHROMA = "retrieval_chroma"
+    RETRIEVAL_MERGE = "retrieval_merge"
+    RERANK = "rerank"
+    SQL_VALIDATION = "sql_validation"
+    CLASSIFICATION = "classification"
+    ACTION_DETECTION = "action_detection"
+    RISKY_ACTION_VALIDATION = "risky_action_validation"
+    BRANCH_EXECUTION = "branch_execution"
+    SQL_TRANSACTION = "sql_transaction"
+    OUTBOX_ENQUEUE = "outbox_enqueue"
+    BUNDLING = "bundling"
+    API_RESPONSE = "api_response"
+    API_TOTAL = "api_total"
+
+
 class OperationStatus(str, Enum):
     SUCCESS = "success"
     FAILED = "failed"
@@ -63,6 +167,22 @@ class ResponseType(str, Enum):
     REMINDER_ACTION = "reminder_action"
     REMINDER_REPLY = "reminder_reply"
     ERROR = "error"
+    SAFE_NOOP = "safe_noop"
+
+
+class ExpectedResponseType(str, Enum):
+    FREE_TEXT_ANSWER              = "free_text_answer"
+    YES_NO_ANSWER                 = "yes_no_answer"
+    SELECTION_ANSWER              = "selection_answer"
+    TIME_OR_DATE_ANSWER           = "time_or_date_answer"
+    PREFERENCE_ANSWER             = "preference_answer"
+    CONFIRMATION_ANSWER           = "confirmation_answer"
+    REPLACEMENT_TEXT_ANSWER       = "replacement_text_answer"
+    STRUCTURED_CONTENT_ANSWER     = "structured_content_answer"
+    REMINDER_FOLLOWUP_ANSWER      = "reminder_followup_answer"
+    HUMAN_SUPPORTING_FOLLOWUP_ANSWER = "human_supporting_followup_answer"
+    CLARIFICATION_SLOT_ANSWER     = "clarification_slot_answer"
+    UNKNOWN                       = "unknown"
 
 
 class ActionValidationResult(str, Enum):
@@ -97,6 +217,7 @@ class GeneratedQuestion:
     purpose: str
     confidence: float
     should_ask: bool = True
+    expected_response_type: ExpectedResponseType = ExpectedResponseType.UNKNOWN
 
 
 @dataclass(frozen=True)
@@ -104,9 +225,12 @@ class ChatRequest:
     user_id: str
     raw_query: str
     platform_context: dict[str, Any] = field(default_factory=dict)
-    reminder_id: str | None = None
-    notification_id: str | None = None
-    reply_text: str | None = None
+    reminder_id: Optional[str] = None
+    notification_id: Optional[str] = None
+    reply_text: Optional[str] = None
+    parent_hop_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    confirmation_token: Optional[str] = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -118,8 +242,9 @@ class LastQAState:
     supporting_questions: list[GeneratedQuestion] = field(default_factory=list)
     clarification_question: GeneratedQuestion | None = None
     reminder_supporting_question: GeneratedQuestion | None = None
-    linked_topic_id: str | None = None
-    linked_hop_id: str | None = None
+    linked_topic_id: Optional[str] = None
+    linked_hop_id: Optional[str] = None
+    expected_response_type: ExpectedResponseType | None = None
 
 
 @dataclass(frozen=True)
@@ -131,6 +256,33 @@ class RetrievalResult:
     confidence: float
     validation_status: str
     payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class OutboxIndexPayload:
+    user_id: str
+    entity_type: str
+    entity_id: str
+    text: str
+    metadata: dict[str, str | int | float | bool] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ApprovedConversationContext:
+    approved_conversation_history: list[dict[str, Any]]
+    human_supporting_questions: list[GeneratedQuestion]
+    reminder_supporting_questions: list[GeneratedQuestion]
+    clarification_question_context: GeneratedQuestion | None
+    extracted_expected_response_types: list[ExpectedResponseType]
+    
+    conversation_retrieval_ran: bool
+    conversation_context_status: Literal["not_run", "approved", "all_rejected", "empty"]
+    approved_conversation_count: int
+
+    _internal_selected_topic_candidates: list[str] = field(default_factory=list)
+    _internal_selected_hop_candidates: list[str] = field(default_factory=list)
+    _rejected_conversation_ids: tuple[str, ...] = field(default_factory=tuple)
+    _validation_summary: str = ""
 
 
 @dataclass
@@ -155,6 +307,7 @@ class RepositoryActionResult:
         "not_found",
         "skipped",
         "error",
+        "pending_confirmation",
     ]
     domain_entity_type: Literal[
         "knowledge_chunk",
@@ -163,21 +316,114 @@ class RepositoryActionResult:
         "conversation_hop",
         "none",
     ] | None = None
-    domain_entity_id: str | None = None
-    audit_hop_id: str | None = None
+    domain_entity_id: Optional[str] = None
+    audit_hop_id: Optional[str] = None
     indexing_outbox_ids: tuple[str, ...] = ()
-    user_safe_summary: str | None = None
-    reason_summary: str | None = None
+    user_safe_summary: Optional[str] = None
+    reason_summary: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class AuthContext:
+    user_id: str
+    claims: dict[str, Any] = field(default_factory=dict)
+    scopes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RateLimitResult:
+    allowed: bool
+    retry_after_seconds: int = 0
+
+
+@dataclass(frozen=True)
+class IdempotencyClaimResult:
+    status: Literal["started", "replay", "in_progress", "conflict", "failed_retry"]
+    request_id: str
+    stored_response_json: Optional[str] = None
+    reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TraceStageSummary:
+    stage: str
+    latency_ms: float
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TraceSummary:
+    request_id: str
+    total_latency_ms: float
+    stages: list[TraceStageSummary] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class MetricSnapshot:
+    counters: dict[str, int]
+    gauges: dict[str, float]
+    latency_ms: dict[str, dict[str, float]]
+    generated_at: str
+
+
+@dataclass(frozen=True)
+class DependencyHealth:
+    name: str
+    status: DependencyStatus
+    detail: str = ""
+    latency_ms: float | None = None
+
+
+@dataclass(frozen=True)
+class HealthPayload:
+    status: HealthStatus
+    dependencies: list[DependencyHealth]
+    outbox_pending_count: int = 0
+    outbox_failed_count: int = 0
+
+
+@dataclass(frozen=True)
+class DriftIssue:
+    kind: str
+    entity_type: str
+    entity_id: str | None = None
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class DriftReport:
+    status: Literal["ok", "drift_detected"]
+    user_id: str | None
+    sql_counts: dict[str, int]
+    bm25_counts: dict[str, int]
+    chroma_counts: dict[str, int]
+    failed_outbox_count: int
+    issues: list[DriftIssue] = field(default_factory=list)
+    repaired: bool = False
+
+
+@dataclass(frozen=True)
+class EvaluationReport:
+    case_count: int
+    top_1_accuracy: float
+    top_3_accuracy: float
+    wrong_target_rate: float
+    clarification_rate: float
+    false_mutation_rate: float
+    retrieval_empty_rate: float
+    average_latency_ms: float
+    passed: bool
+    cases: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class RepositoryTransactionResult:
     committed: bool
     results: tuple[RepositoryActionResult, ...]
-    audit_hop_id: str | None = None
+    audit_hop_id: Optional[str] = None
     indexing_outbox_ids: tuple[str, ...] = ()
-    error_type: str | None = None
-    reason_summary: str | None = None
+    error_type: Optional[str] = None
+    reason_summary: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -191,18 +437,18 @@ class ValidatedKnowledgeAction:
     observed_versions: dict[str, int] = field(default_factory=dict)
     observed_is_deleted: dict[str, bool] = field(default_factory=dict)
 
-    knowledge_text: str | None = None
-    replacement_text: str | None = None
+    knowledge_text: Optional[str] = None
+    replacement_text: Optional[str] = None
     
     # Legacy fields (kept for backward compatibility with ValidatedActionBuilder if it hasn't been updated yet)
-    new_text: str | None = None
-    target_status: str | None = None
-    topic_title: str | None = None
-    target_description: str | None = None
+    new_text: Optional[str] = None
+    target_status: Optional[str] = None
+    topic_title: Optional[str] = None
+    target_description: Optional[str] = None
 
     confidence: float = 0.0
     matched_fields: tuple[str, ...] = ()
-    reason_summary: str | None = None
+    reason_summary: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -232,7 +478,7 @@ class KnowledgeValidationCandidate:
     knowledge_chunk_id: str
     knowledge_topic_id: str
     text: str
-    source_title: str | None
+    source_title: Optional[str]
     retrieval_score: float
     rerank_score: float | None
     is_deleted: bool
@@ -244,8 +490,8 @@ class ReminderValidationCandidate:
     candidate_key: str
     reminder_id: str
     subject: str
-    reminder_summary: str | None
-    raw_reminder: str | None
+    reminder_summary: Optional[str]
+    raw_reminder: Optional[str]
     reminder_time: datetime | None
     status: str
     deterministic_score: float
@@ -257,7 +503,7 @@ class ReminderValidationCandidate:
 class LLMKnowledgeCandidatePayload:
     candidate_key: str
     text_excerpt: str
-    source_title: str | None
+    source_title: Optional[str]
     retrieval_score: float
     rerank_score: float | None
     matched_fields: tuple[str, ...]
@@ -267,7 +513,7 @@ class LLMKnowledgeCandidatePayload:
 class LLMReminderCandidatePayload:
     candidate_key: str
     subject: str
-    reminder_summary: str | None
+    reminder_summary: Optional[str]
     reminder_time: datetime | None
     status: str
     deterministic_score: float
@@ -281,7 +527,7 @@ class ReminderTargetQuery:
     target_entities: tuple[str, ...] = ()
     target_date: datetime | None = None
     target_time_range: tuple[datetime, datetime] | None = None
-    target_daypart: str | None = None
+    target_daypart: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -310,7 +556,7 @@ class ReminderCandidateScore:
     recency_score: float = 0.0
     final_score: float = 0.0
     matched_fields: tuple[str, ...] = ()
-    reason_summary: str | None = None
+    reason_summary: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -328,28 +574,36 @@ class ValidatedReminderAction:
     validation_result: ActionValidationResult
 
     target_reminder_ids: tuple[str, ...] = ()
-    observed_status: str | None = None
+    observed_status: Optional[str] = None
     observed_version: int | None = None
     observed_reminder_time: datetime | None = None
 
-    subject: str | None = None
+    subject: Optional[str] = None
     reminder_time: datetime | None = None
-    reminder_summary: str | None = None
-    raw_reminder: str | None = None
+    reminder_summary: Optional[str] = None
+    raw_reminder: Optional[str] = None
+    user_timezone: Optional[str] = None
+    original_time_text: Optional[str] = None
+    recurrence_rule: Optional[str] = None
+    recurrence_timezone: Optional[str] = None
+    next_fire_time: datetime | None = None
+    parent_recurring_reminder_id: Optional[str] = None
 
-    replacement_subject: str | None = None
+    replacement_subject: Optional[str] = None
     replacement_time: datetime | None = None
-    replacement_summary: str | None = None
+    replacement_summary: Optional[str] = None
+    replacement_recurrence_rule: Optional[str] = None
+    replacement_recurrence_timezone: Optional[str] = None
 
     confidence: float = 0.0
     matched_fields: tuple[str, ...] = ()
-    reason_summary: str | None = None
+    reason_summary: Optional[str] = None
 
 
 @dataclass
 class BranchResult:
     response_type: ResponseType
-    normal_response_text: str | None = None
+    normal_response_text: Optional[str] = None
     clarification_question: GeneratedQuestion | None = None
     human_supporting_questions: list[GeneratedQuestion] = field(default_factory=list)
     reminder_supporting_question: GeneratedQuestion | None = None
@@ -358,11 +612,13 @@ class BranchResult:
     reminder_operation_results: list[RepositoryActionResult] | list[OperationResult] = field(default_factory=list)
     human_in_the_loop_result: dict[str, Any] | None = None
     platform_payload: dict[str, Any] = field(default_factory=dict)
-    fallback_or_error_message: str | None = None
+    fallback_or_error_message: Optional[str] = None
     database_write_result: dict[str, Any] = field(default_factory=dict)
     indexing_job_result: dict[str, Any] = field(default_factory=dict)
-    linked_topic_id: str | None = None
-    linked_hop_id: str | None = None
+    actions_pending_confirmation: list[dict[str, Any]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    linked_topic_id: Optional[str] = None
+    linked_hop_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -370,7 +626,15 @@ class BundledResponse:
     final_chat_text: str
     response_type: ResponseType
     last_qa_state: LastQAState
+    platform_payload: dict[str, Any] = field(default_factory=dict)
     persistence_instructions: dict[str, Any] = field(default_factory=dict)
+    request_id: Optional[str] = None
+    conversation_topic_id: Optional[str] = None
+    conversation_hop_id: Optional[str] = None
+    actions_committed: list[dict[str, Any]] = field(default_factory=list)
+    actions_pending_confirmation: list[dict[str, Any]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    trace_summary: TraceSummary | None = None
 
 
 @dataclass(frozen=True)
@@ -384,20 +648,20 @@ class LastQAResolution:
     interaction_type: LastQAInteractionType | None = None
     question_source: QuestionSource = QuestionSource.NONE
 
-    linked_topic_id: str | None = None
-    linked_hop_id: str | None = None
-    matched_question: str | None = None
+    linked_topic_id: Optional[str] = None
+    linked_hop_id: Optional[str] = None
+    matched_question: Optional[str] = None
 
-    reminder_id: str | None = None
-    notification_id: str | None = None
-    source_topic_id: str | None = None
-    source_hop_id: str | None = None
+    reminder_id: Optional[str] = None
+    notification_id: Optional[str] = None
+    source_topic_id: Optional[str] = None
+    source_hop_id: Optional[str] = None
 
     missing_context: list[str] = field(default_factory=list)
     diagnostic_context: dict[str, Any] = field(default_factory=dict)
 
-    merge_reason: str | None = None
-    skip_reason: str | None = None
+    merge_reason: Optional[str] = None
+    skip_reason: Optional[str] = None
 
     is_authoritative_state: bool = False
 
@@ -433,3 +697,123 @@ class PipelineContext:
     conversation_results: list[RetrievalResult]
     intent: Intent
     last_qa_trace: dict[str, Any] = field(default_factory=dict)
+    approved_conversation_context: ApprovedConversationContext | None = None
+
+
+@dataclass(frozen=True)
+class HopWrite:
+    topic_id: str
+    hop_id: str
+    previous_hop_id: Optional[str] = None
+    outbox_job_id: Optional[str] = None
+
+
+class GeneralSubBranch(str, Enum):
+    SUPPORT_QUESTION_ANSWER  = "support_question_answer"
+    CONVERSATION_FOLLOW_UP   = "conversation_follow_up"
+    NEW_CONVERSATION_TOPIC   = "new_conversation_topic"
+
+
+@dataclass(frozen=True)
+class SubBranchPromptContext:
+    sub_branch: GeneralSubBranch
+    persistence_mode: "PersistenceMode"
+    chat_history_role: str
+    response_goal: str
+    database_update_mode: str
+    allowed_database_updates: tuple[str, ...]
+    prohibited_database_updates: tuple[str, ...]
+    expected_response_type: ExpectedResponseType = ExpectedResponseType.UNKNOWN
+
+
+class PersistenceMode(str, Enum):
+    APPEND_TO_EXISTING_TOPIC  = "append_to_existing_topic"
+    BRANCH_FROM_EXISTING_HOP  = "branch_from_existing_hop"
+    CREATE_NEW_TOPIC          = "create_new_topic"
+
+
+@dataclass(frozen=True)
+class GeneralSubBranchDecision:
+    sub_branch: GeneralSubBranch
+    confidence: float
+    persistence_mode: PersistenceMode
+    selected_candidate_ref: Optional[str] = None
+    selected_topic_id: Optional[str] = None
+    selected_hop_id: Optional[str] = None
+    selected_parent_hop_id: Optional[str] = None
+    reason_summary: str = ""
+    risk_flags: tuple[str, ...] = ()
+    missing_context: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class GeneralResponsePersistencePlan:
+    persistence_mode: PersistenceMode
+    sub_branch: GeneralSubBranch
+    topic_id: Optional[str]
+    previous_hop_id: Optional[str]
+    parent_hop_id: Optional[str]
+    reason_summary: str
+
+
+@dataclass(frozen=True)
+class ContentComposerInput:
+    user_id: str
+    raw_user_query: str
+    rewritten_query: str
+    sub_branch: GeneralSubBranch
+    persistence_mode: PersistenceMode
+    approved_conversation_history: list[dict[str, Any]]
+    human_supporting_questions: list[GeneratedQuestion]
+    reminder_supporting_questions: list[GeneratedQuestion]
+    extracted_expected_response_types: list[ExpectedResponseType]
+    approved_knowledge_evidence: list[str]
+    approved_reminder_context: list[dict[str, Any]]
+    metadata: dict[str, Any]
+    platform_context: dict[str, Any]
+    sub_branch_prompt_context: SubBranchPromptContext
+    sub_branch_supporting_prompt: str
+    repository: Any | None = None
+
+
+@dataclass(frozen=True)
+class ContentToolResult:
+    tool_name: str
+    output_text: str
+    confidence: float
+    fallback_used: bool
+    reason_summary: str
+    artifact: dict[str, Any] | None = None
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ContentComposerResult:
+    final_response_text: str
+    tool_trace_summary: str
+    used_tool_names: tuple[str, ...]
+    confidence: float
+    fallback_used: bool
+    reason_summary: str
+    content_warnings: tuple[str, ...]
+    artifacts: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
+class IngestionResult:
+    source_id: str
+    status: KnowledgeSourceStatus
+    chunk_ids: tuple[str, ...] = ()
+    outbox_job_ids: tuple[str, ...] = ()
+    error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class HumanSupportingDecision:
+    should_ask: bool
+    question: str
+    confidence: float
+    question_source: QuestionSource
+    expected_response_type: ExpectedResponseType
+    reason_summary: str
+    risk_flags: tuple[str, ...]

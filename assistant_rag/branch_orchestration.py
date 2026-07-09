@@ -20,7 +20,7 @@ from .contracts import (
     KnowledgeValidationCandidate,
     ReminderValidationCandidate,
 )
-from .database import SQLRepository
+from .database import AssistantRepository
 from .retrieval import HybridRetriever
 from .settings import TargetNotFoundPolicy, UnsupportedActionPolicy
 from .retrieval_validation import KnowledgeRetrievalValidationStrategy, ReminderRetrievalValidationStrategy
@@ -30,12 +30,10 @@ class KnowledgeTargetResolver:
         self, 
         retriever: HybridRetriever, 
         config: AssistantConfig, 
-        repository: SQLRepository,
         llm_validator: KnowledgeRetrievalValidationStrategy | None = None,
     ):
         self.retriever = retriever
         self.config = config
-        self.repository = repository
         self.llm_validator = llm_validator
 
     def resolve(
@@ -44,6 +42,7 @@ class KnowledgeTargetResolver:
         action_dict: dict[str, Any],
         user_query: str,
         rewritten_query: str,
+        repository: AssistantRepository,
     ) -> tuple[tuple[str, ...], ActionValidationResult]:
         target_description = action_dict.get("target_description")
         if not target_description:
@@ -62,7 +61,7 @@ class KnowledgeTargetResolver:
             return (), ActionValidationResult.SKIP_NOT_FOUND
             
         chunk_ids = [r.entity_id for r in results]
-        sql_chunks = self.repository.get_knowledge_chunks_by_ids(user_id, chunk_ids, include_deleted=False)
+        sql_chunks = repository.get_knowledge_chunks_by_ids(user_id, chunk_ids, include_deleted=False)
         chunk_map = {str(c["chunk_id"]): c for c in sql_chunks}
         
         active_results = []
@@ -88,8 +87,8 @@ class KnowledgeTargetResolver:
                     KnowledgeValidationCandidate(
                         candidate_key=r.entity_id,
                         knowledge_chunk_id=r.entity_id,
-                        knowledge_topic_id=chunk.get("topic_id", ""),
-                        text=chunk.get("text", ""),
+                        knowledge_topic_id=chunk.get("knowledge_topic_id", ""),
+                        text=chunk.get("normalized_text") or chunk.get("raw_text", ""),
                         source_title=chunk.get("source_title"),
                         retrieval_score=r.confidence,
                         rerank_score=r.rerank_score,
@@ -156,13 +155,11 @@ class LLMClientProtocol(Protocol):
 class ReminderTargetResolver:
     def __init__(
         self,
-        repository: SQLRepository,
         config: AssistantConfig,
         fuzzy_matcher: FuzzyMatcher | None = None,
         llm_client: LLMClientProtocol | None = None,
         llm_validator: ReminderRetrievalValidationStrategy | None = None,
     ):
-        self.repository = repository
         self.config = config.reminder_resolver
         self.app_config = config
         self.fuzzy_matcher = fuzzy_matcher or (RapidFuzzMatcher() if self.config.reminder_fuzzy_matcher == "rapidfuzz" else DifflibMatcher())
@@ -188,12 +185,13 @@ class ReminderTargetResolver:
         target_description: str,
         user_query: str,
         rewritten_query: str,
+        repository: AssistantRepository,
     ) -> ReminderTargetResolution:
         if not target_description:
             return ReminderTargetResolution(validation_result=ActionValidationResult.CLARIFY_MISSING_FIELDS)
             
         statuses = self.candidate_statuses_for_action(action)
-        candidates = self.repository.list_reminder_candidates(
+        candidates = repository.list_reminder_candidates(
             user_id=user_id,
             statuses=statuses,
             time_window=None,
@@ -226,6 +224,7 @@ class ReminderTargetResolver:
             
             w_sum = self.config.reminder_subject_weight + self.config.reminder_summary_weight
             final = (exact * self.config.reminder_subject_weight + fuzzy * self.config.reminder_summary_weight) / max(w_sum, 1.0)
+            final = max(final, exact)
             final = max(0.0, min(1.0, final))
             
             # Tie break with recency
@@ -248,6 +247,11 @@ class ReminderTargetResolver:
         scores.sort(key=lambda x: x.final_score, reverse=True)
         top_score = scores[0]
         
+        if top_score.exact_score < 1.0 and top_score.fuzzy_score < self.config.reminder_fuzzy_match_threshold:
+            if self.config.reminder_target_not_found_policy == TargetNotFoundPolicy.CLARIFY_ON_NOT_FOUND:
+                return ReminderTargetResolution(validation_result=ActionValidationResult.CLARIFY_AMBIGUOUS_TARGET)
+            return ReminderTargetResolution(validation_result=ActionValidationResult.SKIP_NOT_FOUND)
+
         if top_score.final_score < self.config.reminder_target_relevance_threshold:
             if self.config.reminder_target_not_found_policy == TargetNotFoundPolicy.CLARIFY_ON_NOT_FOUND:
                 return ReminderTargetResolution(validation_result=ActionValidationResult.CLARIFY_AMBIGUOUS_TARGET)
@@ -316,7 +320,7 @@ class ValidatedActionBuilder:
         self.knowledge_resolver = knowledge_resolver
         self.reminder_resolver = reminder_resolver
 
-    def build_knowledge_actions(self, user_id: str, actions: list[dict[str, Any]], user_query: str, rewritten_query: str) -> list[ValidatedKnowledgeAction]:
+    def build_knowledge_actions(self, user_id: str, actions: list[dict[str, Any]], user_query: str, rewritten_query: str, repository: AssistantRepository) -> list[ValidatedKnowledgeAction]:
         validated = []
         for action_dict in actions:
             action_type_str = action_dict.get("action", "").lower()
@@ -360,7 +364,8 @@ class ValidatedActionBuilder:
                     user_id=user_id, 
                     action_dict=action_dict, 
                     user_query=user_query, 
-                    rewritten_query=rewritten_query
+                    rewritten_query=rewritten_query,
+                    repository=repository,
                 )
                 new_text = action_dict.get("replacement_text")
                 if action_type == KnowledgeAction.MODIFY and not new_text and res == ActionValidationResult.EXECUTE:
@@ -372,7 +377,7 @@ class ValidatedActionBuilder:
                 ))
         return validated
 
-    def build_reminder_actions(self, user_id: str, actions: list[dict[str, Any]], user_query: str, rewritten_query: str) -> list[ValidatedReminderAction]:
+    def build_reminder_actions(self, user_id: str, actions: list[dict[str, Any]], user_query: str, rewritten_query: str, repository: AssistantRepository) -> list[ValidatedReminderAction]:
         validated = []
         for action_dict in actions:
             action_type_str = action_dict.get("action", "").lower()
@@ -411,7 +416,8 @@ class ValidatedActionBuilder:
                     action=action_type, 
                     target_description=target_desc or "",
                     user_query=user_query,
-                    rewritten_query=rewritten_query
+                    rewritten_query=rewritten_query,
+                    repository=repository,
                 )
                 res = resolution.validation_result
                 

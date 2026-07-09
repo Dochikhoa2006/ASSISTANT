@@ -79,12 +79,27 @@ def maybe_pull_ollama_models(ollama_url: str, settings: ProductionSettings) -> N
 
 
 def configured_ollama_models(settings: ProductionSettings) -> list[str]:
-    values = [
+    values: list[str | None] = [
         settings.ollama.fast_model,
         settings.ollama.balanced_model,
-        settings.ollama.accurate_model or "",
-        settings.ollama.writing_model or "",
+        settings.ollama.intent_model,
+        settings.ollama.action_extraction_model,
+        settings.ollama.accurate_model,
+        settings.ollama.writing_model,
+        settings.ollama.last_qa_model,
+        settings.ollama.clarification_merge_model,
+        settings.ollama.clarification_question_model,
+        settings.ollama.human_supporting_question_model,
+        settings.ollama.reminder_supporting_question_model,
     ]
+    # Check if there are other models scattered in settings
+    values.extend([
+        settings.ollama.general_sub_branch_detector_model,
+        settings.ollama.risky_action_model,
+    ])
+    if settings.ollama.heavy_production_enabled:
+        values.append(settings.ollama.heavy_production_model)
+
     unique: list[str] = []
     for value in values:
         if value and value not in unique:

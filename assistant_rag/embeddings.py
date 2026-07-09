@@ -27,6 +27,8 @@ class SentenceTransformerEmbeddingClient:
         if self.settings.device:
             kwargs["device"] = self.settings.device
         self.model = SentenceTransformer(self.settings.model_name, **kwargs)
+        if self.settings.max_length:
+            self.model.max_seq_length = self.settings.max_length
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         vectors = self.model.encode(

@@ -12,7 +12,7 @@ import os
 import sqlite3
 import time
 
-from .contracts import LastQAState, ResponseType
+from .contracts import LastQAState, ResponseType, ExpectedResponseType
 
 
 @dataclass
@@ -60,13 +60,27 @@ class DiskCacheLastQAStore:
         from .contracts import GeneratedQuestion, QuestionSource
         
         clarif = payload.get("clarification_question")
-        clarif_q = GeneratedQuestion(text=clarif["text"], source=QuestionSource(clarif["source"]), purpose=clarif["purpose"], confidence=clarif["confidence"], should_ask=clarif.get("should_ask", True)) if clarif else None
+        clarif_q = GeneratedQuestion(
+            text=clarif["text"], source=QuestionSource(clarif["source"]), purpose=clarif["purpose"], 
+            confidence=clarif["confidence"], should_ask=clarif.get("should_ask", True),
+            expected_response_type=ExpectedResponseType(clarif.get("expected_response_type", ExpectedResponseType.UNKNOWN.value))
+        ) if clarif else None
         
         remind = payload.get("reminder_supporting_question")
-        remind_q = GeneratedQuestion(text=remind["text"], source=QuestionSource(remind["source"]), purpose=remind["purpose"], confidence=remind["confidence"], should_ask=remind.get("should_ask", True)) if remind else None
+        remind_q = GeneratedQuestion(
+            text=remind["text"], source=QuestionSource(remind["source"]), purpose=remind["purpose"], 
+            confidence=remind["confidence"], should_ask=remind.get("should_ask", True),
+            expected_response_type=ExpectedResponseType(remind.get("expected_response_type", ExpectedResponseType.UNKNOWN.value))
+        ) if remind else None
         
         supp = payload.get("supporting_questions", [])
-        supp_qs = [GeneratedQuestion(text=q["text"], source=QuestionSource(q["source"]), purpose=q["purpose"], confidence=q["confidence"], should_ask=q.get("should_ask", True)) for q in supp]
+        supp_qs = [
+            GeneratedQuestion(
+                text=q["text"], source=QuestionSource(q["source"]), purpose=q["purpose"], 
+                confidence=q["confidence"], should_ask=q.get("should_ask", True),
+                expected_response_type=ExpectedResponseType(q.get("expected_response_type", ExpectedResponseType.UNKNOWN.value))
+            ) for q in supp
+        ]
 
         return LastQAState(
             last_user_query=payload["last_user_query"],
@@ -78,7 +92,7 @@ class DiskCacheLastQAStore:
             linked_topic_id=payload.get("linked_topic_id"),
             linked_hop_id=payload.get("linked_hop_id"),
             expected_response_type=(
-                ResponseType(payload["expected_response_type"])
+                ExpectedResponseType(payload["expected_response_type"])
                 if payload.get("expected_response_type")
                 else None
             ),

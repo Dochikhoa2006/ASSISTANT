@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from .contracts import RetrievalResult
@@ -64,6 +64,8 @@ class OpenSearchBM25Index:
                 score = float(hit.get("_score") or 0.0)
                 confidence = score / (score + 1.0) if score > 0 else 0.0
                 text = str(source.get("text", ""))
+                payload = dict(source)
+                payload["text"] = text
                 results.append(
                     RetrievalResult(
                         entity_type=entity_type,
@@ -72,24 +74,34 @@ class OpenSearchBM25Index:
                         rerank_score=confidence,
                         confidence=confidence,
                         validation_status="candidate",
-                        payload={"text": text},
+                        payload=payload,
                     )
                 )
         return sorted(results, key=lambda item: item.rerank_score, reverse=True)[:limit]
 
-    def upsert(self, *, user_id: str, entity_type: str, entity_id: str, text: str) -> None:
+    def upsert(
+        self,
+        *,
+        user_id: str,
+        entity_type: str,
+        entity_id: str,
+        text: str,
+        metadata: dict[str, str | int | float | bool] | None = None,
+    ) -> None:
         self._ensure_initialized()
         index_name = self._index_for_entity(entity_type)
+        body = {
+            "entity_id": entity_id,
+            "user_id": user_id,
+            "entity_type": entity_type,
+            "text": text,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        body.update(metadata or {})
         self.client.index(
             index=index_name,
             id=entity_id,
-            body={
-                "entity_id": entity_id,
-                "user_id": user_id,
-                "entity_type": entity_type,
-                "text": text,
-                "updated_at": datetime.now(UTC).isoformat(),
-            },
+            body=body,
         )
 
     def delete(self, *, entity_id: str) -> None:
@@ -187,6 +199,11 @@ class OpenSearchBM25Index:
                     "entity_type": {"type": "keyword"},
                     "topic_id": {"type": "keyword"},
                     "knowledge_topic_id": {"type": "keyword"},
+                    "hop_id": {"type": "keyword"},
+                    "parent_hop_id": {"type": "keyword"},
+                    "root_hop_id": {"type": "keyword"},
+                    "chunk_id": {"type": "keyword"},
+                    "chunk_index": {"type": "integer"},
                     "source_id": {"type": "keyword"},
                     "branch_id": {"type": "keyword"},
                     "intent": {"type": "keyword"},
@@ -194,6 +211,7 @@ class OpenSearchBM25Index:
                     "content_hash": {"type": "keyword"},
                     "is_deleted": {"type": "boolean"},
                     "version": {"type": "integer"},
+                    "created_at": {"type": "date"},
                     "text": {"type": "text", "analyzer": self.settings.analyzer_name},
                     "summary": {"type": "text", "analyzer": self.settings.analyzer_name},
                     "updated_at": {"type": "date"},

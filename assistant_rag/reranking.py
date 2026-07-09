@@ -52,7 +52,11 @@ class SentenceTransformerCrossEncoderReranker:
                     payload=result.payload,
                 )
             )
-        return sorted(reranked, key=lambda item: item.rerank_score, reverse=True)
+        return [
+            item
+            for item in sorted(reranked, key=lambda item: item.rerank_score, reverse=True)
+            if item.rerank_score >= self.settings.min_score
+        ]
 
 
 @dataclass
@@ -94,7 +98,11 @@ class HTTPReranker:
                     payload=payload,
                 )
             )
-        return sorted(reranked, key=lambda item: item.rerank_score, reverse=True)
+        return [
+            item
+            for item in sorted(reranked, key=lambda item: item.rerank_score, reverse=True)
+            if item.rerank_score >= self.settings.min_score
+        ]
 
     def _score(self, body: dict[str, object]) -> list[float]:
         if not self.settings.endpoint_url:

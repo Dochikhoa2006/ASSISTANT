@@ -17,7 +17,7 @@ from .contracts import (
     ReminderValidationCandidate,
     RetrievalCandidateAssessment,
 )
-from .llm import LLMClient
+from .llm import LLMClient, LLMTask
 from .prompts import PromptRegistry
 
 logger = logging.getLogger(__name__)
@@ -80,12 +80,11 @@ class KnowledgeRetrievalValidationStrategy:
         user_prompt = "Runtime context:\n" + json.dumps(prompt_input, indent=2)
 
         try:
-            raw_response = self.llm.generate_structured(
-                model=self.config.knowledge_llm_validation_model,
-                system=system_prompt,
-                prompt=user_prompt,
-                schema_name="knowledge_retrieval_validation",
-                retry_count=self.config.knowledge_llm_validation_json_retry_count,
+            raw_response = self.llm.generate_json(
+                task=LLMTask.RETRIEVAL_VALIDATION,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                schema=self._schema(),
             )
             return self._parse_and_validate_result(raw_response, candidate_map)
         except Exception as e:
@@ -147,6 +146,39 @@ class KnowledgeRetrievalValidationStrategy:
             candidate_assessments=(),
         )
 
+    def _schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string"},
+                "validation_result": {"type": "string"},
+                "selected_candidate_keys": {"type": "array", "items": {"type": "string"}},
+                "confidence": {"type": "number"},
+                "ambiguous": {"type": "boolean"},
+                "reason_summary": {"type": "string"},
+                "candidate_assessments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "candidate_key": {"type": "string"},
+                            "action_compatible": {"type": "boolean"},
+                            "reasoning": {"type": "string"}
+                        },
+                        "required": ["candidate_key", "action_compatible", "reasoning"]
+                    }
+                }
+            },
+            "required": [
+                "operation",
+                "validation_result",
+                "selected_candidate_keys",
+                "confidence",
+                "ambiguous",
+                "reason_summary"
+            ]
+        }
+
 
 class ReminderRetrievalValidationStrategy:
     def __init__(self, config: RetrievalValidationConfig, llm: LLMClient, prompts: PromptRegistry):
@@ -207,12 +239,11 @@ class ReminderRetrievalValidationStrategy:
         user_prompt = "Runtime context:\n" + json.dumps(prompt_input, indent=2, default=str)
 
         try:
-            raw_response = self.llm.generate_structured(
-                model=self.config.reminder_llm_validation_model,
-                system=system_prompt,
-                prompt=user_prompt,
-                schema_name="reminder_retrieval_validation",
-                retry_count=self.config.reminder_llm_validation_json_retry_count,
+            raw_response = self.llm.generate_json(
+                task=LLMTask.RETRIEVAL_VALIDATION,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                schema=self._schema(),
             )
             return self._parse_and_validate_result(raw_response, candidate_map)
         except Exception as e:

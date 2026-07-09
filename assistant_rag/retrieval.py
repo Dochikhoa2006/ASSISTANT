@@ -13,7 +13,15 @@ class SearchIndex(Protocol):
     def search(self, *, user_id: str, query: str, limit: int) -> list[RetrievalResult]:
         ...
 
-    def upsert(self, *, user_id: str, entity_type: str, entity_id: str, text: str) -> None:
+    def upsert(
+        self,
+        *,
+        user_id: str,
+        entity_type: str,
+        entity_id: str,
+        text: str,
+        metadata: dict[str, str | int | float | bool] | None = None,
+    ) -> None:
         ...
 
     def delete(self, *, entity_id: str) -> None:
@@ -37,6 +45,8 @@ class HybridRetriever:
     lexical_weight: float = 1.0
     semantic_weight: float = 1.0
     rerank_candidate_limit: int = 32
+    bm25_top_k: int = 30
+    chroma_top_k: int = 30
 
     def retrieve_conversation(
         self, *, user_id: str, query: str, limit: int, min_confidence: float
@@ -70,8 +80,8 @@ class HybridRetriever:
         allowed_entity_type: str,
     ) -> list[RetrievalResult]:
         merged = self._rrf_merge(
-            self.bm25.search(user_id=user_id, query=query, limit=limit),
-            self.chroma.search(user_id=user_id, query=query, limit=limit),
+            self.bm25.search(user_id=user_id, query=query, limit=self.bm25_top_k),
+            self.chroma.search(user_id=user_id, query=query, limit=self.chroma_top_k),
         )
         reranked = self.reranker.rerank(query, merged[: self.rerank_candidate_limit])
         return [

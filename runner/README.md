@@ -1,125 +1,74 @@
-# SQL-First RAG Assistant Architecture
+# SQL-First RAG Assistant
 
-This workspace contains a greenfield implementation scaffold for the requested
-assistant architecture.
+This project is a sophisticated Retrieval-Augmented Generation (RAG) assistant pipeline built on a SQL-first foundation. It is designed to intelligently handle multi-turn conversations, retrieve past knowledge and reminders, route queries across intent branches, and construct dynamic responses using an LLM.
 
-The package enforces the main invariants:
+## Directory Structure
 
-- SQL is the source of truth.
-- BM25/OpenSearch and ChromaDB are derived caches.
-- Cross-store updates happen through `indexing_outbox`.
-- Reminder retrieval stays SQL-only.
-- Knowledge actions mutate knowledge tables only.
-- Reminder actions mutate reminder tables only.
-- Action branches return results to the Response Bundler before Chat Output.
-- Last-QA state is volatile and separate from permanent conversation history.
+* **`assistant_rag/`**  
+  The core backend application logic. Contains the production pipeline, RAG models, intent classification, orchestration branches, database wrappers, context filtering, and prompt registries.
+  
+* **`alembic/` & `alembic.ini`**  
+  Database migration files and configuration. Used to maintain the SQL schema across versions.
 
-## Package Map
+* **`assistant_data/`**  
+  A directory holding runtime data, such as the production `assistant.sqlite3` database file.
 
-- `assistant_rag/contracts.py` defines shared request/result contracts.
-- `assistant_rag/database.py` defines the authoritative SQL schema and atomic writes.
-- `assistant_rag/retrieval.py` defines BM25/Chroma-style derived cache adapters.
-- `assistant_rag/bm25_opensearch.py` defines the production OpenSearch BM25 cache.
-- `assistant_rag/validation.py` defines deterministic validation registries.
-- `assistant_rag/branches.py` defines the four branch executors.
-- `assistant_rag/bundler.py` defines the single response assembly layer.
-- `assistant_rag/pipeline.py` wires the exact runtime order.
-- `assistant_rag/indexing.py` processes `indexing_outbox`.
-- `assistant_rag/autoscan.py` implements SQL-only reminder autoscan and reply context loading.
-- `assistant_rag/platform.py` performs post-bundling platform formatting.
-- `assistant_rag/consistency.py` provides rollout and migration integrity checks.
+* **`runner/`**  
+  Contains infrastructure and bootstrapping scripts.
+  * **`run`**: A shell script used to bring up required Docker containers (OpenSearch, ChromaDB, Ollama) and launch the pipeline in either debug or UI mode.
+  * **`docker-compose.runtime.yml`**: Defines the backend service dependencies required by the application.
 
-## Fast Debug Runner
+* **`streamlit_app.py`**  
+  The primary web-based User Interface (UI) for interacting with the assistant using Streamlit.
+  
+* **`debug_pipeline.py`**  
+  A Command Line Interface (CLI) testing utility. It executes the exact same RAG operations as the Streamlit app but inside the terminal without loading a web framework.
+  
+* **`requirements-production.txt`**  
+  The list of Python packages required to run the production system.
 
-Use this when you want to test your own questions quickly in the terminal
-without starting Streamlit or FastAPI. The runner creates/uses SQL,
-OpenSearch indexes, and ChromaDB collections so retrieval sync can be debugged.
-The `run` wrapper starts OpenSearch, ChromaDB, and Ollama with Docker Compose
-before launching the debug runner.
+## Running the Application
 
+To start the infrastructure services and the interactive terminal UI, use the runner script:
 ```bash
-./run
+./runner/run
 ```
 
-Equivalent direct command:
-
+To run the Streamlit web interface:
 ```bash
-python3 debug_pipeline.py
+./runner/run streamlit
 ```
 
-To start the same infrastructure and then run the Streamlit UI:
+## Default Model Policy
 
+Normal runtime uses these central defaults from `assistant_rag/settings.py`:
+
+* Fast routing, query rewrite, Last-QA, and lightweight tool routing: `qwen3:4b`
+* Intent classification and action extraction: `qwen3:8b`
+* Risky delete/modify validation: `qwen3:14b`
+* Final answer generation: `llama3.1:8b`
+* Embeddings: `BAAI/bge-m3`
+
+Runtime policy defaults:
+
+* Deterministic routing/extraction temperatures: `0.0`
+* Final answer temperature: `0.25`
+* Long-form writing temperature: `0.45`
+* Timeouts: fast `20s`, balanced `45s`, accurate/risky `90s`, writing `120s`
+* Context windows: fast `8192`, balanced `16384`, accurate/writing `32768`
+* Retrieval: BM25 `30`, Chroma `30`, RRF `60`, reranker top-k `20`, reranker min score `0.35`, final context `8`
+* Confidence floors: retrieval `0.25`, knowledge context `0.35`, conversation context `0.40`
+* Last-QA: minimum `0.75`, clarification merge `0.80`, broad-retrieval skip `0.85`
+* Actions: action minimum `0.70`, risky action threshold `0.85`, risky ops `delete,modify,turn_off`
+* Reminder context: minimum confidence `0.50`
+* Reminder resolver: candidates `20`, target score `0.72`, ambiguity margin `0.12`, fuzzy threshold `0.78`, LLM validation enabled
+* Knowledge chunks: size `700`, overlap `100`, minimum `80`, maximum `1000`
+* Embeddings: normalized, batch size `32`, max length `8192`
+* Worker: outbox batch `50`, retries `5`, retry backoff `30s`, stale processing timeout `300s`, outbox interval `5s`, reminder autoscan `60s`
+
+Heavy production mode is opt-in so normal laptop runs do not auto-pull a 30B model:
 ```bash
-./run streamlit
+OLLAMA_HEAVY_PRODUCTION_ENABLED=1 ./runner/run
 ```
 
-To skip Docker startup when services are already running:
-
-```bash
-ASSISTANT_SKIP_INFRA=1 ./run
-```
-
-To automatically pull configured Ollama models before running:
-
-```bash
-ASSISTANT_AUTO_PULL_OLLAMA_MODELS=1 ./run
-```
-
-Useful commands:
-
-```text
-ask hello
-remember my laptop is silver
-remind team meeting at 2030-01-01T09:00:00+00:00
-rebuild
-tables
-notifications
-autoscan 2030-01-01T09:01:00+00:00
-reset
-quit
-```
-
-Default production settings:
-
-```text
-ASSISTANT_DB_PATH=assistant_data/assistant.sqlite3
-OPENSEARCH_URL=http://localhost:9200
-OPENSEARCH_CONVERSATION_INDEX=assistant_conversation_hops
-OPENSEARCH_KNOWLEDGE_INDEX=assistant_knowledge_chunks
-DEBUG_OPENSEARCH_CONVERSATION_INDEX=debug_assistant_conversation_hops
-DEBUG_OPENSEARCH_KNOWLEDGE_INDEX=debug_assistant_knowledge_chunks
-DEBUG_CHROMA_PATH=assistant_data/debug_chroma
-ASSISTANT_CHROMA_HOST=localhost
-ASSISTANT_CHROMA_PORT=8000
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_FAST_MODEL=llama3.2:3b
-OLLAMA_BALANCED_MODEL=llama3.2:3b
-```
-
-## Production-Local Commands
-
-Ollama defaults to `http://localhost:11434`. Configure runtime values with
-environment variables such as `OLLAMA_BASE_URL`, `OLLAMA_FAST_MODEL`,
-`OLLAMA_BALANCED_MODEL`, `ASSISTANT_DB_PATH`, and `ASSISTANT_CHROMA_PATH`.
-
-```bash
-python3 -m assistant_rag.cli init-db
-python3 -m assistant_rag.cli check-ollama
-python3 -m assistant_rag.cli check-opensearch
-python3 -m assistant_rag.cli inspect-db
-python3 -m assistant_rag.cli inspect-indexes
-python3 -m assistant_rag.cli rebuild-indexes
-streamlit run streamlit_app.py
-```
-
-Using the local virtualenv:
-
-```bash
-.venv/bin/python -m assistant_rag.cli init-db
-.venv/bin/python -m assistant_rag.cli check-ollama
-.venv/bin/python -m assistant_rag.cli check-opensearch
-.venv/bin/python -m assistant_rag.cli inspect-db
-.venv/bin/python -m assistant_rag.cli inspect-indexes
-.venv/bin/python -m assistant_rag.cli rebuild-indexes
-.venv/bin/streamlit run streamlit_app.py
-```
+When enabled, the configured heavy model default is `qwen3:30b`.

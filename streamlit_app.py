@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from assistant_rag.contracts import ChatRequest
-from assistant_rag.production_factory import build_production_pipeline
+from assistant_rag.production_factory import build_production_pipeline, build_production_repository
 from assistant_rag.settings import ProductionSettings
 
 
@@ -16,9 +16,13 @@ def main() -> None:
     settings = ProductionSettings.from_env()
     if "pipeline" not in st.session_state:
         st.session_state.pipeline = build_production_pipeline(settings)
+    
+    if "repository" not in st.session_state:
+        st.session_state.repository = build_production_repository(settings)
+        
     user_id = st.text_input("User ID", value="streamlit-user")
     gmail_username = st.text_input("Gmail username", value="")
-    gmail_app_password = st.text_input("Gmail app password", value="", type="password")
+    # Gmail app password should be loaded securely from secrets or OAuth in production
     query = st.chat_input("Ask the assistant")
     if query:
         response = st.session_state.pipeline.handle(
@@ -27,9 +31,9 @@ def main() -> None:
                 raw_query=query,
                 platform_context={
                     "gmail_username": gmail_username,
-                    "gmail_app_password": gmail_app_password,
                 },
-            )
+            ),
+            st.session_state.repository
         )
         st.chat_message("assistant").write(response.final_chat_text)
 

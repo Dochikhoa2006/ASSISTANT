@@ -10,3 +10,6 @@ SQLAlchemy
 streamlit
 uvicorn
 rapidfuzz
+PyJWT[crypto]
+redis
+pypdf
