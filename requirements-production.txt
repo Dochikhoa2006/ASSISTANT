@@ -1,0 +1,12 @@
+alembic
+apscheduler
+chromadb
+fastapi
+opensearch-py
+psycopg[binary]
+pydantic-settings
+sentence-transformers
+SQLAlchemy
+streamlit
+uvicorn
+rapidfuzz

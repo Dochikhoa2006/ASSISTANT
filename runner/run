@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if [ -x ".venv/bin/python" ]; then
+  PYTHON=".venv/bin/python"
+else
+  PYTHON="python3"
+fi
+
+COMPOSE_FILE="runner/docker-compose.runtime.yml"
+
+compose() {
+  if docker compose version >/dev/null 2>&1; then
+    docker compose -f "$COMPOSE_FILE" "$@"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    docker-compose -f "$COMPOSE_FILE" "$@"
+  else
+    echo "Docker Compose is required to start OpenSearch, ChromaDB, and Ollama."
+    echo "Install Docker Desktop, then run ./runner/run again."
+    exit 1
+  fi
+}
+
+if [ "${ASSISTANT_SKIP_INFRA:-0}" != "1" ]; then
+  compose up -d
+  "$PYTHON" -m assistant_rag.service_wait
+fi
+
+MODE="${1:-debug}"
+if [ "$MODE" = "streamlit" ]; then
+  shift
+  exec "$PYTHON" -m streamlit run streamlit_app.py "$@"
+fi
+
+exec "$PYTHON" debug_pipeline.py "$@"

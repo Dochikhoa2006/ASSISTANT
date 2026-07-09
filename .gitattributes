@@ -1,0 +1,6 @@
+/Users/chikhoado/Desktop/ASSISTANT/alembic/versions/68a848528fe7_add_knowledge_chunk_deduplication_.py filter=lfs diff=lfs merge=lfs -text
+/Users/chikhoado/Desktop/ASSISTANT/alembic/versions/a4c9e7d1b2f6_release_4_operations_recurrence.py filter=lfs diff=lfs merge=lfs -text
+/Users/chikhoado/Desktop/ASSISTANT/alembic/versions/cf4e5605471b_initial_schema.py filter=lfs diff=lfs merge=lfs -text
+/Users/chikhoado/Desktop/ASSISTANT/alembic/versions/d8f1c2e9a4b7_release_1_schema_contract_alignment.py filter=lfs diff=lfs merge=lfs -text
+/Users/chikhoado/Desktop/ASSISTANT/alembic/versions/e2a91c7b5d30_release_2_production_safety.py filter=lfs diff=lfs merge=lfs -text
+/Users/chikhoado/Desktop/ASSISTANT/alembic/versions/f3b7c9d2a610_release_3_sources_ingestion_artifacts.py filter=lfs diff=lfs merge=lfs -text
