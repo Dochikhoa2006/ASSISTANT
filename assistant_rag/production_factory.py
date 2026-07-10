@@ -22,6 +22,8 @@ from .database import AssistantRepository
 from .embeddings import SentenceTransformerEmbeddingClient
 from .last_qa import DiskCacheLastQAStore
 from .llm import OllamaIntentClassifier, OllamaLLMClient, OllamaModelRouter
+from .onnx_llm import ONNXLLMClient
+from .hybrid_llm import HybridLLMClient
 from .pipeline import AssistantPipeline
 from .platform import PlatformSelector
 from .prompts import DEFAULT_PROMPT_REGISTRY
@@ -167,7 +169,9 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
     chroma = ChromaPersistentVectorIndex(settings.chroma, embeddings)
     prompt_registry = DEFAULT_PROMPT_REGISTRY
     model_router = OllamaModelRouter(settings.ollama)
-    llm = OllamaLLMClient(settings.ollama, model_router)
+    ollama_llm = OllamaLLMClient(settings.ollama, model_router)
+    onnx_llm = ONNXLLMClient(model_router)
+    llm = HybridLLMClient(ollama_llm, onnx_llm)
     reranker = SentenceTransformerCrossEncoderReranker(settings.reranker)
     retriever = HybridRetriever(
         bm25=bm25,

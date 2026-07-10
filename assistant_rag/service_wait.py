@@ -6,6 +6,7 @@ import json
 import time
 from urllib import error, request
 
+from .llm import uses_onnx_runtime
 from .settings import ProductionSettings
 
 
@@ -99,7 +100,10 @@ def configured_ollama_models(settings: ProductionSettings) -> list[str]:
     values: list[str | None] = []
     for field in dataclasses.fields(settings.ollama):
         if field.name.startswith("model_"):
-            values.append(getattr(settings.ollama, field.name))
+            val = getattr(settings.ollama, field.name)
+            # ONNX/Hugging Face models are loaded by ONNX Runtime, not Ollama.
+            if val and not uses_onnx_runtime(val):
+                values.append(val)
 
     unique: list[str] = []
     for value in values:

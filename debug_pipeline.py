@@ -4,6 +4,7 @@ import argparse
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import sys
 from typing import Any, Callable
 
@@ -25,7 +26,6 @@ from assistant_rag.config import GeneralPurposeConfig
 from assistant_rag.context_filter import HardRuleContextFilter, TwoLayerContextFilter
 from assistant_rag.content_composer import AnswerGenerationTool, ContentToolRegistry, ReActContentComposer
 from assistant_rag.contracts import (
-    ActionValidationResult,
     BundledResponse,
     ChatRequest,
     ExpectedResponseType,
@@ -37,16 +37,25 @@ from assistant_rag.contracts import (
     RetrievalResult,
 )
 from assistant_rag.database import SQLiteRepository, now_iso
+from assistant_rag.hybrid_llm import HybridLLMClient
 from assistant_rag.last_qa import InMemoryLastQAStore
-from assistant_rag.llm import LLMTask, OllamaModelRouter
+from assistant_rag.llm import (
+    LLMTask,
+    OllamaLLMClient,
+    OllamaModelRouter,
+    structured_fallback_payload,
+    uses_onnx_runtime,
+    validate_json_schema,
+)
 from assistant_rag.observability import current_trace, new_request_id, start_trace
+from assistant_rag.onnx_llm import ONNXLLMClient, _adaptive_max_new_tokens, _sentence_boundary_stop_reason
 from assistant_rag.platform import PlatformSelector
 from assistant_rag.production_factory import (
     build_assistant_config,
     build_production_pipeline,
     build_production_repository,
 )
-from assistant_rag.prompts import DEFAULT_PROMPT_REGISTRY
+from assistant_rag.prompts import CONTENT_COMPOSER_REACT_SCHEMA, DEFAULT_PROMPT_REGISTRY
 from assistant_rag.settings import ProductionSettings
 
 
@@ -148,17 +157,42 @@ def _debug_llm_lines(llm: Any | None) -> list[str]:
 
     settings = getattr(llm, "settings", None)
     router = getattr(llm, "router", None)
+    ollama_client = getattr(llm, "ollama_client", None)
+    onnx_client = getattr(llm, "onnx_client", None)
     last_error_by_task = getattr(llm, "last_error_by_task", {}) or {}
     last_errors = {
         getattr(task, "value", str(task)): str(error)
         for task, error in last_error_by_task.items()
     }
+    engine = "hybrid_ollama_onnx" if ollama_client is not None and onnx_client is not None else type(llm).__name__
     lines = [
         "Debug LLM:",
+        f"  engine: {engine}",
         f"  base_url: {getattr(settings, 'base_url', 'unknown')}",
         f"  keep_alive: {getattr(settings, 'keep_alive', 'unknown')}",
         f"  structured_attempts_for_json: {getattr(settings, 'structured_retry_count', 0) + 1 if settings else 'unknown'}",
     ]
+    if onnx_client is not None:
+        loaded_models = sorted(getattr(onnx_client, "_models", {}).keys())
+        lines.extend(
+            [
+                f"  onnx_cache_dir: {getattr(onnx_client, 'cache_dir', 'unknown')}",
+                f"  onnx_loaded_models: {loaded_models or []}",
+            ]
+        )
+    if router is not None:
+        onnx_tasks: list[str] = []
+        ollama_tasks: list[str] = []
+        for task in LLMTask:
+            model = router.model_for_task(task)
+            target = onnx_tasks if uses_onnx_runtime(model) else ollama_tasks
+            target.append(f"{task.value}={model}")
+        lines.extend(
+            [
+                f"  onnx_routes: {onnx_tasks}",
+                f"  ollama_routes: {ollama_tasks}",
+            ]
+        )
     if not last_errors:
         lines.append("  recent_errors: none")
         return lines
@@ -171,12 +205,14 @@ def _debug_llm_lines(llm: Any | None) -> list[str]:
         payload: dict[str, Any] = {"task": task.value, "last_error": error_text}
         if router is not None:
             decision = router.decision_for_task(task)
+            retry_count = getattr(settings, f"json_retry_count_{task.value}", getattr(settings, "structured_retry_count", 0)) if settings else 0
             payload.update(
                 {
                     "model": decision.model,
                     "single_call_timeout_seconds": decision.timeout_seconds,
                     "temperature": decision.temperature,
                     "num_ctx": decision.num_ctx,
+                    "configured_json_attempts": retry_count + 1,
                     "reason": decision.reason_summary,
                 }
             )
@@ -325,7 +361,7 @@ class DeterministicRetriever:
         rows = self.repository.connection.execute(
             """
             SELECT h.hop_id, h.topic_id, h.user_id, h.raw_user_query,
-                   h.raw_response, h.supporting_questions_json, h.entities_json
+                    h.raw_response, h.supporting_questions_json, h.entities_json
             FROM conversation_hops h
             WHERE h.user_id = ?
             ORDER BY h.created_at DESC
@@ -415,7 +451,6 @@ class ScenarioLLM:
             "tool_name": "answer_generation",
             "tool_input": {},
             "is_final_answer": True,
-            "reason_summary": "General learning-plan answer.",
         }
 
 
@@ -659,6 +694,8 @@ def scenario_clarification_direct(settings: ProductionSettings) -> ScenarioResul
         },
     )
     assert_response(response, ResponseType.CLARIFICATION, "Which item")
+    if "Clarification question:" not in response.final_chat_text:
+        raise AssertionError(f"clarification question was not explicitly printed: {response.final_chat_text!r}")
     return ScenarioResult("clarification_direct", True, "clarification branch returned a question")
 
 
@@ -678,25 +715,219 @@ def scenario_general_new_conversation(settings: ProductionSettings) -> ScenarioR
     return ScenarioResult("general_new_conversation", True, "new conversation persisted hop and outbox job")
 
 
+def scenario_general_hitl_supporting_question_printed(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    response = run_request(
+        state,
+        "Explain the migration plan",
+        metadata={
+            "intent": Intent.GENERAL_RESPONSE.value,
+            "normal_response_text": "Start with schema compatibility, then migrate traffic gradually.",
+            "supporting_question": "Which service should I prioritize next?",
+        },
+    )
+    assert_response(response, ResponseType.NORMAL, "schema compatibility")
+    if "Supporting question: Which service should I prioritize next?" not in response.final_chat_text:
+        raise AssertionError(f"HITL supporting question was not printed: {response.final_chat_text!r}")
+    return ScenarioResult(
+        "general_hitl_supporting_question_printed",
+        True,
+        "HITL supporting question is visible in final chat text",
+    )
+
+
+def scenario_general_new_conversation_skips_sub_branch_llm(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+
+    class FailingSubBranchDetector:
+        def detect(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("sub-branch detector should not run for a context-free new conversation")
+
+    branch = state.pipeline.router.branches[Intent.GENERAL_RESPONSE]
+    branch.sub_branch_detector = FailingSubBranchDetector()
+    branch.general_purpose_config = GeneralPurposeConfig(
+        general_sub_branch_detector_enabled=True,
+        content_composer_enabled=False,
+        hitl_supporting_question_enabled=False,
+    )
+    response = run_request(
+        state,
+        "Explain binary search with numbers",
+        metadata={
+            "intent": Intent.GENERAL_RESPONSE.value,
+            "normal_response_text": "Binary search repeatedly halves a sorted list.",
+        },
+    )
+    assert_response(response, ResponseType.NORMAL, "halves")
+    return ScenarioResult(
+        "general_new_conversation_skips_sub_branch_llm",
+        True,
+        "context-free general responses choose new topic without sub-branch LLM",
+    )
+
+
+def scenario_answer_adaptive_token_budget(settings: ProductionSettings) -> ScenarioResult:
+    simple_prompt = 'Runtime context:\n{"stage":"answer_generation","raw_query":"Explain binary search with numbers","rewritten_query":"Explain binary search with numbers","extra":{"approved_conversation_history":[],"approved_knowledge_evidence":[],"approved_reminder_context":[]}}'
+    complex_prompt = 'Runtime context:\n{"stage":"answer_generation","raw_query":"Deeply determine a latency optimization architecture and implementation plan","rewritten_query":"Deeply determine a latency optimization architecture and implementation plan","extra":{"approved_conversation_history":[],"approved_knowledge_evidence":[],"approved_reminder_context":[]}}'
+    long_prompt = 'Runtime context:\n{"stage":"answer_generation","raw_query":"Write a comprehensive full specification for the latency optimization","rewritten_query":"Write a comprehensive full specification for the latency optimization","extra":{"approved_conversation_history":[],"approved_knowledge_evidence":[],"approved_reminder_context":[]}}'
+    approved_prompt = 'Runtime context:\n{"stage":"answer_generation","raw_query":"Summarize this prior context","rewritten_query":"Summarize this prior context","extra":{"approved_conversation_history":[{"text":"Previous approved context"}],"approved_knowledge_evidence":[],"approved_reminder_context":[]}}'
+    if _adaptive_max_new_tokens(LLMTask.ANSWER, simple_prompt, 1024) != 320:
+        raise AssertionError("simple teaching answer should use a compact token budget")
+    if _adaptive_max_new_tokens(LLMTask.ANSWER, complex_prompt, 1024) != 640:
+        raise AssertionError("complex architecture answer should use the bounded complex budget")
+    if _adaptive_max_new_tokens(LLMTask.ANSWER, long_prompt, 1024) != 896:
+        raise AssertionError("explicit long-form requests should use the high bounded budget")
+    if _adaptive_max_new_tokens(LLMTask.ANSWER, approved_prompt, 1024) != 512:
+        raise AssertionError("approved-context answers should use the context budget")
+    if _adaptive_max_new_tokens(LLMTask.WRITING, simple_prompt, 1536) != 1536:
+        raise AssertionError("adaptive answer budget must not affect non-answer tasks")
+    if _sentence_boundary_stop_reason("This is a complete enough answer.", 220, 320) is None:
+        raise AssertionError("complete simple answers should be eligible for sentence-boundary stop")
+    if _sentence_boundary_stop_reason("Too short.", 60, 320) is not None:
+        raise AssertionError("short answers should not stop before the budget floor")
+    return ScenarioResult("answer_adaptive_token_budget", True, "answer budgets are tiered and can stop at complete sentences")
+
+
+def scenario_structured_clarification_fallback_policy(settings: ProductionSettings) -> ScenarioResult:
+    default_settings = ProductionSettings()
+    if default_settings.ollama.num_predict_generate_clarification < 160:
+        raise AssertionError("clarification JSON generation needs enough token budget for all required fields")
+    if default_settings.ollama.num_predict_generate_human_supporting < 160:
+        raise AssertionError("human supporting-question JSON generation needs enough token budget")
+    if default_settings.ollama.num_predict_generate_reminder_supporting < 160:
+        raise AssertionError("reminder supporting-question JSON generation needs enough token budget")
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "question_text": {"type": "string"},
+            "question_source": {"type": "string"},
+            "purpose": {"type": "string"},
+            "confidence": {"type": "number"},
+            "should_ask": {"type": "boolean"},
+            "expected_response_type": {
+                "type": "string",
+                "enum": [e.value for e in ExpectedResponseType],
+            },
+            "reason_summary": {"type": "string"},
+        },
+        "required": [
+            "question_text",
+            "question_source",
+            "purpose",
+            "confidence",
+            "should_ask",
+            "expected_response_type",
+            "reason_summary",
+        ],
+    }
+    payload = structured_fallback_payload(
+        task=LLMTask.GENERATE_CLARIFICATION,
+        schema=schema,
+        user_prompt='Runtime context:\n{"raw_query":"Need to update it"}',
+        error=ValueError("synthetic malformed JSON"),
+    )
+    validate_json_schema(payload, schema)
+    if payload["question_text"] != DEFAULT_PROMPT_REGISTRY.message("fallback_message"):
+        raise AssertionError("clarification fallback text must come from PromptRegistry")
+    return ScenarioResult(
+        "structured_clarification_fallback_policy",
+        True,
+        "clarification structured fallback is schema-valid, registry-backed, and budgeted",
+    )
+
+
+def scenario_content_composer_react_structured_policy(settings: ProductionSettings) -> ScenarioResult:
+    default_settings = ProductionSettings()
+    if default_settings.ollama.num_predict_content_composer_react < 160:
+        raise AssertionError("content composer ReAct JSON needs enough token budget for all required fields")
+
+    thought_rules = CONTENT_COMPOSER_REACT_SCHEMA["properties"]["thought"]
+    if thought_rules.get("maxLength") != 120:
+        raise AssertionError("content composer ReAct thought should stay short enough for small structured models")
+
+    prompt = DEFAULT_PROMPT_REGISTRY.template("content_composer_react")
+    if "no more than 12 words" not in " ".join(prompt.decision_rules):
+        raise AssertionError("content composer ReAct prompt must cap thought length")
+
+    payload = structured_fallback_payload(
+        task=LLMTask.CONTENT_COMPOSER_REACT,
+        schema=CONTENT_COMPOSER_REACT_SCHEMA,
+        user_prompt='Runtime context:\n{"rewritten_query":"Create an Excel comparison for dog cat duck fur color"}',
+        error=ValueError("synthetic malformed JSON"),
+    )
+    validate_json_schema(payload, CONTENT_COMPOSER_REACT_SCHEMA)
+    if payload["tool_name"] != "answer_generation" or not payload["is_final_answer"]:
+        raise AssertionError("content composer fallback must finish through answer_generation")
+    return ScenarioResult(
+        "content_composer_react_structured_policy",
+        True,
+        "content composer ReAct schema is concise, budgeted, and fallback-safe",
+    )
+
+
+def scenario_structured_fallback_terminal_quiet(settings: ProductionSettings) -> ScenarioResult:
+    class BadStructuredLLM(OllamaLLMClient):
+        def _chat_raw(self, **_kwargs: Any) -> str:
+            return "not json"
+
+    logger = logging.getLogger("assistant_rag.llm")
+    records: list[logging.LogRecord] = []
+
+    class CaptureHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = CaptureHandler()
+    previous_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        client = BadStructuredLLM(ProductionSettings().ollama, OllamaModelRouter(ProductionSettings().ollama))
+        payload = client.generate_json(
+            task=LLMTask.CONTENT_COMPOSER_REACT,
+            system_prompt="Return JSON.",
+            user_prompt='Runtime context:\n{"rewritten_query":"Create an Excel comparison"}',
+            schema=CONTENT_COMPOSER_REACT_SCHEMA,
+        )
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+    validate_json_schema(payload, CONTENT_COMPOSER_REACT_SCHEMA)
+    terminal_noise = [
+        record.getMessage()
+        for record in records
+        if record.levelno >= logging.WARNING or "Severe failure" in record.getMessage()
+    ]
+    if terminal_noise:
+        raise AssertionError(f"structured fallback emitted terminal-level noise: {terminal_noise}")
+    return ScenarioResult(
+        "structured_fallback_terminal_quiet",
+        True,
+        "validated structured fallbacks stay out of warning/error terminal logs",
+    )
+
+
 def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResult:
     default_settings = ProductionSettings()
     router = OllamaModelRouter(default_settings.ollama)
     expected_models = {
-        LLMTask.QUERY_REWRITE: "qwen3.5:0.8b",
+        LLMTask.QUERY_REWRITE: "microsoft/Phi-4-mini-instruct-onnx",
         LLMTask.LAST_QA: "qwen3.5:2b",
         LLMTask.INTENT: "qwen3.5:2b",
-        LLMTask.ACTION_EXTRACTION: "qwen3.5:4b",
-        LLMTask.GENERATE_CLARIFICATION: "qwen3.5:2b",
+        LLMTask.ACTION_EXTRACTION: "qwen3.5:2b",
+        LLMTask.GENERATE_CLARIFICATION: "microsoft/Phi-4-mini-instruct-onnx",
         LLMTask.GENERATE_HUMAN_SUPPORTING: "qwen3.5:2b",
-        LLMTask.GENERATE_REMINDER_SUPPORTING: "qwen3.5:2b",
-        LLMTask.CLARIFICATION_MERGE: "qwen3.5:4b",
-        LLMTask.ANSWER: "qwen3.5:9b",
-        LLMTask.WRITING: "qwen3.5:9b",
-        LLMTask.RISKY_ACTION: "qwen3.5:9b",
-        LLMTask.RETRIEVAL_VALIDATION: "qwen3.5:9b",
+        LLMTask.GENERATE_REMINDER_SUPPORTING: "microsoft/Phi-4-mini-instruct-onnx",
+        LLMTask.CLARIFICATION_MERGE: "qwen3.5:2b",
+        LLMTask.ANSWER: "microsoft/Phi-4-mini-instruct-onnx",
+        LLMTask.WRITING: "microsoft/Phi-4-mini-instruct-onnx",
+        LLMTask.RISKY_ACTION: "qwen3.5:2b",
+        LLMTask.RETRIEVAL_VALIDATION: "microsoft/Phi-4-mini-instruct-onnx",
         LLMTask.GENERAL_SUB_BRANCH_DETECTION: "qwen3.5:2b",
         LLMTask.CONTENT_COMPOSER_REACT: "qwen3.5:2b",
-        LLMTask.ACTION_PLANNING: "qwen3.5:4b",
+        LLMTask.ACTION_PLANNING: "microsoft/Phi-4-mini-instruct-onnx",
     }
     actual_models = {task: router.model_for_task(task) for task in expected_models}
     mismatches = {
@@ -793,13 +1024,13 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         raise AssertionError("embedding normalization should be enabled")
     if default_settings.embeddings.model_name != "BAAI/bge-m3":
         raise AssertionError(f"embedding model mismatch: {default_settings.embeddings.model_name}")
-    if router.decision_for_task(LLMTask.ANSWER).num_ctx != 8192:
+    if router.decision_for_task(LLMTask.ANSWER).num_ctx != default_settings.ollama.num_ctx_answer:
         raise AssertionError("answer task should use writing context window")
 
     expected_timeouts = {
         LLMTask.QUERY_REWRITE: 12.0,
         LLMTask.LAST_QA: 18.0,
-        LLMTask.INTENT: 18.0,
+        LLMTask.INTENT: 30.0,
         LLMTask.ACTION_EXTRACTION: 30.0,
         LLMTask.RISKY_ACTION: 35.0,
         LLMTask.RETRIEVAL_VALIDATION: 35.0,
@@ -814,6 +1045,33 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
     if timeout_mismatches:
         raise AssertionError(f"LLM timeout mismatches: {timeout_mismatches}")
     return ScenarioResult("model_routing_policy", True, "LLM task routing, retrieval, action, context, and worker defaults match policy")
+
+
+def scenario_debug_hybrid_llm_compatibility(settings: ProductionSettings) -> ScenarioResult:
+    default_settings = ProductionSettings()
+    router = OllamaModelRouter(default_settings.ollama)
+    ollama_client = OllamaLLMClient(default_settings.ollama, router)
+    onnx_client = ONNXLLMClient(router)
+    llm = HybridLLMClient(ollama_client, onnx_client)
+
+    onnx_client.last_error_by_task[LLMTask.ANSWER] = "synthetic ONNX compatibility error"
+    lines = _debug_llm_lines(llm)
+    text = "\n".join(lines)
+    required_fragments = (
+        "engine: hybrid_ollama_onnx",
+        "base_url: http://localhost:11434",
+        "onnx_cache_dir: .onnx_models",
+        "answer=microsoft/Phi-4-mini-instruct-onnx",
+        "query_rewrite=microsoft/Phi-4-mini-instruct-onnx",
+        "synthetic ONNX compatibility error",
+        '"model": "microsoft/Phi-4-mini-instruct-onnx"',
+    )
+    missing = [fragment for fragment in required_fragments if fragment not in text]
+    if missing:
+        raise AssertionError(f"hybrid debug LLM output missing fragments: {missing}\n{text}")
+    if "base_url: unknown" in text or "keep_alive: unknown" in text:
+        raise AssertionError(f"hybrid debug LLM output regressed to unknown settings:\n{text}")
+    return ScenarioResult("debug_hybrid_llm_compatibility", True, "debug report exposes hybrid Ollama/ONNX routes and errors")
 
 
 def scenario_content_composer_general_react(settings: ProductionSettings) -> ScenarioResult:
@@ -1058,6 +1316,35 @@ def scenario_reminder_add(settings: ProductionSettings) -> ScenarioResult:
     return ScenarioResult("reminder_add", True, "reminder add committed")
 
 
+def scenario_reminder_supporting_question_printed(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    response = run_request(
+        state,
+        "Remind me to submit payroll tomorrow",
+        metadata={
+            "intent": Intent.REMINDER.value,
+            "reminder_actions": [
+                {
+                    "action": "add",
+                    "subject": "Submit payroll",
+                    "reminder_summary": "Submit payroll",
+                    "reminder_time": "2026-07-10T09:00:00+00:00",
+                }
+            ],
+            "reminder_supporting_question": "Should this reminder repeat every payroll cycle?",
+        },
+    )
+    assert_response(response, ResponseType.REMINDER_ACTION, "Added reminder")
+    expected = "Reminder supporting question: Should this reminder repeat every payroll cycle?"
+    if expected not in response.final_chat_text:
+        raise AssertionError(f"reminder supporting question was not printed: {response.final_chat_text!r}")
+    return ScenarioResult(
+        "reminder_supporting_question_printed",
+        True,
+        "reminder supporting question is visible in final chat text",
+    )
+
+
 def scenario_reminder_modify(settings: ProductionSettings) -> ScenarioResult:
     state = build_scenario_state(settings)
     seed_reminder(
@@ -1220,7 +1507,14 @@ def scenario_autoscan_notification_reply(settings: ProductionSettings) -> Scenar
 SCENARIOS: tuple[ScenarioFn, ...] = (
     scenario_clarification_direct,
     scenario_general_new_conversation,
+    scenario_general_hitl_supporting_question_printed,
+    scenario_general_new_conversation_skips_sub_branch_llm,
+    scenario_answer_adaptive_token_budget,
+    scenario_structured_clarification_fallback_policy,
+    scenario_content_composer_react_structured_policy,
+    scenario_structured_fallback_terminal_quiet,
     scenario_model_routing_policy,
+    scenario_debug_hybrid_llm_compatibility,
     scenario_content_composer_general_react,
     scenario_general_broad_retrieval_approved,
     scenario_lastqa_supporting_skip,
@@ -1229,6 +1523,7 @@ SCENARIOS: tuple[ScenarioFn, ...] = (
     scenario_knowledge_delete_not_found,
     scenario_knowledge_modify_missing_replacement,
     scenario_reminder_add,
+    scenario_reminder_supporting_question_printed,
     scenario_reminder_modify,
     scenario_reminder_turn_off,
     scenario_reminder_turn_on,
@@ -1268,6 +1563,46 @@ def run_scenario_suite(settings: ProductionSettings, names: set[str] | None = No
         print(f"\n{len(failures)} scenario(s) failed.", file=sys.stderr)
         return 1
     print("\nAll debug pipeline scenarios passed.")
+    return 0
+
+
+def run_llm_smoke_test(settings: ProductionSettings) -> int:
+    """Exercise the configured answer model without initializing retrieval services."""
+
+    smoke_ollama = replace(
+        settings.ollama,
+        num_ctx_answer=min(settings.ollama.num_ctx_answer, 512),
+        num_predict_answer=32,
+        temperature_answer=0.0,
+    )
+    router = OllamaModelRouter(smoke_ollama)
+    llm = HybridLLMClient(
+        OllamaLLMClient(smoke_ollama, router),
+        ONNXLLMClient(router),
+    )
+
+    request_id = new_request_id()
+    start_trace(request_id)
+    try:
+        response = llm.chat(
+            task=LLMTask.ANSWER,
+            system_prompt="You are a concise compatibility smoke test.",
+            user_prompt="Reply with the exact words: Phi ONNX smoke test passed.",
+        )
+    except Exception as exc:
+        print_current_debug_trace()
+        print(f"LLM smoke test failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        for line in _debug_llm_lines(llm):
+            print(line, file=sys.stderr)
+        return 1
+
+    print("LLM smoke test response:")
+    print(response.strip())
+    print()
+    for line in _debug_trace_lines(current_trace().summary() if current_trace() else None):
+        print(line)
+    for line in _debug_llm_lines(llm):
+        print(line)
     return 0
 
 
@@ -1331,6 +1666,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Print deterministic scenario names and exit.",
     )
+    parser.add_argument(
+        "--llm-smoke-test",
+        action="store_true",
+        help="Load the configured answer model through the debug LLM wrapper and run one short answer call.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1341,6 +1681,8 @@ def main(argv: list[str] | None = None) -> int:
             print(scenario.__name__.removeprefix("scenario_"))
         return 0
     settings = ProductionSettings.from_env()
+    if args.llm_smoke_test:
+        return run_llm_smoke_test(settings)
     if args.scenario_suite or args.scenario:
         return run_scenario_suite(settings, set(args.scenario) if args.scenario else None)
     interactive_main(settings)

@@ -13,3 +13,6 @@ rapidfuzz
 PyJWT[crypto]
 redis
 pypdf
+
+onnxruntime-genai
+huggingface-hub

@@ -58,25 +58,45 @@ ANSWER_STAGES = frozenset(
 )
 
 PROMPT_BUDGETS = {
-    "query_rewrite": 600,
-    "last_qa": 900,
-    "intent_classifier": 1000,
-    "general_sub_branch_detector": 400,
-    "content_composer_react": 500,
-    "action_detection": 1200,
-    "risky_action_validation": 900,
-    "action_planning": 500,
-    "knowledge_retrieval_validation": 1000,
-    "reminder_retrieval_validation": 1000,
-    "answer_generation": 1600,
-    "content_tool_answer_generation": 900,
-    "generate_excel_planner": 700,
-    "generate_pdf_planner": 700,
-    "generate_pptx_planner": 800,
-    "question_generation": 900,
-    "clarification_merge": 900,
-    "gmail_policy": 900,
+    "query_rewrite": 360,
+    "last_qa": 700,
+    "intent_classifier": 760,
+    "general_sub_branch_detector": 320,
+    "content_composer_react": 360,
+    "action_detection": 900,
+    "risky_action_validation": 700,
+    "action_planning": 360,
+    "knowledge_retrieval_validation": 760,
+    "reminder_retrieval_validation": 760,
+    "answer_generation": 1200,
+    "content_tool_answer_generation": 720,
+    "generate_excel_planner": 560,
+    "generate_pdf_planner": 560,
+    "generate_pptx_planner": 640,
+    "question_generation": 680,
+    "clarification_merge": 680,
+    "gmail_policy": 700,
 }
+
+STAGE_PAYLOAD_LIMITS = {
+    "query_rewrite": (360, 220, 180, 260, 6, 2),
+    "last_qa": (500, 360, 260, 560, 6, 3),
+    "intent_classifier": (520, 360, 260, 620, 6, 3),
+    "general_sub_branch_detector": (420, 260, 220, 320, 5, 2),
+    "content_composer_react": (420, 260, 220, 340, 5, 2),
+    "action_detection": (700, 640, 420, 760, 10, 4),
+    "risky_action_validation": (620, 560, 360, 640, 8, 4),
+    "action_planning": (520, 320, 260, 360, 6, 3),
+    "knowledge_retrieval_validation": (620, 520, 320, 720, 8, 4),
+    "reminder_retrieval_validation": (620, 520, 320, 720, 8, 4),
+    "answer_generation": (900, 520, 360, 1000, 8, 4),
+    "content_tool_answer_generation": (720, 420, 320, 620, 8, 3),
+    "question_generation": (620, 520, 320, 620, 8, 3),
+    "clarification_merge": (620, 420, 280, 620, 8, 3),
+    "gmail_policy": (620, 520, 360, 640, 8, 4),
+}
+
+DEFAULT_PAYLOAD_LIMITS = (760, 620, 360, 760, 8, 4)
 
 
 def _json(value: Any) -> str:
@@ -139,6 +159,10 @@ def _select_keys(data: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
     return {key: data[key] for key in keys if key in data and data[key] is not None}
 
 
+def _payload_limits_for_stage(stage: str) -> tuple[int, int, int, int, int, int]:
+    return STAGE_PAYLOAD_LIMITS.get(stage, DEFAULT_PAYLOAD_LIMITS)
+
+
 FAST_METADATA_KEYS = (
     "last_qa_state",
     "last_qa_resolution",
@@ -176,6 +200,11 @@ FAST_EXTRA_KEYS = (
     "last_qa_state",
     "last_qa_resolution",
     "schema",
+    "conversation_context_status",
+    "conversation_retrieval_ran",
+    "has_approved_conversation",
+    "approved_conversation_count",
+    "last_qa_path",
     "approved_conversation_history",
     "tool_trace",
     "available_tools",
@@ -215,29 +244,30 @@ class PromptContext:
         broader but still compacted context. This gives a meaningful local latency win
         without changing branch/repository safety.
         """
+        query_max, metadata_max, platform_max, extra_max, max_items, max_depth = _payload_limits_for_stage(self.stage)
         base: dict[str, Any] = {
             "stage": self.stage,
             "user_id": self.user_id,
-            "raw_query": self.raw_query,
-            "rewritten_query": self.rewritten_query,
+            "raw_query": _compact_value(self.raw_query, max_string=query_max, max_items=max_items, max_depth=1),
+            "rewritten_query": _compact_value(self.rewritten_query, max_string=query_max, max_items=max_items, max_depth=1),
             "intent": self.intent,
         }
 
         if self.stage in FAST_ROUTING_STAGES:
-            base["metadata"] = _compact_value(_select_keys(self.metadata, FAST_METADATA_KEYS), max_string=700, max_items=10, max_depth=3)
-            base["platform_context"] = _compact_value(_select_keys(self.platform_context, FAST_PLATFORM_KEYS), max_string=500, max_items=8, max_depth=3)
-            base["extra"] = _compact_value(_select_keys(self.extra, FAST_EXTRA_KEYS), max_string=900, max_items=8, max_depth=3)
+            base["metadata"] = _compact_value(_select_keys(self.metadata, FAST_METADATA_KEYS), max_string=metadata_max, max_items=max_items, max_depth=max_depth)
+            base["platform_context"] = _compact_value(_select_keys(self.platform_context, FAST_PLATFORM_KEYS), max_string=platform_max, max_items=max_items, max_depth=max_depth)
+            base["extra"] = _compact_value(_select_keys(self.extra, FAST_EXTRA_KEYS), max_string=extra_max, max_items=max_items, max_depth=max_depth)
             return {k: v for k, v in base.items() if v not in (None, {}, [])}
 
         if self.stage in MUTATION_STAGES or self.stage in RETRIEVAL_VALIDATION_STAGES:
-            base["metadata"] = _compact_value(self.metadata, max_string=1400, max_items=16, max_depth=5)
-            base["platform_context"] = _compact_value(self.platform_context, max_string=1000, max_items=12, max_depth=4)
-            base["extra"] = _compact_value(self.extra, max_string=1800, max_items=16, max_depth=5)
+            base["metadata"] = _compact_value(self.metadata, max_string=metadata_max, max_items=max_items, max_depth=max_depth)
+            base["platform_context"] = _compact_value(self.platform_context, max_string=platform_max, max_items=max_items, max_depth=max_depth)
+            base["extra"] = _compact_value(self.extra, max_string=extra_max, max_items=max_items, max_depth=max_depth)
             return {k: v for k, v in base.items() if v not in (None, {}, [])}
 
-        base["metadata"] = _compact_value(self.metadata, max_string=1600, max_items=16, max_depth=5)
-        base["platform_context"] = _compact_value(self.platform_context, max_string=1000, max_items=12, max_depth=4)
-        base["extra"] = _compact_value(self.extra, max_string=2200, max_items=18, max_depth=5)
+        base["metadata"] = _compact_value(self.metadata, max_string=metadata_max, max_items=max_items, max_depth=max_depth)
+        base["platform_context"] = _compact_value(self.platform_context, max_string=platform_max, max_items=max_items, max_depth=max_depth)
+        base["extra"] = _compact_value(self.extra, max_string=extra_max, max_items=max_items, max_depth=max_depth)
         return {k: v for k, v in base.items() if v not in (None, {}, [])}
 
 
@@ -351,6 +381,9 @@ class PromptRegistry:
 
     def system(self, name: str) -> str:
         return self.templates[name].render_system()
+
+    def template(self, name: str) -> PromptTemplate:
+        return self.templates[name]
 
     def user(self, context: PromptContext) -> str:
         return "Runtime context:\n" + _json(context.stage_payload())
@@ -504,8 +537,8 @@ CONTENT_COMPOSER_REACT_SCHEMA = {
     "additionalProperties": False,
     "required": ["thought", "tool_name", "confidence", "is_final_answer"],
     "properties": {
-        "thought": {"type": "string"},
-        "tool_name": {"type": "string"},
+        "thought": {"type": "string", "maxLength": 120},
+        "tool_name": {"type": "string", "maxLength": 64},
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "is_final_answer": {"type": "boolean"},
     },
@@ -515,13 +548,12 @@ CONTENT_COMPOSER_REACT_SCHEMA = {
 GENERATE_EXCEL_PLANNER_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["sheet_name", "columns", "suggested_rows", "confidence", "reason_summary"],
+    "required": ["sheet_name", "columns", "suggested_rows", "confidence"],
     "properties": {
         "sheet_name": {"type": "string"},
         "columns": {"type": "array", "items": {"type": "string"}},
         "suggested_rows": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-        "reason_summary": {"type": "string"},
     },
 }
 
@@ -529,12 +561,11 @@ GENERATE_EXCEL_PLANNER_SCHEMA = {
 GENERATE_PDF_PLANNER_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["title", "sections", "confidence", "reason_summary"],
+    "required": ["title", "sections", "confidence"],
     "properties": {
         "title": {"type": "string"},
         "sections": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-        "reason_summary": {"type": "string"},
     },
 }
 
@@ -542,7 +573,7 @@ GENERATE_PDF_PLANNER_SCHEMA = {
 GENERATE_PPTX_PLANNER_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["presentation_title", "slides", "confidence", "reason_summary"],
+    "required": ["presentation_title", "slides", "confidence"],
     "properties": {
         "presentation_title": {"type": "string"},
         "slides": {
@@ -557,7 +588,6 @@ GENERATE_PPTX_PLANNER_SCHEMA = {
             },
         },
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-        "reason_summary": {"type": "string"},
     },
 }
 
@@ -571,7 +601,6 @@ KNOWLEDGE_RETRIEVAL_VALIDATION_SCHEMA = {
         "selected_candidate_keys",
         "confidence",
         "ambiguous",
-        "reason_summary",
         "candidate_assessments",
     ],
     "properties": {
@@ -589,19 +618,17 @@ KNOWLEDGE_RETRIEVAL_VALIDATION_SCHEMA = {
         "selected_candidate_keys": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "ambiguous": {"type": "boolean"},
-        "reason_summary": {"type": "string"},
         "candidate_assessments": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["candidate_key", "matches_target", "confidence", "matched_fields", "reason_summary"],
+                "required": ["candidate_key", "matches_target", "confidence", "matched_fields"],
                 "properties": {
                     "candidate_key": {"type": "string"},
                     "matches_target": {"type": "boolean"},
                     "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                     "matched_fields": {"type": "array", "items": {"type": "string"}},
-                    "reason_summary": {"type": "string"},
                 },
             },
         },
@@ -618,7 +645,6 @@ REMINDER_RETRIEVAL_VALIDATION_SCHEMA = {
         "selected_candidate_keys",
         "confidence",
         "ambiguous",
-        "reason_summary",
         "candidate_assessments",
     ],
     "properties": {
@@ -636,7 +662,6 @@ REMINDER_RETRIEVAL_VALIDATION_SCHEMA = {
         "selected_candidate_keys": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "ambiguous": {"type": "boolean"},
-        "reason_summary": {"type": "string"},
         "candidate_assessments": {
             "type": "array",
             "items": {
@@ -648,7 +673,6 @@ REMINDER_RETRIEVAL_VALIDATION_SCHEMA = {
                     "action_compatible",
                     "confidence",
                     "matched_fields",
-                    "reason_summary",
                 ],
                 "properties": {
                     "candidate_key": {"type": "string"},
@@ -656,7 +680,6 @@ REMINDER_RETRIEVAL_VALIDATION_SCHEMA = {
                     "action_compatible": {"type": "boolean"},
                     "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                     "matched_fields": {"type": "array", "items": {"type": "string"}},
-                    "reason_summary": {"type": "string"},
                 },
             },
         },
@@ -750,7 +773,7 @@ def _default_templates() -> dict[str, PromptTemplate]:
             inputs=("original vague query", "assistant clarification question", "latest user answer"),
             output_contract=(
                 'Return strict JSON: {"answered_clarification": boolean, "merged_query": string, '
-                '"confidence": number, "missing_context": string[], "reason_summary": string}.'
+                '"confidence": number, "missing_context": string[]}.'
             ),
             decision_rules=(
                 "Merge only when the latest answer directly resolves the clarification question.",
@@ -774,7 +797,13 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "Do not extract actions or choose SQL targets.",
                 "Do not retrieve records or mutate state.",
             ),
-            inputs=("raw_query", "rewritten_query", "Last-QA resolver result", "safe request metadata"),
+            inputs=(
+                "raw_query",
+                "rewritten_query",
+                "Last-QA resolver result",
+                "approved conversation chat history",
+                "safe request metadata",
+            ),
             output_contract=(
                 "Return strict JSON with intent, confidence, "
                 "multi_intent, and requires_clarification. "
@@ -786,6 +815,9 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "reminder owns explicit reminder lifecycle operations: remind me, notify me later, schedule reminder, list reminders, modify/delete/dismiss/cancel/turn on/turn off reminder, or reminder notification reply.",
                 "clarification is only for blocked branch selection or unsafe mutation/external action requirements.",
                 "Default to general_response for safely answerable non-mutating requests, even if optional personalization is missing.",
+                "Use approved conversation chat history only to disambiguate follow-ups, pronouns, omitted targets, and references in the current user query.",
+                "If chat history conflicts with the current user query, the current user query wins for intent classification.",
+                "Do not infer a knowledge or reminder mutation solely from chat history; the current user query must explicitly request the state change or notification lifecycle operation.",
                 "Do not choose clarification only because a better answer could ask for preferences, scope, level, format, examples, or timeline.",
                 "Do not choose knowledge_facts for public facts, architecture discussion, coding help, or normal explanations unless the user explicitly asks to change stored memory.",
                 "Do not choose reminder for study plans, goals, future intentions, or planning advice unless the user explicitly asks to be reminded or notified later.",
@@ -832,7 +864,7 @@ def _default_templates() -> dict[str, PromptTemplate]:
             inputs=("selected intent", "raw_query", "rewritten_query", "trusted metadata", "platform_context"),
             output_contract=(
                 "Return strict JSON with intent, confidence, knowledge_actions, reminder_actions, "
-                "missing_fields, risk_flags, normalized_entities, and reason_summary."
+                "missing_fields, risk_flags, and normalized_entities."
             ),
             decision_rules=(
                 "Extract actions only for the selected intent.",
@@ -864,7 +896,7 @@ def _default_templates() -> dict[str, PromptTemplate]:
             inputs=("risky_actions", "raw_query", "rewritten_query", "selected intent", "trusted metadata", "schema"),
             output_contract=(
                 "Return strict JSON with root key results. Each result must include action_index, approved, "
-                "risk_level, reason_summary, missing_fields, requires_clarification, and confidence."
+                "risk_level, missing_fields, requires_clarification, and confidence."
             ),
             decision_rules=(
                 "Approve only when the user explicitly requested the risky action and the action domain matches the selected intent.",
@@ -1006,7 +1038,7 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "Return should_ask=false when the question would be redundant, speculative, unsafe, or low-value.",
             ),
             safety_rules=_safety_rules_for_stage("question_generation"),
-            error_handling=("If task_type or context is insufficient, return should_ask=false with reason_summary.",),
+            error_handling=("If task_type or context is insufficient, return should_ask=false.",),
         ),
         "content_composer_react": PromptTemplate(
             name="content_composer_react",
@@ -1019,6 +1051,7 @@ def _default_templates() -> dict[str, PromptTemplate]:
             inputs=("rewritten_query", "tool_trace", "available_tools", "approved context", "expected response types"),
             output_contract="Return strict JSON matching CONTENT_COMPOSER_REACT_SCHEMA.",
             decision_rules=(
+                "Keep thought concise: one short sentence, no more than 12 words.",
                 "Use answer_generation for normal text, advice, explanations, plans, code help, and writing.",
                 "Use generate_excel only for explicit spreadsheet/workbook/table-as-file requests.",
                 "Use generate_pdf only for explicit PDF/report/document-file requests.",

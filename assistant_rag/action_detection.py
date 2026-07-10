@@ -174,12 +174,11 @@ class LLMActionDetector:
                             "action_index": {"type": "integer"},
                             "approved": {"type": "boolean"},
                             "risk_level": {"type": "string"},
-                            "reason_summary": {"type": "string"},
                             "missing_fields": {"type": "array", "items": {"type": "string"}},
                             "requires_clarification": {"type": "boolean"},
                             "confidence": {"type": "number"}
                         },
-                        "required": ["action_index", "approved", "risk_level", "reason_summary", "missing_fields", "requires_clarification", "confidence"]
+                        "required": ["action_index", "approved", "risk_level", "missing_fields", "requires_clarification", "confidence"]
                     }
                 }
             },
@@ -254,8 +253,7 @@ class LLMActionDetector:
                 },
                 "normalized_entities": {
                     "type": "object",
-                },
-                "reason_summary": {"type": "string"},
+                }
             },
             "required": [
                 "intent",
@@ -264,7 +262,6 @@ class LLMActionDetector:
                 "reminder_actions",
                 "missing_fields",
                 "risk_flags",
-                "normalized_entities",
-                "reason_summary",
+                "normalized_entities"
             ],
         }

@@ -12,7 +12,7 @@ from .contracts import (
     LastQAInteractionType, QuestionSource, LastQAResolution,
     validate_last_qa_resolution
 )
-from .llm import LLMClient, LLMTask, validate_json_schema
+from .llm import LLMClient, LLMTask, build_intent_conversation_extra, validate_json_schema
 from .prompts import DEFAULT_PROMPT_REGISTRY, PromptContext, PromptRegistry
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
@@ -232,9 +232,8 @@ class LLMLastQAResolver:
                 "merged_query": {"type": "string"},
                 "confidence": {"type": "number"},
                 "missing_context": {"type": "array", "items": {"type": "string"}},
-                "reason_summary": {"type": "string"},
             },
-            "required": ["answered_clarification", "merged_query", "confidence", "missing_context", "reason_summary"],
+            "required": ["answered_clarification", "merged_query", "confidence", "missing_context"],
         }
         try:
             payload = self.llm.generate_json(
@@ -372,23 +371,20 @@ class LLMLastQAResolver:
                     schema=schema,
                 )
                 validate_json_schema(payload, schema)
-                
+
                 it_str = payload.get("interaction_type")
                 qs_str = payload.get("question_source")
                 try:
                     interaction_type = LastQAInteractionType(it_str) if it_str else None
                 except ValueError:
                     interaction_type = None
-                    
                 try:
                     question_source = QuestionSource(qs_str) if qs_str else QuestionSource.NONE
                 except ValueError:
                     question_source = QuestionSource.NONE
 
                 if payload.get("interaction_detected") and interaction_type and float(payload.get("confidence", 0.0)) >= self.config.min_confidence:
-                    skip = can_skip_broad_retrieval(payload, state, interaction_type, self.config, request)
-                    
-                    if skip:
+                    if can_skip_broad_retrieval(payload, state, interaction_type, self.config, request):
                         md = request.metadata or {}
                         pc = request.platform_context or {}
                         res = LastQAResolution(
@@ -409,50 +405,14 @@ class LLMLastQAResolver:
                             is_authoritative_state=True,
                             missing_context=[],
                             merge_reason="case_3_never_merges",
-                            skip_reason="strong_latest_context_match_and_guard_passed"
-                        )
-                        validate_last_qa_resolution(res)
-                        return res
-                    else:
-                        res = LastQAResolution(
-                            path=LastQAPath.BROAD_RETRIEVAL_REQUIRED,
-                            rewritten_query=rewritten_query,
-                            state=None,
-                            did_merge_query=False,
-                            skip_broad_retrieval=False,
-                            is_authoritative_state=False,
-                            merge_reason="case_3_never_merges",
-                            skip_reason="weak_match_or_context_incomplete",
+                            skip_reason="strong_latest_context_match_and_guard_passed",
                         )
                         validate_last_qa_resolution(res)
                         return res
             except Exception as e:
                 _log_llm_fallback("Last-QA resolver", e)
-                res = LastQAResolution(
-                    path=LastQAPath.BROAD_RETRIEVAL_REQUIRED,
-                    rewritten_query=rewritten_query,
-                    state=None,
-                    did_merge_query=False,
-                    skip_broad_retrieval=False,
-                    is_authoritative_state=False,
-                    merge_reason="no_safe_last_qa_merge",
-                    skip_reason="broad_retrieval_required",
-                )
-                validate_last_qa_resolution(res)
-                return res
 
-        res = LastQAResolution(
-            path=LastQAPath.BROAD_RETRIEVAL_REQUIRED,
-            rewritten_query=rewritten_query,
-            state=None,
-            did_merge_query=False,
-            skip_broad_retrieval=False,
-            is_authoritative_state=False,
-            merge_reason="no_safe_last_qa_merge",
-            skip_reason="broad_retrieval_required",
-        )
-        validate_last_qa_resolution(res)
-        return res
+        return self.fallback.resolve(request, rewritten_query, state)
 
 
 
@@ -494,19 +454,15 @@ class LLMIntentClassifier(IntentClassifierProtocol):
             "properties": {
                 "intent": {"type": "string", "enum": [e.value for e in Intent]},
                 "confidence": {"type": "number"},
-                "reason_summary": {"type": "string"},
             },
-            "required": ["intent", "confidence", "reason_summary"],
+            "required": ["intent", "confidence"],
         }
         
-        # Build context representing the retrieval precedence rule
-        conversation_status = approved_conversation_context.conversation_context_status if approved_conversation_context else "not_run"
-        context_extra = {
-            "conversation_context_status": conversation_status,
-            "has_approved_conversation": bool(approved_conversation_context and approved_conversation_context.approved_conversation_history),
-            "last_qa_path": last_qa_resolution.path.value if last_qa_resolution else "unknown",
-            "extracted_expected_response_types": [e.value for e in approved_conversation_context.extracted_expected_response_types] if approved_conversation_context else [],
-        }
+        # Include compact approved chat history so intent can resolve safe follow-ups.
+        context_extra = build_intent_conversation_extra(
+            approved_conversation_context=approved_conversation_context,
+            last_qa_resolution=last_qa_resolution,
+        )
 
         try:
             payload = self.llm.generate_json(

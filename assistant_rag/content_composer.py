@@ -51,7 +51,23 @@ class AnswerGenerationTool:
                 task=LLMTask.ANSWER,
                 system_prompt=self.prompt_registry.system("answer_generation"),
                 user_prompt=self.prompt_registry.user(
-                    PromptContext(stage="answer_generation", rewritten_query=composer_input.rewritten_query)
+                    PromptContext(
+                        stage="answer_generation",
+                        user_id=composer_input.user_id,
+                        raw_query=composer_input.raw_user_query,
+                        rewritten_query=composer_input.rewritten_query,
+                        metadata=composer_input.metadata,
+                        platform_context=composer_input.platform_context,
+                        extra={
+                            "approved_conversation_history": composer_input.approved_conversation_history,
+                            "approved_knowledge_evidence": composer_input.approved_knowledge_evidence,
+                            "approved_reminder_context": composer_input.approved_reminder_context,
+                            "sub_branch_supporting_prompt": composer_input.sub_branch_supporting_prompt,
+                            "human_supporting_questions": [q.text for q in composer_input.human_supporting_questions],
+                            "reminder_supporting_questions": [q.text for q in composer_input.reminder_supporting_questions],
+                            "extracted_expected_response_types": [t.value for t in composer_input.extracted_expected_response_types],
+                        },
+                    )
                 ),
             )
             return ContentToolResult(
@@ -365,7 +381,63 @@ class ReActContentComposer:
                 content_warnings=result.warnings,
                 artifacts=tuple(artifacts),
             )
+
+        if not config.content_composer_react_enabled:
+            default_tool = self.registry.get_tool(config.content_composer_default_tool)
+            selected_tool = default_tool
+            for tool in self.registry._tools.values():
+                if tool.name == config.content_composer_default_tool:
+                    continue
+                if tool.can_handle(composer_input, config):
+                    selected_tool = tool
+                    break
+            if not selected_tool:
+                return ContentComposerResult(
+                    final_response_text="System error: Default tool not registered.",
+                    tool_trace_summary="Composer ReAct disabled, default tool missing.",
+                    used_tool_names=(),
+                    confidence=0.0,
+                    fallback_used=True,
+                    reason_summary="Default tool missing",
+                    content_warnings=("System disabled",),
+                )
+            result = selected_tool.execute(composer_input, config)
+            if result.artifact:
+                artifacts.append(result.artifact)
+            return ContentComposerResult(
+                final_response_text=result.output_text,
+                tool_trace_summary=f"Composer ReAct disabled, used tool: {selected_tool.name}",
+                used_tool_names=(selected_tool.name,),
+                confidence=result.confidence,
+                fallback_used=result.fallback_used,
+                reason_summary=result.reason_summary,
+                content_warnings=result.warnings,
+                artifacts=tuple(artifacts),
+            )
             
+        default_tool = self.registry.get_tool(config.content_composer_default_tool)
+        if config.content_composer_short_circuit_single_tool and default_tool:
+            matching_non_default_tools = [
+                tool
+                for tool in self.registry._tools.values()
+                if tool.name != config.content_composer_default_tool
+                and tool.can_handle(composer_input, config)
+            ]
+            if not matching_non_default_tools:
+                result = default_tool.execute(composer_input, config)
+                if result.artifact:
+                    artifacts.append(result.artifact)
+                return ContentComposerResult(
+                    final_response_text=result.output_text,
+                    tool_trace_summary=f"Default tool short-circuit: {default_tool.name}",
+                    used_tool_names=(default_tool.name,),
+                    confidence=result.confidence,
+                    fallback_used=result.fallback_used,
+                    reason_summary=result.reason_summary,
+                    content_warnings=result.warnings,
+                    artifacts=tuple(artifacts),
+                )
+
         # Short-circuit if only one tool is registered
         if len(self.registry._tools) == 1:
             tool = list(self.registry._tools.values())[0]

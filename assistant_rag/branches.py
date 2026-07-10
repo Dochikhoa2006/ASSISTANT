@@ -19,7 +19,9 @@ from .contracts import (
     ExpectedResponseType,
     GeneratedQuestion,
     GeneralSubBranch,
+    GeneralSubBranchDecision,
     Intent,
+    LastQAInteractionType,
     PersistenceMode,
     PipelineContext,
     QuestionSource,
@@ -291,7 +293,11 @@ class GeneralResponseBranch:
 
         from .general_sub_branch import GeneralSubBranchValidator, GeneralPersistencePlanBuilder
         
-        if self.sub_branch_detector and self.general_purpose_config:
+        decision = self._deterministic_general_decision(context, approved_context)
+        if decision and self.general_purpose_config:
+            plan = GeneralPersistencePlanBuilder().build_plan(decision, context, self.general_purpose_config)
+            answer_mode = self._general_sub_branch_to_answer_mode(decision.sub_branch)
+        elif self.sub_branch_detector and self.general_purpose_config:
             decision = self.sub_branch_detector.detect(context, self.general_purpose_config)
             decision = GeneralSubBranchValidator().validate(decision, context, self.general_purpose_config)
             plan = GeneralPersistencePlanBuilder().build_plan(decision, context, self.general_purpose_config)
@@ -436,6 +442,49 @@ class GeneralResponseBranch:
             database_write_result={"conversation_hop_id": hop.hop_id},
             indexing_job_result={"conversation_hop_job_id": hop.outbox_job_id},
             platform_payload={"artifacts": list(composer_result.artifacts)} if composer_result and composer_result.artifacts else {},
+        )
+
+    def _deterministic_general_decision(
+        self, context: PipelineContext, approved_context: Any
+    ) -> GeneralSubBranchDecision | None:
+        authoritative = self._authoritative_last_qa_decision(context)
+        if authoritative:
+            return authoritative
+        if context.last_qa_state:
+            return None
+        if getattr(approved_context, "approved_conversation_history", []):
+            return None
+        return GeneralSubBranchDecision(
+            sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
+            confidence=1.0,
+            persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
+            reason_summary="No approved prior context; deterministic new conversation topic.",
+        )
+
+    def _authoritative_last_qa_decision(self, context: PipelineContext) -> GeneralSubBranchDecision | None:
+        trace = context.last_qa_trace or {}
+        state = context.last_qa_state
+        if not state:
+            return None
+        if not trace.get("skip_broad_retrieval") or not trace.get("is_authoritative_state"):
+            return None
+        if not state.linked_topic_id or not state.linked_hop_id:
+            return None
+
+        interaction_type = trace.get("interaction_type")
+        if interaction_type == LastQAInteractionType.SUPPORTING_QUESTION_ANSWER.value:
+            sub_branch = GeneralSubBranch.SUPPORT_QUESTION_ANSWER
+        else:
+            sub_branch = GeneralSubBranch.CONVERSATION_FOLLOW_UP
+
+        return GeneralSubBranchDecision(
+            sub_branch=sub_branch,
+            confidence=1.0,
+            persistence_mode=PersistenceMode.APPEND_TO_EXISTING_TOPIC,
+            selected_topic_id=state.linked_topic_id,
+            selected_hop_id=state.linked_hop_id,
+            selected_parent_hop_id=state.linked_hop_id,
+            reason_summary="Reused authoritative Last-QA latest-context resolution.",
         )
 
     def _general_sub_branch_to_answer_mode(self, sub_branch: Any) -> AnswerMode:

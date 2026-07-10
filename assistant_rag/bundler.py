@@ -5,8 +5,31 @@ All branch outputs pass through this module before Chat Output.
 
 from __future__ import annotations
 
-from .contracts import BranchResult, BundledResponse, ChatRequest, LastQAState, ResponseType
+from typing import Any
+
+from .contracts import BranchResult, BundledResponse, ChatRequest, GeneratedQuestion, LastQAState, ResponseType
 from .prompts import DEFAULT_PROMPT_REGISTRY, PromptRegistry
+
+
+def _question_text(question: GeneratedQuestion | dict[str, Any] | str | Any) -> str:
+    if isinstance(question, GeneratedQuestion):
+        return question.text.strip()
+    if isinstance(question, dict):
+        return str(question.get("text") or question.get("question_text") or "").strip()
+    return str(getattr(question, "text", question) or "").strip()
+
+
+def _question_line(label: str, question: GeneratedQuestion | dict[str, Any] | str | Any) -> str:
+    text = _question_text(question)
+    return f"{label}: {text}" if text else ""
+
+
+def _append_unique_line(parts: list[str], seen: set[str], line: str) -> None:
+    normalized = " ".join(line.casefold().split())
+    if not normalized or normalized in seen:
+        return
+    seen.add(normalized)
+    parts.append(line)
 
 
 class ResponseBundler:
@@ -21,6 +44,7 @@ class ResponseBundler:
         branch_result: BranchResult,
     ) -> BundledResponse:
         parts: list[str] = []
+        seen_parts: set[str] = set()
         operation_summaries = [
             getattr(result, "user_safe_summary", None) or getattr(result, "user_facing_summary", None)
             for result in (
@@ -28,19 +52,34 @@ class ResponseBundler:
                 + branch_result.reminder_operation_results
             )
         ]
-        parts.extend(summary for summary in operation_summaries if summary)
+        for summary in operation_summaries:
+            if summary:
+                _append_unique_line(parts, seen_parts, str(summary).strip())
         if branch_result.normal_response_text and not operation_summaries:
-            parts.append(branch_result.normal_response_text)
+            _append_unique_line(parts, seen_parts, branch_result.normal_response_text.strip())
         if branch_result.clarification_question:
-            parts.append(branch_result.clarification_question.text)
+            _append_unique_line(
+                parts,
+                seen_parts,
+                _question_line("Clarification question", branch_result.clarification_question),
+            )
         if branch_result.fallback_or_error_message:
-            parts.append(branch_result.fallback_or_error_message)
+            _append_unique_line(parts, seen_parts, branch_result.fallback_or_error_message.strip())
         if branch_result.human_supporting_questions:
-            parts.append(" ".join(q.text for q in branch_result.human_supporting_questions))
+            for question in branch_result.human_supporting_questions:
+                _append_unique_line(
+                    parts,
+                    seen_parts,
+                    _question_line("Supporting question", question),
+                )
         if branch_result.reminder_supporting_question:
-            parts.append(branch_result.reminder_supporting_question.text)
+            _append_unique_line(
+                parts,
+                seen_parts,
+                _question_line("Reminder supporting question", branch_result.reminder_supporting_question),
+            )
             
-        final_text = " ".join(part.strip() for part in parts if part.strip())
+        final_text = "\n".join(part.strip() for part in parts if part.strip())
         if not final_text:
             final_text = self.prompt_registry.message("bundler_empty")
 
