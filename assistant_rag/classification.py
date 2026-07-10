@@ -510,7 +510,7 @@ class LLMIntentClassifier(IntentClassifierProtocol):
 
         try:
             payload = self.llm.generate_json(
-                task=LLMTask.INTENT_CLASSIFICATION,
+                task=LLMTask.INTENT,
                 system_prompt=self.prompt_registry.system("intent_classifier"),
                 user_prompt=self.prompt_registry.user(
                     PromptContext(

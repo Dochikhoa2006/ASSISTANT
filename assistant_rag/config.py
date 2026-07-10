@@ -26,14 +26,14 @@ class RetrievalConfig:
     conversation_min_confidence: float
     knowledge_min_confidence: float
     max_results: int
-    bm25_top_k: int = 30
-    chroma_top_k: int = 30
-    min_confidence: float = 0.25
-    rrf_k: int = 60
-    lexical_weight: float = 1.0
+    bm25_top_k: int = 24
+    chroma_top_k: int = 24
+    min_confidence: float = 0.30
+    rrf_k: int = 40
+    lexical_weight: float = 1.10
     semantic_weight: float = 1.0
-    rerank_candidate_limit: int = 32
-    general_response_reminder_limit: int = 5
+    rerank_candidate_limit: int = 16
+    general_response_reminder_limit: int = 4
     general_response_reminder_statuses: tuple[str, ...] = ("scheduled", "notified")
 
     def __post_init__(self) -> None:
@@ -47,8 +47,8 @@ class RetrievalConfig:
 class OutboxConfig:
     max_attempts: int
     batch_size: int
-    retry_backoff_seconds: int = 30
-    processing_timeout_seconds: int = 300
+    retry_backoff_seconds: int = 15
+    processing_timeout_seconds: int = 180
 
 
 @dataclass(frozen=True)
@@ -67,28 +67,28 @@ class QuestionGenerationConfig:
     clarification_model: str | None = None
     human_supporting_model: str | None = None
     reminder_supporting_model: str | None = None
-    clarification_temperature: float = 0.2
-    human_supporting_temperature: float = 0.4
-    reminder_supporting_temperature: float = 0.3
-    timeout_seconds: float = 30.0
-    clarification_max_tokens: int = 150
-    human_supporting_max_tokens: int = 150
-    reminder_supporting_max_tokens: int = 150
-    clarification_retry_count: int = 2
-    human_supporting_retry_count: int = 2
-    reminder_supporting_retry_count: int = 2
-    question_generation_confidence_threshold: float = 0.6
+    clarification_temperature: float = 0.15
+    human_supporting_temperature: float = 0.25
+    reminder_supporting_temperature: float = 0.2
+    timeout_seconds: float = 15.0
+    clarification_max_tokens: int = 96
+    human_supporting_max_tokens: int = 128
+    reminder_supporting_max_tokens: int = 128
+    clarification_retry_count: int = 1
+    human_supporting_retry_count: int = 1
+    reminder_supporting_retry_count: int = 1
+    question_generation_confidence_threshold: float = 0.68
     reminder_supporting_enabled: bool = True
-    reminder_supporting_min_confidence: float = 0.6
-    human_supporting_max_count: int = 2
+    reminder_supporting_min_confidence: float = 0.68
+    human_supporting_max_count: int = 1
     fallback_policy: str = "fallback_message"
 
 
 @dataclass(frozen=True)
 class MutationPolicyConfig:
     partial_execution_policy: MutationPartialExecutionPolicy = MutationPartialExecutionPolicy.ALL_OR_NOTHING
-    knowledge_relevance_threshold: float = 0.5
-    knowledge_ambiguity_margin: float = 0.1
+    knowledge_relevance_threshold: float = 0.58
+    knowledge_ambiguity_margin: float = 0.08
     knowledge_not_found_policy: TargetNotFoundPolicy = TargetNotFoundPolicy.SKIP_NOT_FOUND
     unsupported_action_policy: UnsupportedActionPolicy = UnsupportedActionPolicy.REJECT_AND_SKIP
 
@@ -168,9 +168,9 @@ class RetrievalValidationConfig:
 
 @dataclass(frozen=True)
 class LastQAConfig:
-    min_confidence: float = 0.4
-    skip_broad_retrieval_min_confidence: float = 0.85
-    clarification_merge_min_confidence: float = 0.7
+    min_confidence: float = 0.80
+    skip_broad_retrieval_min_confidence: float = 0.90
+    clarification_merge_min_confidence: float = 0.84
     skip_allowed_interaction_types: tuple[str, ...] = (
         "normal_follow_up",
         "human_supporting_question_answer",
@@ -178,19 +178,19 @@ class LastQAConfig:
     )
     semantic_match_model: str | None = None
     clarification_merge_model: str | None = None
-    json_retry_count: int = 2
-    clarification_merge_json_retry_count: int = 2
+    json_retry_count: int = 1
+    clarification_merge_json_retry_count: int = 1
     enable_reminder_metadata_reply: bool = True
     clarification_merge_enabled: bool = True
 
 
 @dataclass(frozen=True)
 class ContextFilterConfig:
-    conversation_min_confidence: float = 0.10
-    conversation_approved_max_items: int = 8
-    conversation_duplicate_threshold: float = 0.92
+    conversation_min_confidence: float = 0.42
+    conversation_approved_max_items: int = 6
+    conversation_duplicate_threshold: float = 0.90
     knowledge_approved_max_items: int = 6
-    knowledge_duplicate_threshold: float = 0.95
+    knowledge_duplicate_threshold: float = 0.93
     low_information_text_patterns: tuple[str, ...] = (
         "done", "saved", "updated successfully", "ok", "noted", "sure"
     )
@@ -198,7 +198,7 @@ class ContextFilterConfig:
     semantic_context_judge_enabled: bool = False
     semantic_context_judge_failure_policy: str = "use_hard_rule_approved"
     context_filter_debug_diagnostics_enabled: bool = False
-    low_information_min_chars: int = 10
+    low_information_min_chars: int = 12
     conversation_retrieval_after_last_qa_enabled: bool = True
     conversation_retrieval_before_intent_enabled: bool = True
     expected_response_type_required: bool = True
@@ -222,14 +222,14 @@ _ALLOWED_PERSISTENCE_POLICIES = frozenset({"sub_branch_driven"})
 class GeneralPurposeConfig:
     # Sub-branch detector
     general_sub_branch_detector_enabled: bool = True
-    general_sub_branch_confidence_threshold: float = 0.55
+    general_sub_branch_confidence_threshold: float = 0.65
     general_sub_branch_fallback_mode: str = "new_conversation_topic"
-    general_sub_branch_detector_json_retry_count: int = 2
+    general_sub_branch_detector_json_retry_count: int = 1
 
     # Content composer
     content_composer_enabled: bool = True
-    content_composer_max_iterations: int = 3
-    content_composer_tool_timeout_seconds: float = 60.0
+    content_composer_max_iterations: int = 2
+    content_composer_tool_timeout_seconds: float = 35.0
     content_composer_allowed_tools: tuple[str, ...] = (
         "answer_generation",
         "generate_excel",
@@ -259,9 +259,9 @@ class GeneralPurposeConfig:
 
     # HITL
     hitl_supporting_question_enabled: bool = True
-    hitl_supporting_question_confidence_threshold: float = 0.65
-    hitl_supporting_question_recent_question_window: int = 3
-    hitl_supporting_question_max_length: int = 200
+    hitl_supporting_question_confidence_threshold: float = 0.72
+    hitl_supporting_question_recent_question_window: int = 2
+    hitl_supporting_question_max_length: int = 160
     hitl_supporting_question_safety_mode: str = "standard"
 
     # Persistence
@@ -318,11 +318,11 @@ class AssistantConfig:
     general_purpose: GeneralPurposeConfig = field(default_factory=GeneralPurposeConfig)
     platform_channels: tuple[str, ...] = field(default_factory=tuple)
     default_timezone: str = "UTC"
-    reminder_duplicate_similarity_threshold: float = 0.65
-    reminder_duplicate_time_window_minutes: int = 30
-    confirmation_expiry_minutes: int = 15
-    confirmation_high_confidence_threshold: float = 0.90
+    reminder_duplicate_similarity_threshold: float = 0.72
+    reminder_duplicate_time_window_minutes: int = 45
+    confirmation_expiry_minutes: int = 10
+    confirmation_high_confidence_threshold: float = 0.92
     response_type_intent_mapping: dict[ResponseType, Intent] = field(
         default_factory=lambda: dict(RESPONSE_TYPE_INTENT_MAPPING)
     )
-    human_in_the_loop_min_confidence: float = 0.6
+    human_in_the_loop_min_confidence: float = 0.66

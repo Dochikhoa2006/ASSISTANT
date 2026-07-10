@@ -38,81 +38,142 @@ def _get_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
 class DatabaseSettings:
     path: str = "assistant_data/assistant.sqlite3"
     url: str | None = None
-    pool_size: int = 5
-    max_overflow: int = 10
+    pool_size: int = 8
+    max_overflow: int = 16
     enable_wal: bool = True
-    busy_timeout_ms: int = 5000
+    busy_timeout_ms: int = 2000
 
 
 @dataclass(frozen=True)
 class OllamaSettings:
     base_url: str = "http://localhost:11434"
-    fast_model: str = "qwen2.5:1.5b"
-    balanced_model: str = "qwen3.5:4b"
-    accurate_model: str | None = "qwen2.5:7b"
-    writing_model: str | None = "qwen3.5:4b"
-    intent_model: str | None = "qwen2.5:3b"
-    action_extraction_model: str | None = "qwen3.5:4b"
-    heavy_production_model: str | None = "qwen2.5:7b"
-    heavy_production_enabled: bool = False
-    last_qa_model: str | None = "qwen2.5:3b"
-    clarification_merge_model: str | None = None
-    structured_retry_count: int = 2
-    keep_alive: int | str = -1
-    default_temperature: float = 0.0
-    query_rewrite_temperature: float = 0.0
-    last_qa_temperature: float = 0.0
-    intent_classifier_temperature: float = 0.0
-    action_detection_temperature: float = 0.0
-    risky_action_temperature: float = 0.0
-    answer_temperature: float = 0.25
-    writing_temperature: float = 0.45
-    timeout_fast: float = 120.0
-    timeout_balanced: float = 120.0
-    timeout_accurate: float = 120.0
-    timeout_writing: float = 120.0
-    timeout_risky_action: float = 120.0
-    num_ctx_fast: int = 1024
-    num_predict_fast: int = 128
-    num_ctx_balanced: int = 4096
-    num_ctx_accurate: int = 8192
-    num_ctx_writing: int = 4096
-    num_predict_writing: int = 1600
-    timeout_seconds: float = 120.0
-    last_qa_timeout_seconds: float = 60.0
-    clarification_merge_timeout_seconds: float = 60.0
-    general_sub_branch_detector_model: str | None = None
-    clarification_question_model: str | None = None
-    human_supporting_question_model: str | None = None
-    reminder_supporting_question_model: str | None = None
-    clarification_question_temperature: float = 0.2
-    human_supporting_question_temperature: float = 0.4
-    reminder_supporting_question_temperature: float = 0.3
-    question_generation_timeout: float = 30.0
-    clarification_question_max_tokens: int = 150
-    human_supporting_question_max_tokens: int = 150
-    reminder_supporting_question_max_tokens: int = 150
-    clarification_question_json_retry_count: int = 2
-    human_supporting_question_json_retry_count: int = 2
-    reminder_supporting_question_json_retry_count: int = 2
-    risky_action_model: str | None = "qwen2.5:3b"
-    risky_action_json_retry_count: int = 2
-    last_qa_json_retry_count: int = 2
-    clarification_merge_json_retry_count: int = 2
+    structured_retry_count: int = 1
+    keep_alive: int | str = "30m"
+
+    # Task: QUERY_REWRITE
+    model_query_rewrite: str = "qwen3.5:0.8b"
+    timeout_query_rewrite: float = 12.0
+    num_ctx_query_rewrite: int = 1024
+    num_predict_query_rewrite: int | None = 96
+    temperature_query_rewrite: float = 0.0
+
+    # Task: LAST_QA
+    model_last_qa: str = "qwen3.5:2b"
+    timeout_last_qa: float = 18.0
+    num_ctx_last_qa: int = 1536
+    num_predict_last_qa: int | None = 160
+    temperature_last_qa: float = 0.0
+    json_retry_count_last_qa: int = 1
+
+    # Task: INTENT
+    model_intent: str = "qwen3.5:2b"
+    timeout_intent: float = 18.0
+    num_ctx_intent: int = 2048
+    num_predict_intent: int | None = 96
+    temperature_intent: float = 0.0
+
+    # Task: ACTION_EXTRACTION
+    model_action_extraction: str = "qwen3.5:4b"
+    timeout_action_extraction: float = 30.0
+    num_ctx_action_extraction: int = 3072
+    num_predict_action_extraction: int | None = 512
+    temperature_action_extraction: float = 0.0
+
+    # Task: GENERATE_CLARIFICATION
+    model_generate_clarification: str = "qwen3.5:2b"
+    timeout_generate_clarification: float = 15.0
+    num_ctx_generate_clarification: int = 2048
+    num_predict_generate_clarification: int | None = 96
+    temperature_generate_clarification: float = 0.15
+    json_retry_count_generate_clarification: int = 1
+
+    # Task: GENERATE_HUMAN_SUPPORTING
+    model_generate_human_supporting: str = "qwen3.5:2b"
+    timeout_generate_human_supporting: float = 15.0
+    num_ctx_generate_human_supporting: int = 2048
+    num_predict_generate_human_supporting: int | None = 128
+    temperature_generate_human_supporting: float = 0.25
+    json_retry_count_generate_human_supporting: int = 1
+
+    # Task: GENERATE_REMINDER_SUPPORTING
+    model_generate_reminder_supporting: str = "qwen3.5:2b"
+    timeout_generate_reminder_supporting: float = 15.0
+    num_ctx_generate_reminder_supporting: int = 2048
+    num_predict_generate_reminder_supporting: int | None = 128
+    temperature_generate_reminder_supporting: float = 0.2
+    json_retry_count_generate_reminder_supporting: int = 1
+
+    # Task: CLARIFICATION_MERGE
+    model_clarification_merge: str = "qwen3.5:4b"
+    timeout_clarification_merge: float = 24.0
+    num_ctx_clarification_merge: int = 3072
+    num_predict_clarification_merge: int | None = 256
+    temperature_clarification_merge: float = 0.0
+    json_retry_count_clarification_merge: int = 1
+
+    # Task: ANSWER
+    model_answer: str = "qwen3.5:9b"
+    timeout_answer: float = 75.0
+    num_ctx_answer: int = 8192
+    num_predict_answer: int | None = 1024
+    temperature_answer: float = 0.22
+
+    # Task: WRITING
+    model_writing: str = "qwen3.5:9b"
+    timeout_writing: float = 90.0
+    num_ctx_writing: int = 8192
+    num_predict_writing: int | None = 1536
+    temperature_writing: float = 0.38
+
+    # Task: RISKY_ACTION
+    model_risky_action: str = "qwen3.5:9b"
+    timeout_risky_action: float = 35.0
+    num_ctx_risky_action: int = 4096
+    num_predict_risky_action: int | None = 384
+    temperature_risky_action: float = 0.0
+    json_retry_count_risky_action: int = 1
+
+    # Task: RETRIEVAL_VALIDATION
+    model_retrieval_validation: str = "qwen3.5:9b"
+    timeout_retrieval_validation: float = 35.0
+    num_ctx_retrieval_validation: int = 4096
+    num_predict_retrieval_validation: int | None = 384
+    temperature_retrieval_validation: float = 0.0
+
+    # Task: GENERAL_SUB_BRANCH_DETECTION
+    model_general_sub_branch_detection: str = "qwen3.5:2b"
+    timeout_general_sub_branch_detection: float = 12.0
+    num_ctx_general_sub_branch_detection: int = 1536
+    num_predict_general_sub_branch_detection: int | None = 96
+    temperature_general_sub_branch_detection: float = 0.0
+
+    # Task: CONTENT_COMPOSER_REACT
+    model_content_composer_react: str = "qwen3.5:2b"
+    timeout_content_composer_react: float = 15.0
+    num_ctx_content_composer_react: int = 2048
+    num_predict_content_composer_react: int | None = 128
+    temperature_content_composer_react: float = 0.0
+
+    # Task: ACTION_PLANNING
+    model_action_planning: str = "qwen3.5:4b"
+    timeout_action_planning: float = 35.0
+    num_ctx_action_planning: int = 4096
+    num_predict_action_planning: int | None = 512
+    temperature_action_planning: float = 0.0
 
 
 @dataclass(frozen=True)
 class RetrievalSettings:
-    max_results: int = 8
-    bm25_top_k: int = 30
-    chroma_top_k: int = 30
-    min_confidence: float = 0.25
-    conversation_min_confidence: float = 0.40
-    knowledge_min_confidence: float = 0.35
-    rrf_k: int = 60
-    lexical_weight: float = 1.0
+    max_results: int = 6
+    bm25_top_k: int = 24
+    chroma_top_k: int = 24
+    min_confidence: float = 0.30
+    conversation_min_confidence: float = 0.42
+    knowledge_min_confidence: float = 0.38
+    rrf_k: int = 40
+    lexical_weight: float = 1.10
     semantic_weight: float = 1.0
-    rerank_candidate_limit: int = 20
+    rerank_candidate_limit: int = 16
 
 
 @dataclass(frozen=True)
@@ -127,8 +188,8 @@ class OpenSearchSettings:
     knowledge_write_alias: str = "assistant_knowledge_chunks_write"
     reminder_context_alias: str = "assistant_reminder_contexts"
     analyzer_name: str = "assistant_text"
-    timeout_seconds: int = 30
-    max_retries: int = 3
+    timeout_seconds: int = 10
+    max_retries: int = 2
 
 
 @dataclass(frozen=True)
@@ -144,36 +205,36 @@ class ChromaSettings:
 class EmbeddingSettings:
     model_name: str = "BAAI/bge-m3"
     device: str | None = None
-    batch_size: int = 32
+    batch_size: int = 48
     normalize_embeddings: bool = True
-    max_length: int = 8192
+    max_length: int = 4096
 
 
 @dataclass(frozen=True)
 class RerankerSettings:
-    model_name: str = "BAAI/bge-reranker-v2-m3"
+    model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     endpoint_url: str | None = None
-    timeout_seconds: float = 10.0
-    min_score: float = 0.35
+    timeout_seconds: float = 6.0
+    min_score: float = 0.30
     device: str | None = None
-    batch_size: int = 16
-    max_candidates: int = 32
+    batch_size: int = 24
+    max_candidates: int = 20
 
 
 @dataclass(frozen=True)
 class LastQASettings:
     path: str = "assistant_data/last_qa.sqlite3"
-    ttl_seconds: int = 3600
+    ttl_seconds: int = 1800
 
 
 @dataclass(frozen=True)
 class WorkerSettings:
-    outbox_batch_size: int = 50
-    outbox_max_attempts: int = 5
-    outbox_worker_interval_seconds: int = 5
-    outbox_retry_backoff_seconds: int = 30
-    outbox_processing_timeout_seconds: int = 300
-    autoscan_interval_seconds: int = 60
+    outbox_batch_size: int = 64
+    outbox_max_attempts: int = 4
+    outbox_worker_interval_seconds: int = 3
+    outbox_retry_backoff_seconds: int = 15
+    outbox_processing_timeout_seconds: int = 180
+    autoscan_interval_seconds: int = 30
 
 
 @dataclass(frozen=True)
@@ -191,10 +252,10 @@ class APISettings:
 @dataclass(frozen=True)
 class SafetySettings:
     default_timezone: str = "UTC"
-    reminder_duplicate_similarity_threshold: float = 0.65
-    reminder_duplicate_time_window_minutes: int = 30
-    confirmation_expiry_minutes: int = 15
-    confirmation_high_confidence_threshold: float = 0.90
+    reminder_duplicate_similarity_threshold: float = 0.72
+    reminder_duplicate_time_window_minutes: int = 45
+    confirmation_expiry_minutes: int = 10
+    confirmation_high_confidence_threshold: float = 0.92
     allow_missing_idempotency_key: bool = True
 
 
@@ -224,13 +285,13 @@ class UnsupportedActionPolicy(str, Enum):
 
 @dataclass(frozen=True)
 class PromptPolicySettings:
-    intent_min_confidence: float = 0.45
-    action_min_confidence: float = 0.70
-    last_qa_min_confidence: float = 0.75
-    last_qa_skip_broad_retrieval_min_confidence: float = 0.85
-    human_in_the_loop_min_confidence: float = 0.6
-    clarification_merge_min_confidence: float = 0.80
-    supporting_question_match_threshold: float = 0.7
+    intent_min_confidence: float = 0.55
+    action_min_confidence: float = 0.76
+    last_qa_min_confidence: float = 0.80
+    last_qa_skip_broad_retrieval_min_confidence: float = 0.90
+    human_in_the_loop_min_confidence: float = 0.66
+    clarification_merge_min_confidence: float = 0.84
+    supporting_question_match_threshold: float = 0.74
     skip_broad_retrieval_allowed_relationships: tuple[str, ...] = (
         "supporting_question_answer",
         "normal_follow_up",
@@ -240,19 +301,19 @@ class PromptPolicySettings:
     last_qa_enable_reminder_metadata_reply: bool = True
     risky_action_validation_enabled: bool = True
     risky_action_operations: tuple[str, ...] = ("delete", "modify", "turn_off")
-    risky_action_confidence_threshold: float = 0.85
+    risky_action_confidence_threshold: float = 0.90
     knowledge_modify_requires_replacement_text: bool = True
-    context_filter_knowledge_min_confidence: float = 0.35
+    context_filter_knowledge_min_confidence: float = 0.38
     context_filter_allowed_reminder_statuses: tuple[str, ...] = ("scheduled", "notified")
     question_generation_enabled: bool = True
     reminder_supporting_question_enabled: bool = True
-    question_generation_confidence_threshold: float = 0.6
-    reminder_supporting_question_min_confidence: float = 0.6
-    human_supporting_question_max_count: int = 2
+    question_generation_confidence_threshold: float = 0.68
+    reminder_supporting_question_min_confidence: float = 0.68
+    human_supporting_question_max_count: int = 1
     question_generation_fallback_policy: str = "fallback_message"
     mutation_partial_execution_policy: MutationPartialExecutionPolicy = MutationPartialExecutionPolicy.ALL_OR_NOTHING
-    knowledge_target_relevance_threshold: float = 0.5
-    knowledge_target_ambiguity_margin: float = 0.1
+    knowledge_target_relevance_threshold: float = 0.58
+    knowledge_target_ambiguity_margin: float = 0.08
     knowledge_target_not_found_policy: TargetNotFoundPolicy = TargetNotFoundPolicy.SKIP_NOT_FOUND
     unsupported_action_policy: UnsupportedActionPolicy = UnsupportedActionPolicy.REJECT_AND_SKIP
     conversation_retrieval_after_last_qa_enabled: bool = True
@@ -277,27 +338,27 @@ class PromptPolicySettings:
 
 @dataclass(frozen=True)
 class ReminderTargetResolverSettings:
-    reminder_subject_weight: float = 1.0
-    reminder_summary_weight: float = 0.5
-    reminder_raw_text_weight: float = 0.1
-    reminder_time_weight: float = 1.0
-    reminder_entity_weight: float = 0.5
-    reminder_status_weight: float = 0.2
-    reminder_recency_weight: float = 0.1
+    reminder_subject_weight: float = 1.25
+    reminder_summary_weight: float = 0.65
+    reminder_raw_text_weight: float = 0.15
+    reminder_time_weight: float = 1.35
+    reminder_entity_weight: float = 0.65
+    reminder_status_weight: float = 0.15
+    reminder_recency_weight: float = 0.20
     
-    reminder_target_relevance_threshold: float = 0.72
-    reminder_target_ambiguity_margin: float = 0.12
+    reminder_target_relevance_threshold: float = 0.78
+    reminder_target_ambiguity_margin: float = 0.08
     
     reminder_llm_rerank_enabled: bool = False
-    reminder_llm_rerank_threshold: float = 0.85
-    reminder_llm_rerank_max_candidates: int = 5
+    reminder_llm_rerank_threshold: float = 0.90
+    reminder_llm_rerank_max_candidates: int = 3
     reminder_llm_rerank_model: str | None = None
-    reminder_llm_rerank_json_retry_count: int = 2
+    reminder_llm_rerank_json_retry_count: int = 1
     
     reminder_fuzzy_matcher: str = "rapidfuzz"
-    reminder_fuzzy_match_threshold: float = 0.78
+    reminder_fuzzy_match_threshold: float = 0.82
     reminder_target_not_found_policy: TargetNotFoundPolicy = TargetNotFoundPolicy.SKIP_NOT_FOUND
-    reminder_target_candidate_limit: int = 20
+    reminder_target_candidate_limit: int = 12
     
     allowed_reminder_modify_statuses: tuple[str, ...] = ("scheduled", "notified")
     allowed_reminder_turn_on_statuses: tuple[str, ...] = ("dismissed", "cancelled", "completed")
@@ -332,18 +393,18 @@ class ReminderTargetResolverSettings:
 
 @dataclass(frozen=True)
 class RetrievalValidationSettings:
-    knowledge_llm_validation_enabled: bool = False
+    knowledge_llm_validation_enabled: bool = True
     knowledge_llm_validation_model: str | None = None
-    knowledge_llm_validation_min_confidence: float = 0.8
-    knowledge_llm_validation_json_retry_count: int = 2
-    knowledge_llm_validation_max_candidates: int = 5
+    knowledge_llm_validation_min_confidence: float = 0.86
+    knowledge_llm_validation_json_retry_count: int = 1
+    knowledge_llm_validation_max_candidates: int = 3
     knowledge_llm_validation_failure_policy: str = "fail_closed"
 
     reminder_llm_validation_enabled: bool = True
     reminder_llm_validation_model: str | None = None
-    reminder_llm_validation_min_confidence: float = 0.8
-    reminder_llm_validation_json_retry_count: int = 2
-    reminder_llm_validation_max_candidates: int = 5
+    reminder_llm_validation_min_confidence: float = 0.86
+    reminder_llm_validation_json_retry_count: int = 1
+    reminder_llm_validation_max_candidates: int = 3
 
     destructive_action_requires_unambiguous_target: bool = True
 
@@ -366,10 +427,10 @@ class RetrievalValidationSettings:
 
 @dataclass(frozen=True)
 class KnowledgeChunkSettings:
-    chunk_size_tokens: int = 700
-    chunk_overlap_tokens: int = 100
+    chunk_size_tokens: int = 560
+    chunk_overlap_tokens: int = 80
     min_chunk_tokens: int = 80
-    max_chunk_tokens: int = 1000
+    max_chunk_tokens: int = 800
 
     def __post_init__(self) -> None:
         if self.chunk_size_tokens <= 0:
@@ -384,9 +445,9 @@ class KnowledgeChunkSettings:
 
 @dataclass(frozen=True)
 class ServiceWaitSettings:
-    timeout_seconds: int = 180
-    probe_timeout_seconds: int = 5
-    poll_interval_seconds: int = 2
+    timeout_seconds: int = 120
+    probe_timeout_seconds: int = 3
+    poll_interval_seconds: int = 1
     auto_pull_ollama_models: bool = True
 
 
@@ -401,12 +462,12 @@ class OperationsSettings:
     health_strict_ollama: bool = False
     health_strict_redis: bool = False
     health_strict_storage: bool = False
-    index_rebuild_batch_size: int = 100
+    index_rebuild_batch_size: int = 200
     drift_repair_enabled: bool = False
     recurrence_default_timezone: str = "UTC"
-    eval_top_1_threshold: float = 0.70
-    eval_top_3_threshold: float = 0.85
-    eval_wrong_target_rate_max: float = 0.02
+    eval_top_1_threshold: float = 0.78
+    eval_top_3_threshold: float = 0.90
+    eval_wrong_target_rate_max: float = 0.01
     eval_false_mutation_rate_max: float = 0.0
 
 
@@ -414,17 +475,17 @@ class OperationsSettings:
 class DebugSettings:
     db_path: str = "assistant_data/debug_pipeline.sqlite3"
     user_id: str = "debug-user"
-    conversation_min_confidence: float = 0.03
-    knowledge_min_confidence: float = 0.05
+    conversation_min_confidence: float = 0.08
+    knowledge_min_confidence: float = 0.10
     max_results: int = 4
-    rrf_k: int = 60
-    lexical_weight: float = 1.0
+    rrf_k: int = 40
+    lexical_weight: float = 1.10
     semantic_weight: float = 1.0
-    rerank_candidate_limit: int = 12
-    outbox_max_attempts: int = 3
-    outbox_batch_size: int = 20
+    rerank_candidate_limit: int = 8
+    outbox_max_attempts: int = 2
+    outbox_batch_size: int = 32
     outbox_retry_backoff_seconds: int = 0
-    outbox_processing_timeout_seconds: int = 60
+    outbox_processing_timeout_seconds: int = 45
     autoscan_interval_seconds: int = 10
     opensearch_conversation_index: str = "debug_assistant_conversation_hops"
     opensearch_knowledge_index: str = "debug_assistant_knowledge_chunks"
@@ -438,30 +499,30 @@ class DebugSettings:
 
 @dataclass(frozen=True)
 class ContextFilterSettings:
-    conversation_min_confidence: float = 0.40
-    conversation_approved_max_items: int = 3
-    conversation_duplicate_threshold: float = 0.92
-    knowledge_approved_max_items: int = 8
-    knowledge_duplicate_threshold: float = 0.95
+    conversation_min_confidence: float = 0.42
+    conversation_approved_max_items: int = 6
+    conversation_duplicate_threshold: float = 0.90
+    knowledge_approved_max_items: int = 6
+    knowledge_duplicate_threshold: float = 0.93
     low_information_text_patterns: tuple[str, ...] = (
         "done", "saved", "updated successfully", "ok", "noted", "sure"
     )
-    reminder_approved_max_items: int = 8
-    reminder_min_confidence: float = 0.50
+    reminder_approved_max_items: int = 5
+    reminder_min_confidence: float = 0.58
     semantic_context_judge_enabled: bool = False
     context_filter_debug_diagnostics_enabled: bool = False
-    low_information_min_chars: int = 10
+    low_information_min_chars: int = 12
 
 
 @dataclass(frozen=True)
 class GeneralPurposeSettings:
     general_sub_branch_detector_enabled: bool = True
-    general_sub_branch_confidence_threshold: float = 0.55
+    general_sub_branch_confidence_threshold: float = 0.65
     general_sub_branch_fallback_mode: str = "new_conversation_topic"
-    general_sub_branch_detector_json_retry_count: int = 2
+    general_sub_branch_detector_json_retry_count: int = 1
     content_composer_enabled: bool = True
-    content_composer_max_iterations: int = 3
-    content_composer_tool_timeout_seconds: float = 60.0
+    content_composer_max_iterations: int = 2
+    content_composer_tool_timeout_seconds: float = 35.0
     content_composer_allowed_tools: tuple[str, ...] = (
         "answer_generation", "generate_excel", "generate_pdf", "generate_pptx",
     )
@@ -484,9 +545,9 @@ class GeneralPurposeSettings:
         "pitch deck", "slideshow", "deck", "make slides",
     )
     hitl_supporting_question_enabled: bool = True
-    hitl_supporting_question_confidence_threshold: float = 0.65
-    hitl_supporting_question_recent_question_window: int = 3
-    hitl_supporting_question_max_length: int = 200
+    hitl_supporting_question_confidence_threshold: float = 0.72
+    hitl_supporting_question_recent_question_window: int = 2
+    hitl_supporting_question_max_length: int = 160
     hitl_supporting_question_safety_mode: str = "standard"
     general_response_persistence_policy: str = "sub_branch_driven"
     sub_branch_prompt_mode: str = "sub_branch_driven"
@@ -538,108 +599,89 @@ class ProductionSettings:
             ),
             ollama=OllamaSettings(
                 base_url=os.getenv("OLLAMA_BASE_URL", OllamaSettings.base_url),
-                fast_model=os.getenv("OLLAMA_FAST_MODEL", OllamaSettings.fast_model),
-                balanced_model=os.getenv(
-                    "OLLAMA_BALANCED_MODEL", OllamaSettings.balanced_model
-                ),
-                accurate_model=os.getenv("OLLAMA_ACCURATE_MODEL", OllamaSettings.accurate_model or "") or None,
-                writing_model=os.getenv("OLLAMA_WRITING_MODEL", OllamaSettings.writing_model or "") or None,
-                intent_model=os.getenv("OLLAMA_INTENT_MODEL", OllamaSettings.intent_model or "") or None,
-                action_extraction_model=os.getenv("OLLAMA_ACTION_EXTRACTION_MODEL", OllamaSettings.action_extraction_model or "") or None,
-                heavy_production_model=os.getenv("OLLAMA_HEAVY_PRODUCTION_MODEL", OllamaSettings.heavy_production_model or "") or None,
-                heavy_production_enabled=_get_bool("OLLAMA_HEAVY_PRODUCTION_ENABLED", OllamaSettings.heavy_production_enabled),
-                last_qa_model=os.getenv("OLLAMA_LAST_QA_MODEL", OllamaSettings.last_qa_model or "") or None,
-                clarification_merge_model=os.getenv("OLLAMA_CLARIFICATION_MERGE_MODEL") or None,
-                structured_retry_count=_get_int(
-                    "OLLAMA_STRUCTURED_RETRY_COUNT",
-                    OllamaSettings.structured_retry_count,
-                ),
+                structured_retry_count=_get_int("OLLAMA_STRUCTURED_RETRY_COUNT", OllamaSettings.structured_retry_count),
                 keep_alive=-1 if os.getenv("OLLAMA_KEEP_ALIVE", str(OllamaSettings.keep_alive)) == "-1" else os.getenv("OLLAMA_KEEP_ALIVE", OllamaSettings.keep_alive),
-                default_temperature=_get_float(
-                    "OLLAMA_DEFAULT_TEMPERATURE", OllamaSettings.default_temperature
-                ),
-                query_rewrite_temperature=_get_float(
-                    "QUERY_REWRITE_TEMPERATURE", OllamaSettings.query_rewrite_temperature
-                ),
-                last_qa_temperature=_get_float(
-                    "LAST_QA_TEMPERATURE", OllamaSettings.last_qa_temperature
-                ),
-                intent_classifier_temperature=_get_float(
-                    "INTENT_CLASSIFIER_TEMPERATURE", OllamaSettings.intent_classifier_temperature
-                ),
-                action_detection_temperature=_get_float(
-                    "ACTION_DETECTION_TEMPERATURE", OllamaSettings.action_detection_temperature
-                ),
-                risky_action_temperature=_get_float(
-                    "RISKY_ACTION_TEMPERATURE", OllamaSettings.risky_action_temperature
-                ),
-                answer_temperature=_get_float(
-                    "ANSWER_GENERATION_TEMPERATURE",
-                    _get_float("OLLAMA_ANSWER_TEMPERATURE", OllamaSettings.answer_temperature),
-                ),
-                writing_temperature=_get_float(
-                    "WRITING_TEMPERATURE", OllamaSettings.writing_temperature
-                ),
-                timeout_fast=_get_float(
-                    "OLLAMA_TIMEOUT_FAST", OllamaSettings.timeout_fast
-                ),
-                timeout_balanced=_get_float(
-                    "OLLAMA_TIMEOUT_BALANCED", OllamaSettings.timeout_balanced
-                ),
-                timeout_accurate=_get_float(
-                    "OLLAMA_TIMEOUT_ACCURATE", OllamaSettings.timeout_accurate
-                ),
-                timeout_writing=_get_float(
-                    "OLLAMA_TIMEOUT_WRITING", OllamaSettings.timeout_writing
-                ),
-                timeout_risky_action=_get_float(
-                    "OLLAMA_TIMEOUT_RISKY_ACTION", OllamaSettings.timeout_risky_action
-                ),
-                num_ctx_fast=_get_int(
-                    "OLLAMA_NUM_CTX_FAST", OllamaSettings.num_ctx_fast
-                ),
-                num_predict_fast=_get_int(
-                    "OLLAMA_NUM_PREDICT_FAST", OllamaSettings.num_predict_fast
-                ),
-                num_ctx_balanced=_get_int(
-                    "OLLAMA_NUM_CTX_BALANCED", OllamaSettings.num_ctx_balanced
-                ),
-                num_ctx_accurate=_get_int(
-                    "OLLAMA_NUM_CTX_ACCURATE", OllamaSettings.num_ctx_accurate
-                ),
-                num_ctx_writing=_get_int(
-                    "OLLAMA_NUM_CTX_WRITING", OllamaSettings.num_ctx_writing
-                ),
-                num_predict_writing=_get_int(
-                    "OLLAMA_NUM_PREDICT_WRITING", OllamaSettings.num_predict_writing
-                ),
-                timeout_seconds=_get_float(
-                    "OLLAMA_TIMEOUT_SECONDS", OllamaSettings.timeout_seconds
-                ),
-                last_qa_timeout_seconds=_get_float(
-                    "OLLAMA_LAST_QA_TIMEOUT_SECONDS", OllamaSettings.last_qa_timeout_seconds
-                ),
-                clarification_merge_timeout_seconds=_get_float(
-                    "OLLAMA_CLARIFICATION_MERGE_TIMEOUT_SECONDS", OllamaSettings.clarification_merge_timeout_seconds
-                ),
-                general_sub_branch_detector_model=os.getenv("GENERAL_SUB_BRANCH_DETECTOR_MODEL") or None,
-                clarification_question_model=os.getenv("OLLAMA_CLARIFICATION_QUESTION_MODEL") or None,
-                human_supporting_question_model=os.getenv("OLLAMA_HUMAN_SUPPORTING_QUESTION_MODEL") or None,
-                reminder_supporting_question_model=os.getenv("OLLAMA_REMINDER_SUPPORTING_QUESTION_MODEL") or None,
-                clarification_question_temperature=_get_float("OLLAMA_CLARIFICATION_QUESTION_TEMPERATURE", OllamaSettings.clarification_question_temperature),
-                human_supporting_question_temperature=_get_float("OLLAMA_HUMAN_SUPPORTING_QUESTION_TEMPERATURE", OllamaSettings.human_supporting_question_temperature),
-                reminder_supporting_question_temperature=_get_float("OLLAMA_REMINDER_SUPPORTING_QUESTION_TEMPERATURE", OllamaSettings.reminder_supporting_question_temperature),
-                question_generation_timeout=_get_float("OLLAMA_QUESTION_GENERATION_TIMEOUT", OllamaSettings.question_generation_timeout),
-                clarification_question_max_tokens=_get_int("OLLAMA_CLARIFICATION_QUESTION_MAX_TOKENS", OllamaSettings.clarification_question_max_tokens),
-                human_supporting_question_max_tokens=_get_int("OLLAMA_HUMAN_SUPPORTING_QUESTION_MAX_TOKENS", OllamaSettings.human_supporting_question_max_tokens),
-                reminder_supporting_question_max_tokens=_get_int("OLLAMA_REMINDER_SUPPORTING_QUESTION_MAX_TOKENS", OllamaSettings.reminder_supporting_question_max_tokens),
-                clarification_question_json_retry_count=_get_int("OLLAMA_CLARIFICATION_QUESTION_JSON_RETRY_COUNT", OllamaSettings.clarification_question_json_retry_count),
-                human_supporting_question_json_retry_count=_get_int("OLLAMA_HUMAN_SUPPORTING_QUESTION_JSON_RETRY_COUNT", OllamaSettings.human_supporting_question_json_retry_count),
-                reminder_supporting_question_json_retry_count=_get_int("OLLAMA_REMINDER_SUPPORTING_QUESTION_JSON_RETRY_COUNT", OllamaSettings.reminder_supporting_question_json_retry_count),
-                risky_action_model=os.getenv("OLLAMA_RISKY_ACTION_MODEL", OllamaSettings.risky_action_model or "") or None,
-                risky_action_json_retry_count=_get_int("OLLAMA_RISKY_ACTION_JSON_RETRY_COUNT", OllamaSettings.risky_action_json_retry_count),
-                last_qa_json_retry_count=_get_int("OLLAMA_LAST_QA_JSON_RETRY_COUNT", OllamaSettings.last_qa_json_retry_count),
-                clarification_merge_json_retry_count=_get_int("OLLAMA_CLARIFICATION_MERGE_JSON_RETRY_COUNT", OllamaSettings.clarification_merge_json_retry_count),
+                model_query_rewrite=os.getenv("OLLAMA_QUERY_REWRITE_MODEL", OllamaSettings.model_query_rewrite),
+                timeout_query_rewrite=_get_float("OLLAMA_QUERY_REWRITE_TIMEOUT", OllamaSettings.timeout_query_rewrite),
+                num_ctx_query_rewrite=_get_int("OLLAMA_QUERY_REWRITE_NUM_CTX", OllamaSettings.num_ctx_query_rewrite),
+                num_predict_query_rewrite=_get_int("OLLAMA_QUERY_REWRITE_NUM_PREDICT", OllamaSettings.num_predict_query_rewrite) if os.getenv("OLLAMA_QUERY_REWRITE_NUM_PREDICT") else OllamaSettings.num_predict_query_rewrite,
+                temperature_query_rewrite=_get_float("OLLAMA_QUERY_REWRITE_TEMPERATURE", OllamaSettings.temperature_query_rewrite),
+                model_last_qa=os.getenv("OLLAMA_LAST_QA_MODEL", OllamaSettings.model_last_qa),
+                timeout_last_qa=_get_float("OLLAMA_LAST_QA_TIMEOUT", OllamaSettings.timeout_last_qa),
+                num_ctx_last_qa=_get_int("OLLAMA_LAST_QA_NUM_CTX", OllamaSettings.num_ctx_last_qa),
+                num_predict_last_qa=_get_int("OLLAMA_LAST_QA_NUM_PREDICT", OllamaSettings.num_predict_last_qa) if os.getenv("OLLAMA_LAST_QA_NUM_PREDICT") else OllamaSettings.num_predict_last_qa,
+                temperature_last_qa=_get_float("OLLAMA_LAST_QA_TEMPERATURE", OllamaSettings.temperature_last_qa),
+                json_retry_count_last_qa=_get_int("OLLAMA_LAST_QA_JSON_RETRY_COUNT", OllamaSettings.json_retry_count_last_qa),
+                model_intent=os.getenv("OLLAMA_INTENT_MODEL", OllamaSettings.model_intent),
+                timeout_intent=_get_float("OLLAMA_INTENT_TIMEOUT", OllamaSettings.timeout_intent),
+                num_ctx_intent=_get_int("OLLAMA_INTENT_NUM_CTX", OllamaSettings.num_ctx_intent),
+                num_predict_intent=_get_int("OLLAMA_INTENT_NUM_PREDICT", OllamaSettings.num_predict_intent) if os.getenv("OLLAMA_INTENT_NUM_PREDICT") else OllamaSettings.num_predict_intent,
+                temperature_intent=_get_float("OLLAMA_INTENT_TEMPERATURE", OllamaSettings.temperature_intent),
+                model_action_extraction=os.getenv("OLLAMA_ACTION_EXTRACTION_MODEL", OllamaSettings.model_action_extraction),
+                timeout_action_extraction=_get_float("OLLAMA_ACTION_EXTRACTION_TIMEOUT", OllamaSettings.timeout_action_extraction),
+                num_ctx_action_extraction=_get_int("OLLAMA_ACTION_EXTRACTION_NUM_CTX", OllamaSettings.num_ctx_action_extraction),
+                num_predict_action_extraction=_get_int("OLLAMA_ACTION_EXTRACTION_NUM_PREDICT", OllamaSettings.num_predict_action_extraction) if os.getenv("OLLAMA_ACTION_EXTRACTION_NUM_PREDICT") else OllamaSettings.num_predict_action_extraction,
+                temperature_action_extraction=_get_float("OLLAMA_ACTION_EXTRACTION_TEMPERATURE", OllamaSettings.temperature_action_extraction),
+                model_generate_clarification=os.getenv("OLLAMA_GENERATE_CLARIFICATION_MODEL", OllamaSettings.model_generate_clarification),
+                timeout_generate_clarification=_get_float("OLLAMA_GENERATE_CLARIFICATION_TIMEOUT", OllamaSettings.timeout_generate_clarification),
+                num_ctx_generate_clarification=_get_int("OLLAMA_GENERATE_CLARIFICATION_NUM_CTX", OllamaSettings.num_ctx_generate_clarification),
+                num_predict_generate_clarification=_get_int("OLLAMA_GENERATE_CLARIFICATION_NUM_PREDICT", OllamaSettings.num_predict_generate_clarification) if os.getenv("OLLAMA_GENERATE_CLARIFICATION_NUM_PREDICT") else OllamaSettings.num_predict_generate_clarification,
+                temperature_generate_clarification=_get_float("OLLAMA_GENERATE_CLARIFICATION_TEMPERATURE", OllamaSettings.temperature_generate_clarification),
+                json_retry_count_generate_clarification=_get_int("OLLAMA_GENERATE_CLARIFICATION_JSON_RETRY_COUNT", OllamaSettings.json_retry_count_generate_clarification),
+                model_generate_human_supporting=os.getenv("OLLAMA_GENERATE_HUMAN_SUPPORTING_MODEL", OllamaSettings.model_generate_human_supporting),
+                timeout_generate_human_supporting=_get_float("OLLAMA_GENERATE_HUMAN_SUPPORTING_TIMEOUT", OllamaSettings.timeout_generate_human_supporting),
+                num_ctx_generate_human_supporting=_get_int("OLLAMA_GENERATE_HUMAN_SUPPORTING_NUM_CTX", OllamaSettings.num_ctx_generate_human_supporting),
+                num_predict_generate_human_supporting=_get_int("OLLAMA_GENERATE_HUMAN_SUPPORTING_NUM_PREDICT", OllamaSettings.num_predict_generate_human_supporting) if os.getenv("OLLAMA_GENERATE_HUMAN_SUPPORTING_NUM_PREDICT") else OllamaSettings.num_predict_generate_human_supporting,
+                temperature_generate_human_supporting=_get_float("OLLAMA_GENERATE_HUMAN_SUPPORTING_TEMPERATURE", OllamaSettings.temperature_generate_human_supporting),
+                json_retry_count_generate_human_supporting=_get_int("OLLAMA_GENERATE_HUMAN_SUPPORTING_JSON_RETRY_COUNT", OllamaSettings.json_retry_count_generate_human_supporting),
+                model_generate_reminder_supporting=os.getenv("OLLAMA_GENERATE_REMINDER_SUPPORTING_MODEL", OllamaSettings.model_generate_reminder_supporting),
+                timeout_generate_reminder_supporting=_get_float("OLLAMA_GENERATE_REMINDER_SUPPORTING_TIMEOUT", OllamaSettings.timeout_generate_reminder_supporting),
+                num_ctx_generate_reminder_supporting=_get_int("OLLAMA_GENERATE_REMINDER_SUPPORTING_NUM_CTX", OllamaSettings.num_ctx_generate_reminder_supporting),
+                num_predict_generate_reminder_supporting=_get_int("OLLAMA_GENERATE_REMINDER_SUPPORTING_NUM_PREDICT", OllamaSettings.num_predict_generate_reminder_supporting) if os.getenv("OLLAMA_GENERATE_REMINDER_SUPPORTING_NUM_PREDICT") else OllamaSettings.num_predict_generate_reminder_supporting,
+                temperature_generate_reminder_supporting=_get_float("OLLAMA_GENERATE_REMINDER_SUPPORTING_TEMPERATURE", OllamaSettings.temperature_generate_reminder_supporting),
+                json_retry_count_generate_reminder_supporting=_get_int("OLLAMA_GENERATE_REMINDER_SUPPORTING_JSON_RETRY_COUNT", OllamaSettings.json_retry_count_generate_reminder_supporting),
+                model_clarification_merge=os.getenv("OLLAMA_CLARIFICATION_MERGE_MODEL", OllamaSettings.model_clarification_merge),
+                timeout_clarification_merge=_get_float("OLLAMA_CLARIFICATION_MERGE_TIMEOUT", OllamaSettings.timeout_clarification_merge),
+                num_ctx_clarification_merge=_get_int("OLLAMA_CLARIFICATION_MERGE_NUM_CTX", OllamaSettings.num_ctx_clarification_merge),
+                num_predict_clarification_merge=_get_int("OLLAMA_CLARIFICATION_MERGE_NUM_PREDICT", OllamaSettings.num_predict_clarification_merge) if os.getenv("OLLAMA_CLARIFICATION_MERGE_NUM_PREDICT") else OllamaSettings.num_predict_clarification_merge,
+                temperature_clarification_merge=_get_float("OLLAMA_CLARIFICATION_MERGE_TEMPERATURE", OllamaSettings.temperature_clarification_merge),
+                json_retry_count_clarification_merge=_get_int("OLLAMA_CLARIFICATION_MERGE_JSON_RETRY_COUNT", OllamaSettings.json_retry_count_clarification_merge),
+                model_answer=os.getenv("OLLAMA_ANSWER_MODEL", OllamaSettings.model_answer),
+                timeout_answer=_get_float("OLLAMA_ANSWER_TIMEOUT", OllamaSettings.timeout_answer),
+                num_ctx_answer=_get_int("OLLAMA_ANSWER_NUM_CTX", OllamaSettings.num_ctx_answer),
+                num_predict_answer=_get_int("OLLAMA_ANSWER_NUM_PREDICT", OllamaSettings.num_predict_answer) if os.getenv("OLLAMA_ANSWER_NUM_PREDICT") else OllamaSettings.num_predict_answer,
+                temperature_answer=_get_float("OLLAMA_ANSWER_TEMPERATURE", OllamaSettings.temperature_answer),
+                model_writing=os.getenv("OLLAMA_WRITING_MODEL", OllamaSettings.model_writing),
+                timeout_writing=_get_float("OLLAMA_WRITING_TIMEOUT", OllamaSettings.timeout_writing),
+                num_ctx_writing=_get_int("OLLAMA_WRITING_NUM_CTX", OllamaSettings.num_ctx_writing),
+                num_predict_writing=_get_int("OLLAMA_WRITING_NUM_PREDICT", OllamaSettings.num_predict_writing) if os.getenv("OLLAMA_WRITING_NUM_PREDICT") else OllamaSettings.num_predict_writing,
+                temperature_writing=_get_float("OLLAMA_WRITING_TEMPERATURE", OllamaSettings.temperature_writing),
+                model_risky_action=os.getenv("OLLAMA_RISKY_ACTION_MODEL", OllamaSettings.model_risky_action),
+                timeout_risky_action=_get_float("OLLAMA_RISKY_ACTION_TIMEOUT", OllamaSettings.timeout_risky_action),
+                num_ctx_risky_action=_get_int("OLLAMA_RISKY_ACTION_NUM_CTX", OllamaSettings.num_ctx_risky_action),
+                num_predict_risky_action=_get_int("OLLAMA_RISKY_ACTION_NUM_PREDICT", OllamaSettings.num_predict_risky_action) if os.getenv("OLLAMA_RISKY_ACTION_NUM_PREDICT") else OllamaSettings.num_predict_risky_action,
+                temperature_risky_action=_get_float("OLLAMA_RISKY_ACTION_TEMPERATURE", OllamaSettings.temperature_risky_action),
+                json_retry_count_risky_action=_get_int("OLLAMA_RISKY_ACTION_JSON_RETRY_COUNT", OllamaSettings.json_retry_count_risky_action),
+                model_retrieval_validation=os.getenv("OLLAMA_RETRIEVAL_VALIDATION_MODEL", OllamaSettings.model_retrieval_validation),
+                timeout_retrieval_validation=_get_float("OLLAMA_RETRIEVAL_VALIDATION_TIMEOUT", OllamaSettings.timeout_retrieval_validation),
+                num_ctx_retrieval_validation=_get_int("OLLAMA_RETRIEVAL_VALIDATION_NUM_CTX", OllamaSettings.num_ctx_retrieval_validation),
+                num_predict_retrieval_validation=_get_int("OLLAMA_RETRIEVAL_VALIDATION_NUM_PREDICT", OllamaSettings.num_predict_retrieval_validation) if os.getenv("OLLAMA_RETRIEVAL_VALIDATION_NUM_PREDICT") else OllamaSettings.num_predict_retrieval_validation,
+                temperature_retrieval_validation=_get_float("OLLAMA_RETRIEVAL_VALIDATION_TEMPERATURE", OllamaSettings.temperature_retrieval_validation),
+                model_general_sub_branch_detection=os.getenv("OLLAMA_GENERAL_SUB_BRANCH_DETECTION_MODEL", OllamaSettings.model_general_sub_branch_detection),
+                timeout_general_sub_branch_detection=_get_float("OLLAMA_GENERAL_SUB_BRANCH_DETECTION_TIMEOUT", OllamaSettings.timeout_general_sub_branch_detection),
+                num_ctx_general_sub_branch_detection=_get_int("OLLAMA_GENERAL_SUB_BRANCH_DETECTION_NUM_CTX", OllamaSettings.num_ctx_general_sub_branch_detection),
+                num_predict_general_sub_branch_detection=_get_int("OLLAMA_GENERAL_SUB_BRANCH_DETECTION_NUM_PREDICT", OllamaSettings.num_predict_general_sub_branch_detection) if os.getenv("OLLAMA_GENERAL_SUB_BRANCH_DETECTION_NUM_PREDICT") else OllamaSettings.num_predict_general_sub_branch_detection,
+                temperature_general_sub_branch_detection=_get_float("OLLAMA_GENERAL_SUB_BRANCH_DETECTION_TEMPERATURE", OllamaSettings.temperature_general_sub_branch_detection),
+                model_content_composer_react=os.getenv("OLLAMA_CONTENT_COMPOSER_REACT_MODEL", OllamaSettings.model_content_composer_react),
+                timeout_content_composer_react=_get_float("OLLAMA_CONTENT_COMPOSER_REACT_TIMEOUT", OllamaSettings.timeout_content_composer_react),
+                num_ctx_content_composer_react=_get_int("OLLAMA_CONTENT_COMPOSER_REACT_NUM_CTX", OllamaSettings.num_ctx_content_composer_react),
+                num_predict_content_composer_react=_get_int("OLLAMA_CONTENT_COMPOSER_REACT_NUM_PREDICT", OllamaSettings.num_predict_content_composer_react) if os.getenv("OLLAMA_CONTENT_COMPOSER_REACT_NUM_PREDICT") else OllamaSettings.num_predict_content_composer_react,
+                temperature_content_composer_react=_get_float("OLLAMA_CONTENT_COMPOSER_REACT_TEMPERATURE", OllamaSettings.temperature_content_composer_react),
+                model_action_planning=os.getenv("OLLAMA_ACTION_PLANNING_MODEL", OllamaSettings.model_action_planning),
+                timeout_action_planning=_get_float("OLLAMA_ACTION_PLANNING_TIMEOUT", OllamaSettings.timeout_action_planning),
+                num_ctx_action_planning=_get_int("OLLAMA_ACTION_PLANNING_NUM_CTX", OllamaSettings.num_ctx_action_planning),
+                num_predict_action_planning=_get_int("OLLAMA_ACTION_PLANNING_NUM_PREDICT", OllamaSettings.num_predict_action_planning) if os.getenv("OLLAMA_ACTION_PLANNING_NUM_PREDICT") else OllamaSettings.num_predict_action_planning,
+                temperature_action_planning=_get_float("OLLAMA_ACTION_PLANNING_TEMPERATURE", OllamaSettings.temperature_action_planning),
             ),
 
             retrieval=RetrievalSettings(
@@ -1118,6 +1160,7 @@ class ProductionSettings:
                 content_composer_allowed_tools=_get_tuple("CONTENT_COMPOSER_ALLOWED_TOOLS", GeneralPurposeSettings.content_composer_allowed_tools),
                 content_composer_default_tool=os.getenv("CONTENT_COMPOSER_DEFAULT_TOOL", GeneralPurposeSettings.content_composer_default_tool),
                 content_composer_fallback_tool=os.getenv("CONTENT_COMPOSER_FALLBACK_TOOL", GeneralPurposeSettings.content_composer_fallback_tool),
+                content_composer_react_enabled=_get_bool("CONTENT_COMPOSER_REACT_ENABLED", GeneralPurposeSettings.content_composer_react_enabled),
                 content_composer_debug_trace_enabled=_get_bool("CONTENT_COMPOSER_DEBUG_TRACE_ENABLED", GeneralPurposeSettings.content_composer_debug_trace_enabled),
                 excel_tool_signal_keywords=_get_tuple("CONTENT_COMPOSER_EXCEL_KEYWORDS", GeneralPurposeSettings.excel_tool_signal_keywords),
                 pdf_tool_signal_keywords=_get_tuple("CONTENT_COMPOSER_PDF_KEYWORDS", GeneralPurposeSettings.pdf_tool_signal_keywords),
@@ -1128,6 +1171,7 @@ class ProductionSettings:
                 hitl_supporting_question_max_length=_get_int("HITL_SUPPORTING_QUESTION_MAX_LENGTH", GeneralPurposeSettings.hitl_supporting_question_max_length),
                 hitl_supporting_question_safety_mode=os.getenv("HITL_SUPPORTING_QUESTION_SAFETY_MODE", GeneralPurposeSettings.hitl_supporting_question_safety_mode),
                 general_response_persistence_policy=os.getenv("GENERAL_RESPONSE_PERSISTENCE_POLICY", GeneralPurposeSettings.general_response_persistence_policy),
+                sub_branch_prompt_mode=os.getenv("SUB_BRANCH_PROMPT_MODE", GeneralPurposeSettings.sub_branch_prompt_mode),
                 general_response_default_topic_title=os.getenv("GENERAL_RESPONSE_DEFAULT_TOPIC_TITLE", GeneralPurposeSettings.general_response_default_topic_title),
                 documents_dir=os.getenv("ASSISTANT_DOCUMENTS_DIR", GeneralPurposeSettings.documents_dir),
                 artifact_storage_dir=os.getenv("ASSISTANT_ARTIFACT_STORAGE_DIR", GeneralPurposeSettings.artifact_storage_dir),

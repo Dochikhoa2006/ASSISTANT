@@ -43,32 +43,25 @@ To run the Streamlit web interface:
 
 Normal runtime uses these central defaults from `assistant_rag/settings.py`:
 
-* Fast routing, query rewrite, Last-QA, and lightweight tool routing: `qwen3:4b`
-* Intent classification and action extraction: `qwen3:8b`
-* Risky delete/modify validation: `qwen3:14b`
-* Final answer generation: `llama3.1:8b`
+* Query rewrite: `qwen3.5:0.8b`
+* Last-QA, intent classification, supporting-question generation, sub-branch detection, and lightweight tool routing: `qwen3.5:2b`
+* Action extraction, clarification merge, and action planning: `qwen3.5:4b`
+* Final answers, long-form writing, risky-action validation, and retrieval validation: `qwen3.5:9b`
 * Embeddings: `BAAI/bge-m3`
 
 Runtime policy defaults:
 
 * Deterministic routing/extraction temperatures: `0.0`
-* Final answer temperature: `0.25`
-* Long-form writing temperature: `0.45`
-* Timeouts: fast `20s`, balanced `45s`, accurate/risky `90s`, writing `120s`
-* Context windows: fast `8192`, balanced `16384`, accurate/writing `32768`
-* Retrieval: BM25 `30`, Chroma `30`, RRF `60`, reranker top-k `20`, reranker min score `0.35`, final context `8`
-* Confidence floors: retrieval `0.25`, knowledge context `0.35`, conversation context `0.40`
-* Last-QA: minimum `0.75`, clarification merge `0.80`, broad-retrieval skip `0.85`
-* Actions: action minimum `0.70`, risky action threshold `0.85`, risky ops `delete,modify,turn_off`
-* Reminder context: minimum confidence `0.50`
-* Reminder resolver: candidates `20`, target score `0.72`, ambiguity margin `0.12`, fuzzy threshold `0.78`, LLM validation enabled
-* Knowledge chunks: size `700`, overlap `100`, minimum `80`, maximum `1000`
-* Embeddings: normalized, batch size `32`, max length `8192`
-* Worker: outbox batch `50`, retries `5`, retry backoff `30s`, stale processing timeout `300s`, outbox interval `5s`, reminder autoscan `60s`
-
-Heavy production mode is opt-in so normal laptop runs do not auto-pull a 30B model:
-```bash
-OLLAMA_HEAVY_PRODUCTION_ENABLED=1 ./runner/run
-```
-
-When enabled, the configured heavy model default is `qwen3:30b`.
+* Final answer temperature: `0.22`
+* Long-form writing temperature: `0.38`
+* Timeouts: tiny routing `12s`, short JSON `15-18s`, extraction `30s`, validation/planning `35s`, answer `75s`, writing `90s`
+* Context windows: routing `1024-2048`, extraction/merge `3072`, validation/planning `4096`, answer/writing `8192`
+* Retrieval: BM25 `24`, Chroma `24`, RRF `40`, reranker top-k `16`, reranker min score `0.30`, final context `6`
+* Confidence floors: retrieval `0.30`, knowledge context `0.38`, conversation context `0.42`
+* Last-QA: minimum `0.80`, clarification merge `0.84`, broad-retrieval skip `0.90`
+* Actions: action minimum `0.76`, risky action threshold `0.90`, risky ops `delete,modify,turn_off`
+* Reminder context: minimum confidence `0.58`
+* Reminder resolver: candidates `12`, target score `0.78`, ambiguity margin `0.08`, fuzzy threshold `0.82`, LLM validation enabled
+* Knowledge chunks: size `560`, overlap `80`, minimum `80`, maximum `800`
+* Embeddings: normalized, batch size `48`, max length `4096`
+* Worker: outbox batch `64`, retries `4`, retry backoff `15s`, stale processing timeout `180s`, outbox interval `3s`, reminder autoscan `30s`

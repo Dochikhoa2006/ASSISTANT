@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum
 import json
 import time
@@ -65,132 +65,30 @@ class OllamaModelRouter:
     settings: OllamaSettings
 
     def decision_for_task(self, task: LLMTask) -> ModelDecision:
-        model = self.model_for_task(task)
-        temperature = self.temperature_for_task(task)
-        reasons = {
-            LLMTask.QUERY_REWRITE: "fast rewrite with low variance",
-            LLMTask.LAST_QA: "fast temporary-context decision",
-            LLMTask.INTENT: "fast branch classification",
-            LLMTask.ACTION_EXTRACTION: "balanced structured action extraction",
-            LLMTask.GENERATE_CLARIFICATION: "targeted clarification question",
-            LLMTask.GENERATE_HUMAN_SUPPORTING: "optional human supporting questions",
-            LLMTask.GENERATE_REMINDER_SUPPORTING: "reminder-specific follow-up actions",
-            LLMTask.CLARIFICATION_MERGE: "semantic merge for clarification answers",
-            LLMTask.ANSWER: "writing model for final user-facing text",
-            LLMTask.WRITING: "writing model for long-form generated content",
-            LLMTask.RISKY_ACTION: "accurate model for risky mutation analysis",
-            LLMTask.GENERAL_SUB_BRANCH_DETECTION: "classification for general response sub-branch",
-            LLMTask.CONTENT_COMPOSER_REACT: "ReAct loop for tool selection and reasoning",
-            LLMTask.ACTION_PLANNING: "planning actions for knowledge and reminder branches",
-        }
-        
         return ModelDecision(
             task=task,
-            model=model,
-            temperature=temperature,
+            model=self.model_for_task(task),
+            temperature=self.temperature_for_task(task),
             timeout_seconds=self.timeout_for_task(task),
             num_ctx=self.num_ctx_for_task(task),
             num_predict=self.num_predict_for_task(task),
-            reason_summary=reasons.get(task, "configured model policy"),
+            reason_summary=f"Task-specific configuration for {task.value}",
         )
 
     def model_for_task(self, task: LLMTask) -> str:
-        if self.settings.heavy_production_enabled and self.settings.heavy_production_model:
-            if task in {
-                LLMTask.ANSWER,
-                LLMTask.WRITING,
-                LLMTask.RISKY_ACTION,
-                LLMTask.RETRIEVAL_VALIDATION,
-                LLMTask.ACTION_PLANNING,
-            }:
-                return self.settings.heavy_production_model
-        if task is LLMTask.LAST_QA:
-            return self.settings.last_qa_model or self.settings.fast_model
-        if task is LLMTask.INTENT:
-            return self.settings.intent_model or self.settings.balanced_model
-        if task is LLMTask.ACTION_EXTRACTION:
-            return self.settings.action_extraction_model or self.settings.balanced_model
-        if task is LLMTask.CLARIFICATION_MERGE:
-            return self.settings.clarification_merge_model or self.settings.balanced_model
-        if task is LLMTask.GENERATE_CLARIFICATION:
-            return self.settings.clarification_question_model or self.settings.balanced_model
-        if task is LLMTask.GENERATE_HUMAN_SUPPORTING:
-            return self.settings.human_supporting_question_model or self.settings.balanced_model
-        if task is LLMTask.GENERATE_REMINDER_SUPPORTING:
-            return self.settings.reminder_supporting_question_model or self.settings.balanced_model
-        if task in {LLMTask.QUERY_REWRITE, LLMTask.GENERAL_SUB_BRANCH_DETECTION, LLMTask.CONTENT_COMPOSER_REACT}:
-            if task is LLMTask.GENERAL_SUB_BRANCH_DETECTION and self.settings.general_sub_branch_detector_model:
-                return self.settings.general_sub_branch_detector_model
-            return self.settings.fast_model
-        if task in {LLMTask.RISKY_ACTION}:
-            return self.settings.risky_action_model or self.settings.accurate_model or self.settings.balanced_model
-        if task in {LLMTask.ANSWER, LLMTask.WRITING}:
-            return self.settings.writing_model or self.settings.balanced_model
-        if task is LLMTask.ACTION_PLANNING:
-            return self.settings.balanced_model
-        return self.settings.balanced_model
+        return getattr(self.settings, f"model_{task.value}")
 
     def temperature_for_task(self, task: LLMTask) -> float:
-        if task is LLMTask.QUERY_REWRITE:
-            return self.settings.query_rewrite_temperature
-        if task is LLMTask.LAST_QA:
-            return self.settings.last_qa_temperature
-        if task is LLMTask.INTENT:
-            return self.settings.intent_classifier_temperature
-        if task in {LLMTask.ACTION_EXTRACTION, LLMTask.ACTION_PLANNING}:
-            return self.settings.action_detection_temperature
-        if task is LLMTask.RISKY_ACTION:
-            return self.settings.risky_action_temperature
-        if task is LLMTask.ANSWER:
-            return self.settings.answer_temperature
-        if task is LLMTask.WRITING:
-            return self.settings.writing_temperature
-        if task is LLMTask.GENERATE_CLARIFICATION:
-            return self.settings.clarification_question_temperature
-        if task is LLMTask.GENERATE_HUMAN_SUPPORTING:
-            return self.settings.human_supporting_question_temperature
-        if task is LLMTask.GENERATE_REMINDER_SUPPORTING:
-            return self.settings.reminder_supporting_question_temperature
-        return self.settings.default_temperature
+        return getattr(self.settings, f"temperature_{task.value}")
 
     def num_ctx_for_task(self, task: LLMTask) -> int | None:
-        if self.settings.heavy_production_enabled and self.settings.heavy_production_model:
-            if task in {
-                LLMTask.ANSWER,
-                LLMTask.RISKY_ACTION,
-                LLMTask.RETRIEVAL_VALIDATION,
-                LLMTask.ACTION_PLANNING,
-            }:
-                return self.settings.num_ctx_accurate
-        if task in {LLMTask.QUERY_REWRITE, LLMTask.LAST_QA, LLMTask.GENERAL_SUB_BRANCH_DETECTION, LLMTask.CONTENT_COMPOSER_REACT}:
-            return self.settings.num_ctx_fast
-        if task in {LLMTask.INTENT, LLMTask.ACTION_EXTRACTION, LLMTask.ACTION_PLANNING, LLMTask.CLARIFICATION_MERGE, LLMTask.GENERATE_CLARIFICATION, LLMTask.GENERATE_HUMAN_SUPPORTING, LLMTask.GENERATE_REMINDER_SUPPORTING}:
-            return self.settings.num_ctx_balanced
-        if task in {LLMTask.RISKY_ACTION, LLMTask.RETRIEVAL_VALIDATION}:
-            return self.settings.num_ctx_accurate
-        if task in {LLMTask.ANSWER, LLMTask.WRITING}:
-            return self.settings.num_ctx_writing
-        return None
+        return getattr(self.settings, f"num_ctx_{task.value}")
 
     def num_predict_for_task(self, task: LLMTask) -> int | None:
-        if task in {LLMTask.QUERY_REWRITE, LLMTask.LAST_QA, LLMTask.GENERAL_SUB_BRANCH_DETECTION, LLMTask.INTENT, LLMTask.CONTENT_COMPOSER_REACT}:
-            return self.settings.num_predict_fast
-        if task in {LLMTask.ANSWER, LLMTask.WRITING}:
-            return self.settings.num_predict_writing
-        return None
+        return getattr(self.settings, f"num_predict_{task.value}")
 
     def timeout_for_task(self, task: LLMTask) -> float:
-        if task in {LLMTask.QUERY_REWRITE, LLMTask.LAST_QA, LLMTask.GENERAL_SUB_BRANCH_DETECTION, LLMTask.CONTENT_COMPOSER_REACT}:
-            return self.settings.timeout_fast
-        if task in {LLMTask.INTENT, LLMTask.ACTION_EXTRACTION, LLMTask.ACTION_PLANNING, LLMTask.CLARIFICATION_MERGE, LLMTask.GENERATE_CLARIFICATION, LLMTask.GENERATE_HUMAN_SUPPORTING, LLMTask.GENERATE_REMINDER_SUPPORTING}:
-            return self.settings.timeout_balanced
-        if task is LLMTask.RISKY_ACTION:
-            return self.settings.timeout_risky_action
-        if task is LLMTask.RETRIEVAL_VALIDATION:
-            return self.settings.timeout_accurate
-        if task in {LLMTask.ANSWER, LLMTask.WRITING}:
-            return self.settings.timeout_writing
-        return self.settings.timeout_seconds
+        return getattr(self.settings, f"timeout_{task.value}")
 
 
 @dataclass
@@ -209,7 +107,8 @@ class OllamaLLMClient:
     ) -> dict[str, Any]:
         with StageTimer(f"llm_{task.value}"):
             last_error: Exception | None = None
-            for _ in range(self.settings.structured_retry_count + 1):
+            retry_count = getattr(self.settings, f"json_retry_count_{task.value}", self.settings.structured_retry_count)
+            for _ in range(retry_count + 1):
                 try:
                     raw = self._chat_raw(
                         task=task,
@@ -251,50 +150,30 @@ class OllamaLLMClient:
     def check(self) -> dict[str, Any]:
         started = time.perf_counter()
         models = self.list_models()
+        configured_models = self._configured_models()
         model_checks = {
-            "fast_model": self.settings.fast_model in models,
-            "balanced_model": self.settings.balanced_model in models,
-            "intent_model": (
-                True
-                if self.settings.intent_model is None
-                else self.settings.intent_model in models
-            ),
-            "action_extraction_model": (
-                True
-                if self.settings.action_extraction_model is None
-                else self.settings.action_extraction_model in models
-            ),
-            "accurate_model": (
-                True
-                if self.settings.accurate_model is None
-                else self.settings.accurate_model in models
-            ),
-            "risky_action_model": (
-                True
-                if self.settings.risky_action_model is None
-                else self.settings.risky_action_model in models
-            ),
-            "writing_model": (
-                True
-                if self.settings.writing_model is None
-                else self.settings.writing_model in models
-            ),
-            "last_qa_model": (
-                True
-                if self.settings.last_qa_model is None
-                else self.settings.last_qa_model in models
-            ),
+            task_name: model in models
+            for task_name, model in configured_models.items()
         }
-        if self.settings.heavy_production_enabled and self.settings.heavy_production_model:
-            model_checks["heavy_production_model"] = self.settings.heavy_production_model in models
         latency_ms = round((time.perf_counter() - started) * 1000, 2)
         return {
             "base_url": self.settings.base_url,
             "reachable": True,
             "installed_models": models,
+            "configured_models": configured_models,
             "model_checks": model_checks,
             "latency_ms": latency_ms,
         }
+
+    def _configured_models(self) -> dict[str, str]:
+        configured: dict[str, str] = {}
+        for field_info in fields(self.settings):
+            if not field_info.name.startswith("model_"):
+                continue
+            model = getattr(self.settings, field_info.name)
+            if model:
+                configured[field_info.name.removeprefix("model_")] = str(model)
+        return configured
 
     def _chat_raw(
         self,
@@ -305,6 +184,7 @@ class OllamaLLMClient:
         format_schema: dict[str, Any] | None,
     ) -> str:
         decision = self.router.decision_for_task(task)
+        print(f"LLM used: {decision.model} (task: {task.value})")
         body: dict[str, Any] = {
             "model": decision.model,
             "messages": [
@@ -350,7 +230,7 @@ class OllamaLLMClient:
             method="POST",
         )
         if timeout is None:
-            timeout = self.settings.timeout_seconds
+            timeout = self._control_plane_timeout_seconds()
         try:
             with request.urlopen(req, timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
@@ -361,10 +241,13 @@ class OllamaLLMClient:
         url = f"{self.settings.base_url.rstrip('/')}{path}"
         req = request.Request(url, method="GET")
         try:
-            with request.urlopen(req, timeout=self.settings.timeout_seconds) as response:
+            with request.urlopen(req, timeout=self._control_plane_timeout_seconds()) as response:
                 return json.loads(response.read().decode("utf-8"))
         except error.URLError as exc:
             raise ConnectionError(f"Ollama request failed for {url}: {exc}") from exc
+
+    def _control_plane_timeout_seconds(self) -> float:
+        return min(10.0, max(3.0, self.settings.timeout_query_rewrite))
 
 
 def parse_json_object(raw: str) -> dict[str, Any]:

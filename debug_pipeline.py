@@ -110,7 +110,7 @@ def _debug_response_lines(response: BundledResponse) -> list[str]:
         f"  conversation_topic_id: {response.conversation_topic_id or 'none'}",
         f"  conversation_hop_id: {response.conversation_hop_id or 'none'}",
     ]
-    
+
     def _add_json_field(name: str, value: Any) -> None:
         if not value:
             lines.append(f"  {name}: {value}")
@@ -681,43 +681,34 @@ def scenario_general_new_conversation(settings: ProductionSettings) -> ScenarioR
 def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResult:
     default_settings = ProductionSettings()
     router = OllamaModelRouter(default_settings.ollama)
-    expected = {
-        LLMTask.QUERY_REWRITE: "qwen2.5:3b",
-        LLMTask.LAST_QA: "qwen2.5:3b",
-        LLMTask.GENERAL_SUB_BRANCH_DETECTION: "qwen2.5:3b",
-        LLMTask.CONTENT_COMPOSER_REACT: "qwen2.5:3b",
-        LLMTask.INTENT: "qwen2.5:3b",
-        LLMTask.ACTION_EXTRACTION: "qwen2.5:3b",
-        LLMTask.ACTION_PLANNING: "qwen2.5:3b",
-        LLMTask.RISKY_ACTION: "qwen2.5:3b",
-        LLMTask.ANSWER: "qwen2.5:3b",
-        LLMTask.WRITING: "qwen2.5:3b",
+    expected_models = {
+        LLMTask.QUERY_REWRITE: "qwen3.5:0.8b",
+        LLMTask.LAST_QA: "qwen3.5:2b",
+        LLMTask.INTENT: "qwen3.5:2b",
+        LLMTask.ACTION_EXTRACTION: "qwen3.5:4b",
+        LLMTask.GENERATE_CLARIFICATION: "qwen3.5:2b",
+        LLMTask.GENERATE_HUMAN_SUPPORTING: "qwen3.5:2b",
+        LLMTask.GENERATE_REMINDER_SUPPORTING: "qwen3.5:2b",
+        LLMTask.CLARIFICATION_MERGE: "qwen3.5:4b",
+        LLMTask.ANSWER: "qwen3.5:9b",
+        LLMTask.WRITING: "qwen3.5:9b",
+        LLMTask.RISKY_ACTION: "qwen3.5:9b",
+        LLMTask.RETRIEVAL_VALIDATION: "qwen3.5:9b",
+        LLMTask.GENERAL_SUB_BRANCH_DETECTION: "qwen3.5:2b",
+        LLMTask.CONTENT_COMPOSER_REACT: "qwen3.5:2b",
+        LLMTask.ACTION_PLANNING: "qwen3.5:4b",
     }
-    actual = {task: router.model_for_task(task) for task in expected}
+    actual_models = {task: router.model_for_task(task) for task in expected_models}
     mismatches = {
-        task.value: {"expected": expected_model, "actual": actual[task]}
-        for task, expected_model in expected.items()
-        if actual[task] != expected_model
+        task.value: {"expected": expected_model, "actual": actual_models[task]}
+        for task, expected_model in expected_models.items()
+        if actual_models[task] != expected_model
     }
     if mismatches:
         raise AssertionError(f"model routing mismatches: {mismatches}")
+
+    # Check some basic policy settings
     policy_values = {
-        "query_rewrite_temperature": default_settings.ollama.query_rewrite_temperature,
-        "last_qa_temperature": default_settings.ollama.last_qa_temperature,
-        "intent_classifier_temperature": default_settings.ollama.intent_classifier_temperature,
-        "action_detection_temperature": default_settings.ollama.action_detection_temperature,
-        "risky_action_temperature": default_settings.ollama.risky_action_temperature,
-        "answer_temperature": default_settings.ollama.answer_temperature,
-        "writing_temperature": default_settings.ollama.writing_temperature,
-        "timeout_fast": default_settings.ollama.timeout_fast,
-        "timeout_balanced": default_settings.ollama.timeout_balanced,
-        "timeout_accurate": default_settings.ollama.timeout_accurate,
-        "timeout_writing": default_settings.ollama.timeout_writing,
-        "timeout_risky_action": default_settings.ollama.timeout_risky_action,
-        "num_ctx_fast": default_settings.ollama.num_ctx_fast,
-        "num_ctx_balanced": default_settings.ollama.num_ctx_balanced,
-        "num_ctx_accurate": default_settings.ollama.num_ctx_accurate,
-        "num_ctx_writing": default_settings.ollama.num_ctx_writing,
         "bm25_top_k": default_settings.retrieval.bm25_top_k,
         "chroma_top_k": default_settings.retrieval.chroma_top_k,
         "rrf_k": default_settings.retrieval.rrf_k,
@@ -752,54 +743,38 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         "reminder_autoscan_interval_seconds": default_settings.worker.autoscan_interval_seconds,
     }
     expected_policy_values = {
-        "query_rewrite_temperature": 0.0,
-        "last_qa_temperature": 0.0,
-        "intent_classifier_temperature": 0.0,
-        "action_detection_temperature": 0.0,
-        "risky_action_temperature": 0.0,
-        "answer_temperature": 0.25,
-        "writing_temperature": 0.45,
-        "timeout_fast": 20.0,
-        "timeout_balanced": 45.0,
-        "timeout_accurate": 90.0,
-        "timeout_writing": 120.0,
-        "timeout_risky_action": 90.0,
-        "num_ctx_fast": 8192,
-        "num_ctx_balanced": 16384,
-        "num_ctx_accurate": 32768,
-        "num_ctx_writing": 32768,
-        "bm25_top_k": 30,
-        "chroma_top_k": 30,
-        "rrf_k": 60,
-        "reranker_top_k": 20,
-        "reranker_min_score": 0.35,
-        "reranker_batch_size": 16,
-        "final_context_top_k": 8,
-        "retrieval_min_confidence": 0.25,
-        "knowledge_context_min_confidence": 0.35,
-        "conversation_context_min_confidence": 0.40,
-        "last_qa_min_confidence": 0.75,
-        "last_qa_clarification_merge_min_confidence": 0.80,
-        "last_qa_skip_broad_retrieval_min_confidence": 0.85,
-        "action_min_confidence": 0.70,
-        "risky_action_confidence_threshold": 0.85,
-        "reminder_candidate_limit": 20,
-        "reminder_target_min_score": 0.72,
-        "reminder_target_ambiguity_margin": 0.12,
-        "reminder_fuzzy_match_threshold": 0.78,
-        "reminder_context_min_confidence": 0.50,
-        "knowledge_chunk_size_tokens": 700,
-        "knowledge_chunk_overlap_tokens": 100,
+        "bm25_top_k": 24,
+        "chroma_top_k": 24,
+        "rrf_k": 40,
+        "reranker_top_k": 16,
+        "reranker_min_score": 0.30,
+        "reranker_batch_size": 24,
+        "final_context_top_k": 6,
+        "retrieval_min_confidence": 0.30,
+        "knowledge_context_min_confidence": 0.38,
+        "conversation_context_min_confidence": 0.42,
+        "last_qa_min_confidence": 0.80,
+        "last_qa_clarification_merge_min_confidence": 0.84,
+        "last_qa_skip_broad_retrieval_min_confidence": 0.90,
+        "action_min_confidence": 0.76,
+        "risky_action_confidence_threshold": 0.90,
+        "reminder_candidate_limit": 12,
+        "reminder_target_min_score": 0.78,
+        "reminder_target_ambiguity_margin": 0.08,
+        "reminder_fuzzy_match_threshold": 0.82,
+        "reminder_context_min_confidence": 0.58,
+        "knowledge_chunk_size_tokens": 560,
+        "knowledge_chunk_overlap_tokens": 80,
         "knowledge_min_chunk_tokens": 80,
-        "knowledge_max_chunk_tokens": 1000,
-        "embedding_batch_size": 32,
-        "embedding_max_length": 8192,
-        "outbox_batch_size": 50,
-        "outbox_max_retries": 5,
-        "outbox_retry_backoff_seconds": 30,
-        "outbox_stale_processing_after_seconds": 300,
-        "outbox_worker_interval_seconds": 5,
-        "reminder_autoscan_interval_seconds": 60,
+        "knowledge_max_chunk_tokens": 800,
+        "embedding_batch_size": 48,
+        "embedding_max_length": 4096,
+        "outbox_batch_size": 64,
+        "outbox_max_retries": 4,
+        "outbox_retry_backoff_seconds": 15,
+        "outbox_stale_processing_after_seconds": 180,
+        "outbox_worker_interval_seconds": 3,
+        "reminder_autoscan_interval_seconds": 30,
     }
     policy_mismatches = {
         key: {"expected": expected_policy_values[key], "actual": policy_values[key]}
@@ -812,21 +787,24 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         raise AssertionError(f"risky action operations mismatch: {default_settings.prompt_policy.risky_action_operations}")
     if not default_settings.retrieval_validation.reminder_llm_validation_enabled:
         raise AssertionError("reminder LLM validation should be enabled by default")
+    if not default_settings.retrieval_validation.knowledge_llm_validation_enabled:
+        raise AssertionError("knowledge LLM validation should be enabled by default")
     if not default_settings.embeddings.normalize_embeddings:
         raise AssertionError("embedding normalization should be enabled")
     if default_settings.embeddings.model_name != "BAAI/bge-m3":
         raise AssertionError(f"embedding model mismatch: {default_settings.embeddings.model_name}")
-    if router.decision_for_task(LLMTask.ANSWER).num_ctx != 32768:
+    if router.decision_for_task(LLMTask.ANSWER).num_ctx != 8192:
         raise AssertionError("answer task should use writing context window")
+
     expected_timeouts = {
-        LLMTask.QUERY_REWRITE: 20.0,
-        LLMTask.LAST_QA: 20.0,
-        LLMTask.INTENT: 45.0,
-        LLMTask.ACTION_EXTRACTION: 45.0,
-        LLMTask.RISKY_ACTION: 90.0,
-        LLMTask.RETRIEVAL_VALIDATION: 90.0,
-        LLMTask.ANSWER: 120.0,
-        LLMTask.WRITING: 120.0,
+        LLMTask.QUERY_REWRITE: 12.0,
+        LLMTask.LAST_QA: 18.0,
+        LLMTask.INTENT: 18.0,
+        LLMTask.ACTION_EXTRACTION: 30.0,
+        LLMTask.RISKY_ACTION: 35.0,
+        LLMTask.RETRIEVAL_VALIDATION: 35.0,
+        LLMTask.ANSWER: 75.0,
+        LLMTask.WRITING: 90.0,
     }
     timeout_mismatches = {
         task.value: {"expected": expected_timeout, "actual": router.decision_for_task(task).timeout_seconds}

@@ -23,6 +23,8 @@ def main() -> int:
         "OpenSearch",
         [opensearch_url],
         timeout_seconds=timeout_seconds,
+        poll_interval_seconds=settings.service_wait.poll_interval_seconds,
+        probe_timeout_seconds=settings.service_wait.probe_timeout_seconds,
     )
     wait_for_any(
         "ChromaDB",
@@ -32,11 +34,15 @@ def main() -> int:
             f"http://{chroma_host}:{chroma_port}",
         ],
         timeout_seconds=timeout_seconds,
+        poll_interval_seconds=settings.service_wait.poll_interval_seconds,
+        probe_timeout_seconds=settings.service_wait.probe_timeout_seconds,
     )
     wait_for_any(
         "Ollama",
         [f"{ollama_url}/api/tags"],
         timeout_seconds=timeout_seconds,
+        poll_interval_seconds=settings.service_wait.poll_interval_seconds,
+        probe_timeout_seconds=settings.service_wait.probe_timeout_seconds,
     )
 
     maybe_pull_ollama_models(ollama_url, settings)
@@ -44,24 +50,34 @@ def main() -> int:
     return 0
 
 
-def wait_for_any(name: str, urls: list[str], *, timeout_seconds: int) -> None:
+def wait_for_any(
+    name: str,
+    urls: list[str],
+    *,
+    timeout_seconds: int,
+    poll_interval_seconds: int,
+    probe_timeout_seconds: int,
+) -> None:
     deadline = time.monotonic() + timeout_seconds
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         for url in urls:
             try:
-                fetch_json(url)
+                fetch_json(url, timeout_seconds=probe_timeout_seconds)
                 print(f"{name} is reachable at {url}")
                 return
             except Exception as exc:
                 last_error = exc
-        time.sleep(2)
+        time.sleep(poll_interval_seconds)
     raise RuntimeError(f"{name} did not become reachable: {last_error}")
 
 
 def maybe_pull_ollama_models(ollama_url: str, settings: ProductionSettings) -> None:
     models = configured_ollama_models(settings)
-    installed = installed_ollama_models(ollama_url)
+    installed = installed_ollama_models(
+        ollama_url,
+        timeout_seconds=settings.service_wait.probe_timeout_seconds,
+    )
     missing = [model for model in models if model not in installed]
     if not missing:
         print("Configured Ollama models are already installed.")
@@ -79,26 +95,11 @@ def maybe_pull_ollama_models(ollama_url: str, settings: ProductionSettings) -> N
 
 
 def configured_ollama_models(settings: ProductionSettings) -> list[str]:
-    values: list[str | None] = [
-        settings.ollama.fast_model,
-        settings.ollama.balanced_model,
-        settings.ollama.intent_model,
-        settings.ollama.action_extraction_model,
-        settings.ollama.accurate_model,
-        settings.ollama.writing_model,
-        settings.ollama.last_qa_model,
-        settings.ollama.clarification_merge_model,
-        settings.ollama.clarification_question_model,
-        settings.ollama.human_supporting_question_model,
-        settings.ollama.reminder_supporting_question_model,
-    ]
-    # Check if there are other models scattered in settings
-    values.extend([
-        settings.ollama.general_sub_branch_detector_model,
-        settings.ollama.risky_action_model,
-    ])
-    if settings.ollama.heavy_production_enabled:
-        values.append(settings.ollama.heavy_production_model)
+    import dataclasses
+    values: list[str | None] = []
+    for field in dataclasses.fields(settings.ollama):
+        if field.name.startswith("model_"):
+            values.append(getattr(settings.ollama, field.name))
 
     unique: list[str] = []
     for value in values:
@@ -107,15 +108,15 @@ def configured_ollama_models(settings: ProductionSettings) -> list[str]:
     return unique
 
 
-def installed_ollama_models(ollama_url: str) -> set[str]:
-    payload = fetch_json(f"{ollama_url}/api/tags")
+def installed_ollama_models(ollama_url: str, *, timeout_seconds: int = 5) -> set[str]:
+    payload = fetch_json(f"{ollama_url}/api/tags", timeout_seconds=timeout_seconds)
     return {str(model["name"]) for model in payload.get("models", [])}
 
 
-def fetch_json(url: str) -> dict[str, object]:
+def fetch_json(url: str, *, timeout_seconds: int = 5) -> dict[str, object]:
     req = request.Request(url, method="GET")
     try:
-        with request.urlopen(req, timeout=5) as response:
+        with request.urlopen(req, timeout=timeout_seconds) as response:
             body = response.read().decode("utf-8")
     except error.URLError as exc:
         raise ConnectionError(f"GET {url} failed: {exc}") from exc
