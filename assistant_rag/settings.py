@@ -77,7 +77,7 @@ class OllamaSettings:
     num_ctx_balanced: int = 4096
     num_ctx_accurate: int = 8192
     num_ctx_writing: int = 4096
-    num_predict_writing: int = 1536
+    num_predict_writing: int = 1600
     timeout_seconds: float = 120.0
     last_qa_timeout_seconds: float = 60.0
     clarification_merge_timeout_seconds: float = 60.0
@@ -151,7 +151,7 @@ class EmbeddingSettings:
 
 @dataclass(frozen=True)
 class RerankerSettings:
-    model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    model_name: str = "BAAI/bge-reranker-v2-m3"
     endpoint_url: str | None = None
     timeout_seconds: float = 10.0
     min_score: float = 0.35
@@ -439,7 +439,7 @@ class DebugSettings:
 @dataclass(frozen=True)
 class ContextFilterSettings:
     conversation_min_confidence: float = 0.40
-    conversation_approved_max_items: int = 8
+    conversation_approved_max_items: int = 3
     conversation_duplicate_threshold: float = 0.92
     knowledge_approved_max_items: int = 8
     knowledge_duplicate_threshold: float = 0.95

@@ -15,7 +15,7 @@ from .branches import (
 from .branch_orchestration import KnowledgeTargetResolver, ReminderTargetResolver, ValidatedActionBuilder
 from .bundler import ChatOutput, ResponseBundler
 from .chroma_index import ChromaPersistentVectorIndex
-from .classification import LLMLastQAResolver, LLMQueryRewriter
+from .classification import LLMLastQAResolver, LLMQueryRewriter, T5CanardQueryRewriter
 from .config import AssistantConfig, AutoscanConfig, ClassificationConfig, OutboxConfig, RetrievalConfig, QuestionGenerationConfig, MutationPolicyConfig, ContextFilterConfig, GeneralPurposeConfig, LastQAConfig
 from .contracts import Intent
 from .database import AssistantRepository
@@ -315,7 +315,7 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
             settings.last_qa.path,
             ttl_seconds=settings.last_qa.ttl_seconds,
         ),
-        query_rewriter=LLMQueryRewriter(llm, prompt_registry),
+        query_rewriter=T5CanardQueryRewriter(),
         last_qa_resolver=LLMLastQAResolver(
             llm=llm,
             config=assistant_config.last_qa,

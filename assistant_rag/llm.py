@@ -11,7 +11,7 @@ from urllib import error, request
 
 from .contracts import Intent
 from .metrics import GLOBAL_METRICS
-from .observability import StageTimer
+from .observability import StageTimer, current_trace
 from .prompts import DEFAULT_PROMPT_REGISTRY, PromptContext, PromptRegistry
 from .settings import OllamaSettings, PromptPolicySettings
 
@@ -324,6 +324,15 @@ class OllamaLLMClient:
         if format_schema is not None:
             body["format"] = format_schema
         payload = self._request_json("/api/chat", body, timeout=decision.timeout_seconds)
+        
+        trace = current_trace()
+        if trace and trace._active_timers:
+            timer = trace._active_timers[-1]
+            if "prompt_eval_count" in payload:
+                timer.metadata["input_count"] = payload["prompt_eval_count"]
+            if "eval_count" in payload:
+                timer.metadata["output_count"] = payload["eval_count"]
+                
         msg = payload.get("message", {})
         content = str(msg.get("content", ""))
         thinking = str(msg.get("thinking", ""))

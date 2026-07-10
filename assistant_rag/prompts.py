@@ -714,17 +714,26 @@ def _default_templates() -> dict[str, PromptTemplate]:
             ),
             inputs=("rewritten_query", "last_qa_state", "platform reminder metadata when present"),
             output_contract=(
-                "Return exactly ONE line with three pipe-separated values: INTERACTION_TYPE | SKIP_RETRIEVAL | CONFIDENCE\n"
-                "Example: normal_follow_up | true | 0.95"
+                'Return strict JSON: {"interaction_detected": boolean, '
+                '"interaction_type": "clarification_answer|supporting_question_answer|normal_follow_up|reminder_reply|unrelated|ambiguous", '
+                '"question_source": "system|human|reminder|none", "matched_question": string, '
+                '"llm_suggested_skip_broad_retrieval": boolean, "confidence": number}.'
             ),
             decision_rules=(
-                "INTERACTION_TYPE must be one of: clarification_answer, supporting_question_answer, normal_follow_up, reminder_reply, unrelated, ambiguous",
-                "SKIP_RETRIEVAL must be 'true' or 'false'. Set to true only for supporting/normal/reminder with high confidence.",
-                "CONFIDENCE must be a float between 0.0 and 1.0.",
-                "Do NOT output markdown, JSON, or any other text. Output strictly the 3 values separated by pipes.",
+                "Set interaction_detected to true if the query relies on the previous context.",
+                "interaction_type rules:",
+                "  clarification_answer: previous assistant asked a blocking clarification and the latest query clearly answers it.",
+                "  supporting_question_answer: latest query clearly answers exactly one prior supporting question.",
+                "  normal_follow_up: latest query clearly continues the previous completed answer.",
+                "  reminder_reply: trusted platform or Last-QA metadata proves this is replying to a reminder notification.",
+                "  unrelated: latest query starts a new task or topic.",
+                "  ambiguous: relation might exist but target, link, or required context is not safe.",
+                "Set question_source to match who originated the context (system, human, reminder) or none.",
+                "Set llm_suggested_skip_broad_retrieval=true only for supporting_question_answer, normal_follow_up, or reminder_reply when confidence is high.",
+                "Set llm_suggested_skip_broad_retrieval=false for unrelated, ambiguous, incomplete, stale, weak, or mutation-target-dependent context.",
             ),
             safety_rules=_safety_rules_for_stage("last_qa"),
-            error_handling=("If uncertain, return: ambiguous | false | 0.0",),
+            error_handling=("If uncertain, set interaction_detected=false and interaction_type=ambiguous.",),
         ),
         "clarification_merge": PromptTemplate(
             name="clarification_merge",

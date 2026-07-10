@@ -14,6 +14,7 @@ from .contracts import (
 )
 from .llm import LLMClient, LLMTask, validate_json_schema
 from .prompts import DEFAULT_PROMPT_REGISTRY, PromptContext, PromptRegistry
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,27 @@ class LLMQueryRewriter:
             return normalized
         rewritten = str(payload.get("rewritten_query") or normalized).strip()
         return rewritten or normalized
+
+
+class T5CanardQueryRewriter:
+    def __init__(self, model_name: str = "castorini/t5-base-canard", fallback: QueryRewriter | None = None):
+        self.fallback = fallback or QueryRewriter()
+        logger.info("Loading HuggingFace model for query rewriting: %s", model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+
+    def rewrite(self, query: str) -> str:
+        normalized = self.fallback.rewrite(query)
+        if not normalized:
+            return normalized
+        try:
+            input_ids = self.tokenizer(query, return_tensors="pt").input_ids
+            outputs = self.model.generate(input_ids, max_length=128)
+            rewritten = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            return rewritten.strip() or normalized
+        except Exception as e:
+            _log_llm_fallback("Query rewrite (T5)", e)
+            return normalized
 
 
 # LastQAResolution moved to contracts.py
@@ -314,8 +336,26 @@ class LLMLastQAResolver:
             return res
 
         if state.response_type in (ResponseType.NORMAL, ResponseType.KNOWLEDGE_ACTION, ResponseType.REMINDER_ACTION, ResponseType.REMINDER_REPLY, ResponseType.ERROR):
+            schema = {
+                "type": "object",
+                "properties": {
+                    "interaction_detected": {"type": "boolean"},
+                    "interaction_type": {"type": "string"},
+                    "question_source": {"type": "string"},
+                    "matched_question": {"type": "string"},
+                    "confidence": {"type": "number"},
+                    "llm_suggested_skip_broad_retrieval": {"type": "boolean"},
+                },
+                "required": [
+                    "interaction_detected",
+                    "interaction_type",
+                    "question_source",
+                    "confidence",
+                    "llm_suggested_skip_broad_retrieval",
+                ],
+            }
             try:
-                payload_str = self.llm.chat(
+                payload = self.llm.generate_json(
                     task=LLMTask.LAST_QA,
                     system_prompt=self.prompt_registry.system("last_qa"),
                     user_prompt=self.prompt_registry.user(
@@ -328,32 +368,24 @@ class LLMLastQAResolver:
                             platform_context=request.platform_context,
                             extra={"last_qa_state": state.__dict__},
                         )
-                    )
+                    ),
+                    schema=schema,
                 )
+                validate_json_schema(payload, schema)
                 
-                parts = [p.strip() for p in payload_str.split("|")]
-                if len(parts) >= 3:
-                    it_str = parts[0].strip("`\"'")
-                    skip_str = parts[1].strip("`\"'").lower()
-                    conf_str = parts[2].strip("`\"'")
-                    
-                    payload = {
-                        "interaction_type": it_str,
-                        "llm_suggested_skip_broad_retrieval": skip_str == "true",
-                        "confidence": float(conf_str) if conf_str.replace('.', '', 1).isdigit() else 0.0,
-                    }
-                else:
-                    payload = {}
-
                 it_str = payload.get("interaction_type")
+                qs_str = payload.get("question_source")
                 try:
                     interaction_type = LastQAInteractionType(it_str) if it_str else None
                 except ValueError:
                     interaction_type = None
+                    
+                try:
+                    question_source = QuestionSource(qs_str) if qs_str else QuestionSource.NONE
+                except ValueError:
+                    question_source = QuestionSource.NONE
 
-                interaction_detected = interaction_type is not None and interaction_type != LastQAInteractionType.UNRELATED
-                
-                if interaction_detected and interaction_type and float(payload.get("confidence", 0.0)) >= self.config.min_confidence:                    
+                if payload.get("interaction_detected") and interaction_type and float(payload.get("confidence", 0.0)) >= self.config.min_confidence:
                     skip = can_skip_broad_retrieval(payload, state, interaction_type, self.config, request)
                     
                     if skip:
@@ -362,12 +394,14 @@ class LLMLastQAResolver:
                         res = LastQAResolution(
                             path=LastQAPath.LATEST_CONTEXT_INTERACTION,
                             interaction_type=interaction_type,
+                            question_source=question_source,
                             rewritten_query=rewritten_query,
                             state=state,
                             did_merge_query=False,
                             skip_broad_retrieval=True,
                             linked_topic_id=state.linked_topic_id,
                             linked_hop_id=state.linked_hop_id,
+                            matched_question=payload.get("matched_question"),
                             reminder_id=md.get("reminder_id") or pc.get("reminder_id"),
                             notification_id=md.get("notification_id") or pc.get("notification_id"),
                             source_topic_id=md.get("source_topic_id") or pc.get("source_topic_id"),
