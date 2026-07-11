@@ -175,6 +175,11 @@ class AssistantRepository(ABC):
         pass
 
     @abstractmethod
+    def update_all_notification_ui_status(self, *, user_id: str, ui_status: str) -> int:
+        """Set every visible notification for one user to read or unread."""
+        pass
+
+    @abstractmethod
     def mark_notification_delivery_sent(self, *, user_id: str, notification_id: str) -> dict[str, Any]:
         pass
 

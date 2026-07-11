@@ -173,22 +173,10 @@ def _render_reminder_notifications(
 
     bulk_read, bulk_unread = st.columns(2)
     if bulk_read.button("👁 Mark all read", type="primary", use_container_width=True):
-        for notification in notifications:
-            if notification.get("ui_status") != "read":
-                repository.update_notification_ui_status(
-                    user_id=user_id,
-                    notification_id=str(notification["notification_id"]),
-                    ui_status="read",
-                )
+        repository.update_all_notification_ui_status(user_id=user_id, ui_status="read")
         st.rerun()
     if bulk_unread.button("◉ Mark all unread", use_container_width=True):
-        for notification in notifications:
-            if notification.get("ui_status") != "unread":
-                repository.update_notification_ui_status(
-                    user_id=user_id,
-                    notification_id=str(notification["notification_id"]),
-                    ui_status="unread",
-                )
+        repository.update_all_notification_ui_status(user_id=user_id, ui_status="unread")
         st.rerun()
 
     context_index = build_reminder_reply_context_index(

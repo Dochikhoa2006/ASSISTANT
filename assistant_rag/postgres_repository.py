@@ -1718,6 +1718,29 @@ class PostgresRepository(AssistantRepository):
                 "deleted_at": row[11],
             }
 
+    def update_all_notification_ui_status(self, *, user_id: str, ui_status: str) -> int:
+        """Atomically mark this user's visible notifications read or unread."""
+        if ui_status not in {"unread", "read"}:
+            raise ValueError("Bulk notification status must be read or unread")
+        values: dict[str, Any]
+        if ui_status == "read":
+            values = {"ui_status": "read", "read_at": now_iso(), "deleted_at": None}
+        else:
+            values = {"ui_status": "unread", "read_at": None, "deleted_at": None}
+        with self.transaction() as cursor:
+            result = cursor.execute(
+                update(reminder_notifications)
+                .where(
+                    and_(
+                        reminder_notifications.c.user_id == user_id,
+                        reminder_notifications.c.ui_status != "deleted",
+                        reminder_notifications.c.ui_status != ui_status,
+                    )
+                )
+                .values(**values)
+            )
+            return int(result.rowcount)
+
     def mark_notification_delivery_sent(
         self, *, user_id: str, notification_id: str
     ) -> dict[str, Any]:

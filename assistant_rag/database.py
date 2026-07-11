@@ -2377,6 +2377,31 @@ class SQLiteRepository(AssistantRepository):
         ).fetchone()
         return dict(row)
 
+    def update_all_notification_ui_status(self, *, user_id: str, ui_status: str) -> int:
+        """Atomically mark this user's visible notifications read or unread."""
+        if ui_status not in {"unread", "read"}:
+            raise ValueError("Bulk notification status must be read or unread")
+        with self.transaction() as cursor:
+            if ui_status == "read":
+                cursor.execute(
+                    """
+                    UPDATE reminder_notifications
+                    SET ui_status = 'read', read_at = ?, deleted_at = NULL
+                    WHERE user_id = ? AND ui_status != 'deleted' AND ui_status != 'read'
+                    """,
+                    (now_iso(), user_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE reminder_notifications
+                    SET ui_status = 'unread', read_at = NULL, deleted_at = NULL
+                    WHERE user_id = ? AND ui_status != 'deleted' AND ui_status != 'unread'
+                    """,
+                    (user_id,),
+                )
+            return int(cursor.rowcount)
+
     def mark_notification_delivery_sent(
         self, *, user_id: str, notification_id: str
     ) -> dict[str, Any]:
