@@ -26,7 +26,6 @@ from .onnx_llm import ONNXLLMClient
 from .hybrid_llm import HybridLLMClient
 from .pipeline import AssistantPipeline
 from .platform import PlatformSelector
-from .reminder_timing import ReminderTimingPlanner
 from .prompts import DEFAULT_PROMPT_REGISTRY
 from .retrieval import HybridRetriever
 from .reranking import SentenceTransformerCrossEncoderReranker
@@ -160,6 +159,21 @@ def build_production_repository(settings: ProductionSettings) -> AssistantReposi
     )
     repository.initialize_schema()
     return repository
+
+
+def build_reminder_timing_planner(settings: ProductionSettings) -> ReminderTimingPlanner:
+    """Build the same routed LLM client used by the online pipeline.
+
+    Workers should receive this planner so timing occurs in autoscan, without
+    making the chat request wait for a model call.
+    """
+    model_router = OllamaModelRouter(settings.ollama)
+    ollama_llm = OllamaLLMClient(settings.ollama, model_router)
+    onnx_llm = ONNXLLMClient(
+        model_router,
+        preload=settings.ollama.preload_onnx_models,
+    )
+    return ReminderTimingPlanner(llm=HybridLLMClient(ollama_llm, onnx_llm))
 
 
 def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline:
@@ -323,7 +337,6 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
                 retriever=retriever,
                 context_filter=context_filter,
                 llm=llm,
-                reminder_timing_planner=ReminderTimingPlanner(llm=llm),
             ),
         }
     )

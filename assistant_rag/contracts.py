@@ -580,10 +580,8 @@ class ValidatedReminderAction:
     observed_reminder_time: datetime | None = None
 
     subject: Optional[str] = None
-    # The event/deadline and the notification fire time are distinct.  For an
-    # explicit notification request, event_time is None and reminder_time is
-    # preserved exactly.  For an event-only request, a timing planner derives
-    # reminder_time from this immutable event timestamp.
+    # event_time is the original timestamp supplied for this reminder.  The
+    # background timing planner derives reminder_time from it asynchronously.
     event_time: datetime | None = None
     reminder_time: datetime | None = None
     reminder_summary: Optional[str] = None
@@ -604,6 +602,20 @@ class ValidatedReminderAction:
     confidence: float = 0.0
     matched_fields: tuple[str, ...] = ()
     reason_summary: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PendingReminderTiming:
+    """A reminder claimed by autoscan for one durable timing-plan attempt."""
+
+    reminder_id: str
+    user_id: str
+    source_time: datetime
+    subject: str
+    raw_reminder: str
+    user_timezone: str
+    recurrence_rule: str | None
+    version: int
 
 
 @dataclass

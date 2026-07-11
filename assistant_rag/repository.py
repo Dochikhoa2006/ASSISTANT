@@ -35,6 +35,18 @@ class AssistantRepository(ABC):
         pass
 
     @abstractmethod
+    def list_reminders_requiring_timing(self, *, limit: int = 100) -> list[PendingReminderTiming]:
+        pass
+
+    @abstractmethod
+    def complete_reminder_timing_plan(self, *, reminder_id: str, user_id: str, expected_version: int, notification_time: datetime, reason: str) -> bool:
+        pass
+
+    @abstractmethod
+    def fail_reminder_timing_plan(self, *, reminder_id: str, user_id: str, expected_version: int, reason: str) -> bool:
+        pass
+
+    @abstractmethod
     def load_reminder_reply_context(self, *, user_id: str, reminder_id: str, notification_id: str) -> dict[str, str | None]:
         pass
 

@@ -13,6 +13,7 @@ from .autoscan import ReminderAutoscan
 from .config import OutboxConfig
 from .database import AssistantRepository
 from .indexing import BackgroundIndexer
+from .reminder_timing import ReminderTimingPlanner
 from .retrieval import SearchIndex
 from .settings import ProductionSettings
 
@@ -23,6 +24,15 @@ class ProductionWorker:
     bm25: SearchIndex
     chroma: SearchIndex
     settings: ProductionSettings
+    reminder_timing_planner: ReminderTimingPlanner | None = None
+
+    def __post_init__(self) -> None:
+        # A production worker must own a real planner.  Keeping construction
+        # here makes it impossible to accidentally run autoscan without the
+        # timing LLM when callers use the normal worker constructor.
+        if self.reminder_timing_planner is None:
+            from .production_factory import build_reminder_timing_planner
+            self.reminder_timing_planner = build_reminder_timing_planner(self.settings)
 
     def run_once(self, *, scan_reminders: bool = True) -> dict[str, int]:
         indexer = BackgroundIndexer(
@@ -44,19 +54,22 @@ class ProductionWorker:
             logger.error("Exception during background indexing", exc_info=e)
             indexed = 0
 
-        notified = []
+        notified_count = 0
         if scan_reminders:
             try:
-                notified = ReminderAutoscan(self.repository).scan_due(
+                catch_up = ReminderAutoscan(
+                    self.repository, timing_planner=self.reminder_timing_planner
+                ).catch_up_due(
                     now_value=datetime.now(timezone.utc).isoformat()
                 )
-                if notified:
-                    logger.info(f"Scanned and generated {len(notified)} reminder notifications.")
+                notified_count = int(catch_up["notified"])
+                if notified_count:
+                    logger.info("Scanned and generated %s reminder notifications.", notified_count)
             except Exception as e:
                 logger.error("Exception during reminder autoscan", exc_info=e)
-                notified = []
+                notified_count = 0
 
-        return {"indexed_jobs": indexed, "notified_reminders": len(notified)}
+        return {"indexed_jobs": indexed, "notified_reminders": notified_count}
 
     def run_forever(self) -> None:
         logger.info("Starting background worker...")

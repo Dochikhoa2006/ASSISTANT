@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from typing import Any, Iterator, Optional
 from datetime import datetime, timezone
 
-from sqlalchemy import create_engine, select, insert, update, delete, and_, or_, func
+from sqlalchemy import create_engine, select, insert, update, delete, and_, or_, func, case
 from sqlalchemy.engine import Engine, Connection
 
 from .repository import AssistantRepository
@@ -236,7 +236,11 @@ class PostgresRepository(AssistantRepository):
                 )
                 # Deliberately global across users. The notification row still
                 # carries the owning user_id and remains access-controlled.
-                .where(and_(reminders.c.status == "scheduled", due_expr <= now_value))
+                .where(and_(
+                    reminders.c.status == "scheduled",
+                    reminders.c.timing_plan_status == "planned",
+                    due_expr <= now_value,
+                ))
                 .order_by(due_expr)
                 .limit(limit)
             ).fetchall()
@@ -294,6 +298,89 @@ class PostgresRepository(AssistantRepository):
         GLOBAL_METRICS.increment("reminder_scans_total")
         GLOBAL_METRICS.increment("notification_created_total", len(notified))
         return notified
+
+    def list_reminders_requiring_timing(self, *, limit: int = 100) -> list[PendingReminderTiming]:
+        stmt = (
+            select(
+                reminders.c.reminder_id, reminders.c.user_id, reminders.c.event_time,
+                reminders.c.reminder_time, reminders.c.subject, reminders.c.raw_reminder,
+                reminders.c.user_timezone, reminders.c.recurrence_rule, reminders.c.version,
+            )
+            .where(and_(
+                reminders.c.status == "scheduled",
+                reminders.c.timing_plan_status == "pending",
+            ))
+            .order_by(func.coalesce(reminders.c.event_time, reminders.c.reminder_time), reminders.c.reminder_id)
+            .limit(limit)
+        )
+        with self.engine.connect() as conn:
+            rows = conn.execute(stmt).fetchall()
+        candidates: list[PendingReminderTiming] = []
+        for row in rows:
+            source_value = row.event_time or row.reminder_time
+            try:
+                source_time = datetime.fromisoformat(source_value)
+                if source_time.tzinfo is None:
+                    source_time = source_time.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                source_time = datetime.min.replace(tzinfo=timezone.utc)
+            candidates.append(PendingReminderTiming(
+                reminder_id=str(row.reminder_id), user_id=str(row.user_id),
+                source_time=source_time, subject=str(row.subject or ""),
+                raw_reminder=str(row.raw_reminder or ""),
+                user_timezone=str(row.user_timezone or "UTC"),
+                recurrence_rule=row.recurrence_rule, version=int(row.version),
+            ))
+        return candidates
+
+    def complete_reminder_timing_plan(
+        self, *, reminder_id: str, user_id: str, expected_version: int,
+        notification_time: datetime, reason: str,
+    ) -> bool:
+        notification_iso = notification_time.astimezone(timezone.utc).isoformat()
+        with self.transaction() as cursor:
+            result = cursor.execute(
+                update(reminders)
+                .where(and_(
+                    reminders.c.reminder_id == reminder_id,
+                    reminders.c.user_id == user_id,
+                    reminders.c.version == expected_version,
+                    reminders.c.status == "scheduled",
+                    reminders.c.timing_plan_status == "pending",
+                ))
+                .values(
+                    reminder_time=notification_iso,
+                    next_fire_time=case(
+                        (reminders.c.recurrence_rule.is_not(None), notification_iso),
+                        else_=None,
+                    ),
+                    timing_plan_status="planned", timing_planned_at=now_iso(),
+                    timing_plan_reason=reason, updated_at=now_iso(),
+                    version=reminders.c.version + 1,
+                )
+            )
+            return result.rowcount == 1
+
+    def fail_reminder_timing_plan(
+        self, *, reminder_id: str, user_id: str, expected_version: int, reason: str,
+    ) -> bool:
+        with self.transaction() as cursor:
+            result = cursor.execute(
+                update(reminders)
+                .where(and_(
+                    reminders.c.reminder_id == reminder_id,
+                    reminders.c.user_id == user_id,
+                    reminders.c.version == expected_version,
+                    reminders.c.status == "scheduled",
+                    reminders.c.timing_plan_status == "pending",
+                ))
+                .values(
+                    timing_plan_status="needs_review", timing_planned_at=now_iso(),
+                    timing_plan_reason=reason, updated_at=now_iso(),
+                    version=reminders.c.version + 1,
+                )
+            )
+            return result.rowcount == 1
 
     def load_reminder_reply_context(self, *, user_id: str, reminder_id: str, notification_id: str) -> dict[str, str | None]:
         stmt = select(
@@ -1297,7 +1384,7 @@ class PostgresRepository(AssistantRepository):
                 source_topic_id=source_topic_id,
                 source_hop_id=audit_hop_id,
                 reminder_time=action.reminder_time.isoformat(),
-                event_time=action.event_time.isoformat() if action.event_time else None,
+                event_time=(action.event_time or action.reminder_time).isoformat(),
                 raw_reminder=action.raw_reminder or "",
                 reminder_summary=action.reminder_summary or "",
                 subject=action.subject or "",
@@ -1316,9 +1403,7 @@ class PostgresRepository(AssistantRepository):
                 domain_entity_id=reminder_id,
                 indexing_outbox_ids=(),
                 user_safe_summary=(
-                    f"Added reminder '{action.subject}'. Notification scheduled for "
-                    f"{action.reminder_time.isoformat()}"
-                    + (f"; event time is {action.event_time.isoformat()}." if action.event_time else ".")
+                    f"Added reminder '{action.subject}'. Timing will be finalized by autoscan before it can notify you."
                 ),
             )
 
@@ -1335,7 +1420,7 @@ class PostgresRepository(AssistantRepository):
                 expected_version=action.observed_version,
                 expected_status=action.observed_status,
             )
-            replacement_time = action.replacement_time or action.reminder_time
+            replacement_time = action.replacement_time or action.reminder_time or action.observed_reminder_time
             if not replacement_time:
                 raise RepositoryValidationError("Replacement reminder time is required")
             new_reminder_id = self.add_reminder(
@@ -1344,7 +1429,7 @@ class PostgresRepository(AssistantRepository):
                 source_topic_id=source_topic_id,
                 source_hop_id=audit_hop_id,
                 reminder_time=replacement_time.isoformat(),
-                event_time=action.event_time.isoformat() if action.event_time else None,
+                event_time=(action.event_time or replacement_time).isoformat(),
                 raw_reminder=action.raw_reminder or "",
                 reminder_summary=action.replacement_summary or action.reminder_summary or "",
                 subject=action.replacement_subject or action.subject or "",
@@ -1363,8 +1448,7 @@ class PostgresRepository(AssistantRepository):
                 domain_entity_id=new_reminder_id,
                 indexing_outbox_ids=(),
                 user_safe_summary=(
-                    f"Modified reminder '{action.replacement_subject or action.subject}'. Notification scheduled for "
-                    f"{replacement_time.isoformat()}."
+                    f"Modified reminder '{action.replacement_subject or action.subject}'. Timing will be recalculated by autoscan."
                 ),
             )
 
@@ -1376,14 +1460,38 @@ class PostgresRepository(AssistantRepository):
         if action_type not in status_by_action:
             raise ValueError("Unsupported reminder action")
         new_status = status_by_action[action_type]
-        self.update_reminder_status(
-            cursor,
-            user_id=user_id,
-            reminder_id=reminder_id,
-            status=new_status,
-            expected_version=action.observed_version,
-            expected_status=action.observed_status,
-        )
+        if action_type is ReminderAction.TURN_ON:
+            result = cursor.execute(
+                update(reminders)
+                .where(and_(
+                    reminders.c.user_id == user_id,
+                    reminders.c.reminder_id == reminder_id,
+                    reminders.c.version == action.observed_version,
+                    reminders.c.status == action.observed_status,
+                ))
+                .values(
+                    status=ReminderStatus.SCHEDULED.value,
+                    reminder_time=func.coalesce(reminders.c.event_time, reminders.c.reminder_time),
+                    next_fire_time=case(
+                        (reminders.c.recurrence_rule.is_not(None), func.coalesce(reminders.c.event_time, reminders.c.reminder_time)),
+                        else_=None,
+                    ),
+                    timing_plan_status="pending", timing_planned_at=None,
+                    timing_plan_reason=None, updated_at=now_iso(),
+                    version=reminders.c.version + 1,
+                )
+            )
+            if result.rowcount != 1:
+                raise ReminderConflictError("Reminder update failed ownership, version, or status validation")
+        else:
+            self.update_reminder_status(
+                cursor,
+                user_id=user_id,
+                reminder_id=reminder_id,
+                status=new_status,
+                expected_version=action.observed_version,
+                expected_status=action.observed_status,
+            )
         return RepositoryActionResult(
             action_id=new_id(),
             action_type=action_type.value,
@@ -1391,7 +1499,11 @@ class PostgresRepository(AssistantRepository):
             domain_entity_type="reminder",
             domain_entity_id=reminder_id,
             indexing_outbox_ids=(),
-            user_safe_summary=f"Reminder '{action.subject or reminder_id}' is now {new_status}.",
+            user_safe_summary=(
+                f"Reminder '{action.subject or reminder_id}' is scheduled again; its timing will be recalculated by autoscan."
+                if action_type is ReminderAction.TURN_ON
+                else f"Reminder '{action.subject or reminder_id}' is now {new_status}."
+            ),
         )
 
     def list_reminder_candidates(
@@ -1467,7 +1579,14 @@ class PostgresRepository(AssistantRepository):
         if not include_deleted:
             stmt = stmt.where(reminder_notifications.c.ui_status != 'deleted')
             
-        stmt = stmt.order_by(reminder_notifications.c.created_at.desc())
+        stmt = stmt.order_by(
+            func.coalesce(
+                reminder_notifications.c.fire_time,
+                reminders.c.reminder_time,
+                reminder_notifications.c.created_at,
+            ).desc(),
+            reminder_notifications.c.created_at.desc(),
+        )
         
         with self.engine.connect() as conn:
             rows = conn.execute(stmt).fetchall()

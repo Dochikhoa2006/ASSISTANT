@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from getpass import getpass
 import json
 import logging
 import sys
@@ -52,7 +53,7 @@ from assistant_rag.llm import (
     uses_onnx_runtime,
     validate_json_schema,
 )
-from assistant_rag.observability import current_trace, new_request_id, start_trace
+from assistant_rag.observability import JsonLogFormatter, current_trace, new_request_id, start_trace
 from assistant_rag.onnx_llm import ONNXLLMClient, _adaptive_max_new_tokens, _sentence_boundary_stop_reason
 from assistant_rag.platform import PlatformSelector
 from assistant_rag.production_factory import (
@@ -65,6 +66,7 @@ from assistant_rag.settings import ProductionSettings
 
 
 DEBUG_USER = "debug-user"
+logger = logging.getLogger(__name__)
 
 
 def _debug_json(value: Any) -> str:
@@ -154,6 +156,38 @@ def _debug_llm_from_pipeline(pipeline: Any) -> Any | None:
         if llm is not None:
             return llm
     return None
+
+
+def print_runtime_architecture(pipeline: Any, repository: Any) -> None:
+    """Print the live objects assembled for the interactive production path."""
+    router = getattr(pipeline, "router", None)
+    branches = getattr(router, "branches", {}) or getattr(router, "routes", {}) or {}
+    branch_lines = [
+        f"{getattr(intent, 'value', intent)}={type(branch).__name__}"
+        for intent, branch in branches.items()
+    ]
+    components = (
+        "query_rewriter", "last_qa_resolver", "retriever", "context_filter",
+        "classifier", "router", "bundler", "platform_selector",
+        "post_selector_hitl", "chat_output",
+    )
+    print("\nLive application architecture (same production factory as Streamlit):")
+    print(f"  repository: {type(repository).__name__}")
+    for name in components:
+        print(f"  {name}: {type(getattr(pipeline, name, None)).__name__}")
+    print(f"  branches: {branch_lines or ['unavailable']}")
+
+
+def configure_debug_logging() -> None:
+    """Emit structured, redacted runtime logs to the same terminal as traces."""
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    if any(getattr(handler, "_assistant_debug_handler", False) for handler in root.handlers):
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler._assistant_debug_handler = True  # type: ignore[attr-defined]
+    handler.setFormatter(JsonLogFormatter())
+    root.addHandler(handler)
 
 
 def _debug_llm_lines(llm: Any | None) -> list[str]:
@@ -662,6 +696,18 @@ def seed_reminder(
             raw_reminder=summary,
             reminder_summary=summary,
             subject=subject,
+        )
+        # Scenario fixtures represent reminders whose background timing pass
+        # already completed. Real add/modify/turn-on paths deliberately reset
+        # this state and are exercised separately.
+        cursor.execute(
+            """
+            UPDATE reminders
+            SET event_time = reminder_time, timing_plan_status = 'planned',
+                timing_planned_at = ?, timing_plan_reason = 'scenario fixture'
+            WHERE reminder_id = ?
+            """,
+            (now_iso(), reminder_id),
         )
         if status != "scheduled":
             state.repository.update_reminder_status(
@@ -2322,14 +2368,19 @@ def run_llm_smoke_test(settings: ProductionSettings) -> int:
 
 
 def interactive_main(settings: ProductionSettings) -> None:
-    print("Initializing SQL-First RAG Assistant Pipeline (CLI Mode)...")
-    debug_settings = _debug_runtime_settings(settings)
-    pipeline = build_production_pipeline(debug_settings)
-    repository = build_production_repository(debug_settings)
+    configure_debug_logging()
+    print("Initializing real SQL-First RAG Assistant Pipeline (CLI Mode)...")
+    # Do not apply settings.debug here: interactive debug must construct the
+    # identical production architecture and use the same configured stores as
+    # Streamlit.  Debug-only deterministic scenarios remain opt-in below.
+    pipeline = build_production_pipeline(settings)
+    repository = build_production_repository(settings)
     llm = _debug_llm_from_pipeline(pipeline)
+    print_runtime_architecture(pipeline, repository)
 
-    user_id = input(f"User ID [default: {debug_settings.debug.user_id}]: ").strip() or debug_settings.debug.user_id
+    user_id = input("User ID [default: default_user]: ").strip() or "default_user"
     gmail_username = input("Gmail username [default: '']: ").strip()
+    gmail_app_password = getpass("Gmail app password [default: '']: ")
 
     print("\nAssistant is ready! Type '/exit' or Ctrl+C to quit.")
     while True:
@@ -2349,11 +2400,20 @@ def interactive_main(settings: ProductionSettings) -> None:
                     raw_query=query,
                     platform_context={
                         "gmail_username": gmail_username,
+                        "gmail_app_password": gmail_app_password,
                     },
                 ),
                 repository,
             )
             print_debug_report(response, llm=llm)
+            logger.info(
+                "real_pipeline_request_completed",
+                extra={"payload": {
+                    "response_type": response.response_type.value,
+                    "trace_stage_count": len(response.trace_summary.stages) if response.trace_summary else 0,
+                    "conversation_hop_id": response.conversation_hop_id,
+                }},
+            )
             print(f"\nAssistant:\n{response.final_chat_text}")
         except KeyboardInterrupt:
             print("\nExiting...")
@@ -2368,7 +2428,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--scenario-suite",
         action="store_true",
-        help="Run deterministic architecture/path scenarios and exit.",
+        help="Run isolated deterministic component tests (not the real production-app debug path) and exit.",
     )
     parser.add_argument(
         "--scenario",

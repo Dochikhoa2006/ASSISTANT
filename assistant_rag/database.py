@@ -36,6 +36,7 @@ from .contracts import (
     ConfirmationStatus,
     KnowledgeSourceStatus,
     ArtifactStatus,
+    PendingReminderTiming,
 )
 from .errors import (
     RepositoryConflictError,
@@ -197,6 +198,9 @@ class SQLiteRepository(AssistantRepository):
                 source_hop_id TEXT NULL,
                 reminder_time TEXT NOT NULL,
                 event_time TEXT NULL,
+                timing_plan_status TEXT NOT NULL DEFAULT 'pending' CHECK (timing_plan_status IN ('pending', 'planned', 'needs_review')),
+                timing_planned_at TEXT NULL,
+                timing_plan_reason TEXT NULL,
                 status TEXT NOT NULL CHECK (status IN ('scheduled', 'notified', 'cancelled', 'dismissed', 'completed')),
                 raw_reminder TEXT NOT NULL,
                 reminder_summary TEXT NOT NULL,
@@ -380,6 +384,13 @@ class SQLiteRepository(AssistantRepository):
         if "event_time" not in reminder_columns:
             self.connection.execute("ALTER TABLE reminders ADD COLUMN event_time TEXT NULL")
             reminder_columns.add("event_time")
+        if "timing_plan_status" not in reminder_columns:
+            self.connection.execute("ALTER TABLE reminders ADD COLUMN timing_plan_status TEXT NOT NULL DEFAULT 'pending'")
+            reminder_columns.add("timing_plan_status")
+        if "timing_planned_at" not in reminder_columns:
+            self.connection.execute("ALTER TABLE reminders ADD COLUMN timing_planned_at TEXT NULL")
+        if "timing_plan_reason" not in reminder_columns:
+            self.connection.execute("ALTER TABLE reminders ADD COLUMN timing_plan_reason TEXT NULL")
         for column_name in (
             "recurrence_rule",
             "recurrence_timezone",
@@ -604,6 +615,7 @@ class SQLiteRepository(AssistantRepository):
                 -- durable notifications for every due user, including offline
                 -- users who will retrieve them after reconnecting.
                 WHERE status = 'scheduled'
+                  AND timing_plan_status = 'planned'
                   AND COALESCE(next_fire_time, reminder_time) <= ?
                 ORDER BY COALESCE(next_fire_time, reminder_time)
                 LIMIT ?
@@ -665,6 +677,76 @@ class SQLiteRepository(AssistantRepository):
         GLOBAL_METRICS.increment("reminder_scans_total")
         GLOBAL_METRICS.increment("notification_created_total", len(notified))
         return notified
+
+    def list_reminders_requiring_timing(self, *, limit: int = 100) -> list[PendingReminderTiming]:
+        """Return unplanned reminders globally; autoscan owns the LLM phase."""
+        rows = self.connection.execute(
+            """
+            SELECT reminder_id, user_id, event_time, reminder_time, subject,
+                   raw_reminder, user_timezone, recurrence_rule, version
+            FROM reminders
+            WHERE status = 'scheduled' AND timing_plan_status = 'pending'
+            ORDER BY COALESCE(event_time, reminder_time), reminder_id
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        candidates: list[PendingReminderTiming] = []
+        for row in rows:
+            source_value = row["event_time"] or row["reminder_time"]
+            try:
+                source_time = datetime.fromisoformat(source_value)
+                if source_time.tzinfo is None:
+                    source_time = source_time.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                # A malformed legacy timestamp cannot safely be sent to the
+                # planner.  Mark it terminally below through the normal API.
+                source_time = datetime.min.replace(tzinfo=timezone.utc)
+            candidates.append(PendingReminderTiming(
+                reminder_id=row["reminder_id"], user_id=row["user_id"],
+                source_time=source_time, subject=row["subject"],
+                raw_reminder=row["raw_reminder"],
+                user_timezone=row["user_timezone"] or "UTC",
+                recurrence_rule=row["recurrence_rule"], version=int(row["version"]),
+            ))
+        return candidates
+
+    def complete_reminder_timing_plan(
+        self, *, reminder_id: str, user_id: str, expected_version: int,
+        notification_time: datetime, reason: str,
+    ) -> bool:
+        notification_iso = notification_time.astimezone(timezone.utc).isoformat()
+        with self.transaction() as cursor:
+            cursor.execute(
+                """
+                UPDATE reminders
+                SET reminder_time = ?,
+                    next_fire_time = CASE WHEN recurrence_rule IS NOT NULL THEN ? ELSE NULL END,
+                    timing_plan_status = 'planned', timing_planned_at = ?,
+                    timing_plan_reason = ?, updated_at = ?, version = version + 1
+                WHERE reminder_id = ? AND user_id = ? AND version = ?
+                  AND status = 'scheduled' AND timing_plan_status = 'pending'
+                """,
+                (notification_iso, notification_iso, now_iso(), reason, now_iso(),
+                 reminder_id, user_id, expected_version),
+            )
+            return cursor.rowcount == 1
+
+    def fail_reminder_timing_plan(
+        self, *, reminder_id: str, user_id: str, expected_version: int, reason: str,
+    ) -> bool:
+        with self.transaction() as cursor:
+            cursor.execute(
+                """
+                UPDATE reminders
+                SET timing_plan_status = 'needs_review', timing_planned_at = ?,
+                    timing_plan_reason = ?, updated_at = ?, version = version + 1
+                WHERE reminder_id = ? AND user_id = ? AND version = ?
+                  AND status = 'scheduled' AND timing_plan_status = 'pending'
+                """,
+                (now_iso(), reason, now_iso(), reminder_id, user_id, expected_version),
+            )
+            return cursor.rowcount == 1
 
     def load_reminder_reply_context(self, *, user_id: str, reminder_id: str, notification_id: str) -> dict[str, str | None]:
         res = self.connection.execute(
@@ -1443,12 +1525,13 @@ class SQLiteRepository(AssistantRepository):
             """
             INSERT INTO reminders (
                 reminder_id, user_id, source_topic_id, source_hop_id,
-                reminder_time, event_time, status, raw_reminder, reminder_summary, subject,
+                reminder_time, event_time, timing_plan_status, timing_planned_at, timing_plan_reason,
+                status, raw_reminder, reminder_summary, subject,
                 supporting_question, supporting_response, user_timezone,
                 original_time_text, recurrence_rule, recurrence_timezone,
                 next_fire_time, last_fire_time, parent_recurring_reminder_id,
                 created_at, updated_at, version
-            ) VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, 'scheduled', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 1)
             """,
             (
                 reminder_id,
@@ -1967,7 +2050,7 @@ class SQLiteRepository(AssistantRepository):
                 source_topic_id=source_topic_id,
                 source_hop_id=audit_hop_id,
                 reminder_time=action.reminder_time.isoformat() if action.reminder_time else "",
-                event_time=action.event_time.isoformat() if action.event_time else None,
+                event_time=(action.event_time or action.reminder_time).isoformat() if (action.event_time or action.reminder_time) else None,
                 raw_reminder=action.raw_reminder or "",
                 reminder_summary=action.reminder_summary or "",
                 subject=action.subject or "",
@@ -1986,13 +2069,14 @@ class SQLiteRepository(AssistantRepository):
                 domain_entity_id=reminder_id,
                 indexing_outbox_ids=(),
                 user_safe_summary=(
-                    f"Added reminder '{action.subject}'. Notification scheduled for "
-                    f"{action.reminder_time.isoformat() if action.reminder_time else 'the requested time'}"
-                    + (f"; event time is {action.event_time.isoformat()}." if action.event_time else ".")
+                    f"Added reminder '{action.subject}'. Timing will be finalized by autoscan before it can notify you."
                 ),
             )
         elif action_type is ReminderAction.MODIFY:
             reminder_id = action.target_reminder_ids[0]
+            replacement_time = action.replacement_time or action.reminder_time or action.observed_reminder_time
+            if not replacement_time:
+                raise RepositoryValidationError("Replacement reminder time is required")
             self.update_reminder_status(
                 cursor,
                 user_id=user_id,
@@ -2006,8 +2090,8 @@ class SQLiteRepository(AssistantRepository):
                 user_id=user_id,
                 source_topic_id=source_topic_id,
                 source_hop_id=audit_hop_id,
-                reminder_time=action.replacement_time.isoformat() if action.replacement_time else (action.reminder_time.isoformat() if action.reminder_time else ""),
-                event_time=action.event_time.isoformat() if action.event_time else None,
+                reminder_time=replacement_time.isoformat(),
+                event_time=(action.event_time or replacement_time).isoformat(),
                 raw_reminder=action.raw_reminder or "",
                 reminder_summary=action.replacement_summary or action.reminder_summary or "",
                 subject=action.replacement_subject or action.subject or "",
@@ -2015,7 +2099,7 @@ class SQLiteRepository(AssistantRepository):
                 original_time_text=action.original_time_text,
                 recurrence_rule=action.replacement_recurrence_rule or action.recurrence_rule,
                 recurrence_timezone=action.replacement_recurrence_timezone or action.recurrence_timezone or action.user_timezone,
-                next_fire_time=action.next_fire_time.isoformat() if action.next_fire_time else ((action.replacement_time or action.reminder_time).isoformat() if (action.replacement_recurrence_rule or action.recurrence_rule) and (action.replacement_time or action.reminder_time) else None),
+                next_fire_time=action.next_fire_time.isoformat() if action.next_fire_time else (replacement_time.isoformat() if (action.replacement_recurrence_rule or action.recurrence_rule) else None),
                 parent_recurring_reminder_id=reminder_id,
             )
             return RepositoryActionResult(
@@ -2026,8 +2110,7 @@ class SQLiteRepository(AssistantRepository):
                 domain_entity_id=new_reminder_id,
                 indexing_outbox_ids=(),
                 user_safe_summary=(
-                    f"Modified reminder '{action.replacement_subject or action.subject}'. Notification scheduled for "
-                    f"{(action.replacement_time or action.reminder_time).isoformat() if (action.replacement_time or action.reminder_time) else 'the requested time'}."
+                    f"Modified reminder '{action.replacement_subject or action.subject}'. Timing will be recalculated by autoscan."
                 ),
             )
         else:
@@ -2037,14 +2120,30 @@ class SQLiteRepository(AssistantRepository):
                 ReminderAction.TURN_OFF: "cancelled",
                 ReminderAction.DELETE: "dismissed",
             }
-            self.update_reminder_status(
-                cursor,
-                user_id=user_id,
-                reminder_id=reminder_id,
-                status=status_by_action[action_type],
-                expected_version=action.observed_version,
-                expected_status=action.observed_status,
-            )
+            if action_type is ReminderAction.TURN_ON:
+                timestamp = now_iso()
+                cursor.execute(
+                    """
+                    UPDATE reminders
+                    SET status = 'scheduled', reminder_time = COALESCE(event_time, reminder_time),
+                        next_fire_time = CASE WHEN recurrence_rule IS NOT NULL THEN COALESCE(event_time, reminder_time) ELSE NULL END,
+                        timing_plan_status = 'pending', timing_planned_at = NULL,
+                        timing_plan_reason = NULL, updated_at = ?, version = version + 1
+                    WHERE user_id = ? AND reminder_id = ? AND version = ? AND status = ?
+                    """,
+                    (timestamp, user_id, reminder_id, action.observed_version, action.observed_status),
+                )
+                if cursor.rowcount != 1:
+                    raise ReminderConflictError("Reminder update failed ownership, version, or status validation")
+            else:
+                self.update_reminder_status(
+                    cursor,
+                    user_id=user_id,
+                    reminder_id=reminder_id,
+                    status=status_by_action[action_type],
+                    expected_version=action.observed_version,
+                    expected_status=action.observed_status,
+                )
             return RepositoryActionResult(
                 action_id=new_id(),
                 action_type=action_type.value,
@@ -2052,7 +2151,11 @@ class SQLiteRepository(AssistantRepository):
                 domain_entity_type="reminder",
                 domain_entity_id=reminder_id,
                 indexing_outbox_ids=(),
-                user_safe_summary=f"Reminder '{action.subject or reminder_id}' is now {status_by_action[action_type]}.",
+                user_safe_summary=(
+                    f"Reminder '{action.subject or reminder_id}' is scheduled again; its timing will be recalculated by autoscan."
+                    if action_type is ReminderAction.TURN_ON
+                    else f"Reminder '{action.subject or reminder_id}' is now {status_by_action[action_type]}."
+                ),
             )
 
     def _resolve_root_hop(
@@ -2110,7 +2213,9 @@ class SQLiteRepository(AssistantRepository):
         params: list[Any] = [user_id]
         if not include_deleted:
             query += " AND n.ui_status != 'deleted'"
-        query += " ORDER BY n.created_at DESC"
+        # Sidebar order is nearest due time at the top and farthest overdue
+        # time at the bottom; creation time is only a stable tie-breaker.
+        query += " ORDER BY COALESCE(n.fire_time, r.reminder_time, n.created_at) DESC, n.created_at DESC"
         rows = self.connection.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
