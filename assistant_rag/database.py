@@ -2232,19 +2232,36 @@ class SQLiteRepository(AssistantRepository):
         if ui_status not in {"unread", "read", "deleted"}:
             raise ValueError("Invalid notification UI status")
         timestamp = now_iso()
-        read_at = timestamp if ui_status == "read" else None
-        deleted_at = timestamp if ui_status == "deleted" else None
         with self.transaction() as cursor:
-            cursor.execute(
-                """
-                UPDATE reminder_notifications
-                SET ui_status = ?,
-                    read_at = COALESCE(?, read_at),
-                    deleted_at = COALESCE(?, deleted_at)
-                WHERE user_id = ? AND notification_id = ?
-                """,
-                (ui_status, read_at, deleted_at, user_id, notification_id),
-            )
+            if ui_status == "read":
+                cursor.execute(
+                    """
+                    UPDATE reminder_notifications
+                    SET ui_status = ?, read_at = ?, deleted_at = NULL
+                    WHERE user_id = ? AND notification_id = ?
+                    """,
+                    (ui_status, timestamp, user_id, notification_id),
+                )
+            elif ui_status == "unread":
+                # Re-opening a notification must remove the acknowledgement
+                # timestamp, otherwise it is still semantically "read".
+                cursor.execute(
+                    """
+                    UPDATE reminder_notifications
+                    SET ui_status = ?, read_at = NULL, deleted_at = NULL
+                    WHERE user_id = ? AND notification_id = ?
+                    """,
+                    (ui_status, user_id, notification_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE reminder_notifications
+                    SET ui_status = ?, deleted_at = ?
+                    WHERE user_id = ? AND notification_id = ?
+                    """,
+                    (ui_status, timestamp, user_id, notification_id),
+                )
             if cursor.rowcount != 1:
                 raise ValueError("Notification not found for user")
         row = self.connection.execute(

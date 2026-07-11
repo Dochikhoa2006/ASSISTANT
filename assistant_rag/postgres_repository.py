@@ -1628,17 +1628,24 @@ class PostgresRepository(AssistantRepository):
     def update_notification_ui_status(
         self, *, user_id: str, notification_id: str, ui_status: str
     ) -> dict[str, Any]:
+        if ui_status not in {"unread", "read", "deleted"}:
+            raise ValueError("Invalid notification UI status")
+        timestamp = now_iso()
+        values: dict[str, Any] = {"ui_status": ui_status}
+        if ui_status == "read":
+            values.update(read_at=timestamp, deleted_at=None)
+        elif ui_status == "unread":
+            # An unread notification must not retain an old read timestamp.
+            values.update(read_at=None, deleted_at=None)
+        else:
+            values["deleted_at"] = timestamp
         with self.transaction() as cursor:
             stmt = update(reminder_notifications).where(
                 and_(
                     reminder_notifications.c.user_id == user_id,
                     reminder_notifications.c.notification_id == notification_id
                 )
-            ).values(
-                ui_status=ui_status,
-                read_at=now_iso() if ui_status == 'read' else reminder_notifications.c.read_at,
-                deleted_at=now_iso() if ui_status == 'deleted' else reminder_notifications.c.deleted_at
-            ).returning(
+            ).values(**values).returning(
                 reminder_notifications.c.notification_id,
                 reminder_notifications.c.reminder_id,
                 reminder_notifications.c.user_id,
@@ -1665,9 +1672,10 @@ class PostgresRepository(AssistantRepository):
                 "delivery_attempts": row[5],
                 "last_delivery_error": row[6],
                 "sent_at": row[7],
-                "created_at": row[8],
-                "read_at": row[9],
-                "deleted_at": row[10],
+                "fire_time": row[8],
+                "created_at": row[9],
+                "read_at": row[10],
+                "deleted_at": row[11],
             }
 
     def mark_notification_delivery_sent(

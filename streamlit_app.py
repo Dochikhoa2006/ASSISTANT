@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from html import escape
 import json
 import logging
 from uuid import uuid4
@@ -122,6 +123,74 @@ def _render_reminder_notifications(
     if not notifications:
         st.caption("No due reminder notifications.")
         return
+
+    # Keep the state treatment unambiguous: read notifications use the red
+    # treatment requested for this UI, while notifications not yet read use a
+    # deliberately quiet grey.  Only fixed class names are injected; all
+    # database-backed reminder text is escaped below.
+    st.markdown(
+        """
+        <style>
+        .reminder-notification-header {
+            border-radius: 10px;
+            margin: 0.15rem 0 0.55rem;
+            padding: 0.7rem 0.8rem;
+        }
+        .reminder-notification-read {
+            background: linear-gradient(135deg, #7f1d1d, #b91c1c);
+            border: 1px solid #ef4444;
+            color: #fff7ed;
+        }
+        .reminder-notification-unread {
+            background: linear-gradient(135deg, #374151, #4b5563);
+            border: 1px solid #6b7280;
+            color: #f9fafb;
+        }
+        .reminder-notification-state {
+            font-size: 0.7rem;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            opacity: 0.92;
+        }
+        .reminder-notification-title {
+            font-size: 1rem;
+            font-weight: 700;
+            line-height: 1.35;
+            margin-top: 0.15rem;
+        }
+        .reminder-supporting-question {
+            background: #f8fafc;
+            border-left: 4px solid #64748b;
+            border-radius: 5px;
+            color: #1e293b;
+            margin: 0.45rem 0;
+            padding: 0.55rem 0.65rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    bulk_read, bulk_unread = st.columns(2)
+    if bulk_read.button("👁 Mark all read", type="primary", use_container_width=True):
+        for notification in notifications:
+            if notification.get("ui_status") != "read":
+                repository.update_notification_ui_status(
+                    user_id=user_id,
+                    notification_id=str(notification["notification_id"]),
+                    ui_status="read",
+                )
+        st.rerun()
+    if bulk_unread.button("◉ Mark all unread", use_container_width=True):
+        for notification in notifications:
+            if notification.get("ui_status") != "unread":
+                repository.update_notification_ui_status(
+                    user_id=user_id,
+                    notification_id=str(notification["notification_id"]),
+                    ui_status="unread",
+                )
+        st.rerun()
+
     context_index = build_reminder_reply_context_index(
         repository=repository, user_id=user_id, notifications=notifications
     )
@@ -133,73 +202,106 @@ def _render_reminder_notifications(
             unread = notification.get("ui_status") == "unread"
             subject = str(notification.get("subject") or "Reminder")
             summary = str(notification.get("reminder_summary") or "")
-            prefix = "🔔" if unread else "✓"
-            st.markdown(f"{prefix} **{subject}**")
-            st.caption(_format_notification_time(notification))
-            if summary:
-                st.caption(summary)
             context = context_index.get(
                 reminder_notification_key(
                     str(notification["reminder_id"]), str(notification["notification_id"])
                 ),
                 {},
             )
-            supporting_question = context.get("supporting_question")
-            if supporting_question:
-                st.caption(f"Supporting question: {supporting_question}")
-            with st.form(key=f"notification-reply-form-{notification['notification_id']}", clear_on_submit=True):
-                reply_text = st.text_area(
-                    "Reply or comment for the assistant",
-                    key=f"notification-reply-text-{notification['notification_id']}",
-                    placeholder="Answer the supporting question, add a comment, or ask for help…",
+            # Normalize legacy JSON/plain-text question shapes into the exact
+            # question the reply pipeline receives, so the UI never displays
+            # an opaque serialized payload to the user.
+            reply_metadata = build_reminder_reply_metadata(
+                reminder_id=str(notification["reminder_id"]),
+                notification_id=str(notification["notification_id"]),
+                context=context,
+            ) if context else {}
+            supporting_question = reply_metadata.get("supporting_question")
+            read = not unread
+            status_text = "ALREADY READ" if read else "NOT READ YET"
+            state_class = "reminder-notification-read" if read else "reminder-notification-unread"
+
+            with st.container(border=True):
+                st.markdown(
+                    f"""
+                    <div class="reminder-notification-header {state_class}">
+                      <div class="reminder-notification-state">REMINDER NOTIFICATION · {status_text}</div>
+                      <div class="reminder-notification-title">{escape(subject)}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
                 )
-                submitted = st.form_submit_button("Send to chatbot")
-            if submitted:
-                reply = reply_text.strip()
-                if not reply:
-                    st.warning("Enter a reply or comment first.")
-                elif not context or not context.get("source_hop_id"):
-                    st.warning("This reminder’s source conversation is unavailable. Nothing was sent.")
-                else:
-                    # The hash lookup restores the source hop's user query,
-                    # response, and supporting questions before normal routing.
-                    pipeline.last_qa_store.save(user_id, build_reminder_reply_last_qa(context))
-                    start_trace(new_request_id())
-                    response = pipeline.handle(
-                        ChatRequest(
-                            user_id=user_id,
-                            raw_query=reply,
-                            parent_hop_id=context.get("source_hop_id"),
-                            metadata=build_reminder_reply_metadata(
-                                reminder_id=str(notification["reminder_id"]),
-                                notification_id=str(notification["notification_id"]),
-                                context=context,
-                            ),
-                            platform_context={
-                                "gmail_username": st.session_state.get("gmail_username", ""),
-                                "gmail_app_password": st.session_state.get("gmail_app_password", ""),
-                            },
-                        ),
-                        repository,
+                st.caption(f"Notification time: {_format_notification_time(notification)}")
+                if summary:
+                    st.markdown(f"**Reminder details:** {summary}")
+                if supporting_question:
+                    st.markdown(
+                        "<div class=\"reminder-supporting-question\">"
+                        "<strong>Supporting question</strong><br>"
+                        f"{escape(str(supporting_question))}</div>",
+                        unsafe_allow_html=True,
                     )
-                    st.session_state.chat_messages.extend([
-                        {"role": "user", "content": reply},
-                        {"role": "assistant", "content": response.final_chat_text},
-                    ])
+                else:
+                    st.caption("Supporting question: none for this reminder.")
+
+                toggle_column, _ = st.columns((1, 1))
+                toggle_label = "👁 Mark as read" if unread else "◉ Mark as unread"
+                target_status = "read" if unread else "unread"
+                if toggle_column.button(
+                    toggle_label,
+                    key=f"notification-state-{notification['notification_id']}",
+                    use_container_width=True,
+                ):
                     repository.update_notification_ui_status(
                         user_id=user_id,
                         notification_id=str(notification["notification_id"]),
-                        ui_status="read",
+                        ui_status=target_status,
                     )
-                    st.session_state.reminder_reply_notice = "Your reminder reply was sent through the main chatbot."
                     st.rerun()
-            if unread and st.button("Mark read", key=f"notification-read-{notification['notification_id']}"):
-                repository.update_notification_ui_status(
-                    user_id=user_id,
-                    notification_id=str(notification["notification_id"]),
-                    ui_status="read",
-                )
-                st.rerun()
+
+                with st.form(key=f"notification-reply-form-{notification['notification_id']}", clear_on_submit=True):
+                    reply_text = st.text_area(
+                        "Reply or comment for the assistant",
+                        key=f"notification-reply-text-{notification['notification_id']}",
+                        placeholder="Answer the supporting question, add a comment, or ask for help…",
+                    )
+                    submitted = st.form_submit_button("Send to chatbot")
+                if submitted:
+                    reply = reply_text.strip()
+                    if not reply:
+                        st.warning("Enter a reply or comment first.")
+                    elif not context or not context.get("source_hop_id"):
+                        st.warning("This reminder’s source conversation is unavailable. Nothing was sent.")
+                    else:
+                        # The hash lookup restores the source hop's user query,
+                        # response, and supporting questions before normal routing.
+                        pipeline.last_qa_store.save(user_id, build_reminder_reply_last_qa(context))
+                        start_trace(new_request_id())
+                        response = pipeline.handle(
+                            ChatRequest(
+                                user_id=user_id,
+                                raw_query=reply,
+                                parent_hop_id=context.get("source_hop_id"),
+                                metadata=reply_metadata,
+                                platform_context={
+                                    "gmail_username": st.session_state.get("gmail_username", ""),
+                                    "gmail_app_password": st.session_state.get("gmail_app_password", ""),
+                                },
+                            ),
+                            repository,
+                        )
+                        st.session_state.chat_messages.extend([
+                            {"role": "user", "content": reply},
+                            {"role": "assistant", "content": response.final_chat_text},
+                        ])
+                        # A successful reply is an explicit acknowledgement.
+                        repository.update_notification_ui_status(
+                            user_id=user_id,
+                            notification_id=str(notification["notification_id"]),
+                            ui_status="read",
+                        )
+                        st.session_state.reminder_reply_notice = "Your reminder reply was sent through the main chatbot."
+                        st.rerun()
             st.divider()
 
 
