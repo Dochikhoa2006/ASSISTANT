@@ -437,7 +437,7 @@ def _last_qa_safety_rules() -> tuple[str, ...]:
 def _compact_mutation_safety_rules() -> tuple[str, ...]:
     return (
         "This stage may only extract or validate mutation intent; it must not execute writes.",
-        "Extract actions only when the current user clearly requests a state change.",
+        "Extract actions only when the current user clearly requests a state change, except that a clear first-person future event may create a proactive reminder when the product reminder policy enables it.",
         "Knowledge actions are add, delete, modify. Reminder actions are add, delete, modify, turn_on, turn_off.",
         "Do not switch domains automatically between knowledge and reminders.",
         "Add actions require clear content. Reminder add requires clear subject and time. Modify requires clear target plus replacement. Delete/turn_on/turn_off require clear target.",
@@ -821,14 +821,14 @@ def _default_templates() -> dict[str, PromptTemplate]:
             decision_rules=(
                 "Choose operation_kind before intent; intent must agree with it.",
                 "durable_knowledge means the user asks to retain, inspect, change, or remove a fact, preference, rule, or project knowledge. It is storage, not a future notification.",
-                "reminder_lifecycle means the user asks to create, inspect, change, or remove a scheduled future notification. It requires notification or scheduling semantics, not merely language about recall or retention.",
-                "Evidence for reminder_lifecycle must be either a requested future notification or schedule, or an explicit operation on an existing reminder/notification. Without either, do not choose reminder_lifecycle.",
+                "reminder_lifecycle means the user asks to create, inspect, change, or remove a scheduled future notification. A clear first-person future commitment with an identifiable event and time (for example, 'I have a meeting next week') also qualifies for proactive notification. It does not include vague plans, third-party facts, or merely discussing a future topic.",
+                "Evidence for reminder_lifecycle must be a requested future notification or schedule, a clear first-person future commitment with identifiable event/time, or an explicit operation on an existing reminder/notification. Without this, do not choose reminder_lifecycle.",
                 "clarification_reply is only a direct answer to an active mandatory assistant question; a new request is never clarification.",
                 "none covers all other questions and conversation. Missing action fields never change a state branch to general_response or clarification.",
             ),
             safety_rules=_safety_rules_for_stage("intent_classifier"),
             error_handling=(
-                "If no explicit state operation is present, return general_response.",
+                "If there is neither an explicit state operation nor a clear first-person future commitment with event/time, return general_response.",
                 "If context does not prove an active mandatory question, never return clarification.",
             ),
         ),
@@ -863,7 +863,7 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "Do not switch to another branch.",
                 "Do not claim any action completed.",
             ),
-            inputs=("selected intent", "raw_query", "rewritten_query", "trusted metadata", "platform_context"),
+            inputs=("selected intent", "raw_query", "rewritten_query", "trusted metadata", "platform_context", "current_time_utc"),
             output_contract=(
                 "Return strict JSON for the selected branch only: confidence, its action array, "
                 "missing_fields, and risk_flags. Do not return intent or unused metadata."
@@ -875,7 +875,8 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "Determine the operation from the outer change requested of the assistant's stored record. Verbs, lifecycle terms, and conditions inside supplied fact or policy content are data; they do not turn a request to record that content into modify or delete.",
                 "For a knowledge update that supplies both an existing value/reference and a desired value in one message, emit modify with both target_description and replacement_text. Keep the existing reference and desired replacement separate; neither may be discarded because the other is present.",
                 "For other knowledge changes, delete needs target_description; modify needs target_description and replacement_text. Those fields are never substitutes for text on add.",
-                "For reminders, add needs subject and time; every other action needs a target and any requested replacement field.",
+                "For reminders, add needs subject and time; a clear first-person future event statement (for example, 'I have a meeting next week') is also an add request for a proactive reminder. Every other action needs a target and any requested replacement field.",
+                "For a reminder add, use notification_time only when the user explicitly states when to notify/remind them; that timestamp must be copied exactly. Use event_time only when the stated time is the meeting, deadline, or event and the user did not choose a notification time. Set time_semantics accordingly. Never turn an event time into a notification_time or invent either timestamp.",
                 "Never invent values. Mark destructive, bulk, cross-domain, ambiguous, or incomplete requests in missing_fields/risk_flags.",
             ),
             safety_rules=_safety_rules_for_stage("action_detection"),

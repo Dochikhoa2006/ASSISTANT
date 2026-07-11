@@ -196,6 +196,7 @@ class SQLiteRepository(AssistantRepository):
                 source_topic_id TEXT NULL,
                 source_hop_id TEXT NULL,
                 reminder_time TEXT NOT NULL,
+                event_time TEXT NULL,
                 status TEXT NOT NULL CHECK (status IN ('scheduled', 'notified', 'cancelled', 'dismissed', 'completed')),
                 raw_reminder TEXT NOT NULL,
                 reminder_summary TEXT NOT NULL,
@@ -376,6 +377,9 @@ class SQLiteRepository(AssistantRepository):
             return {str(row["name"]) for row in rows}
 
         reminder_columns = columns("reminders")
+        if "event_time" not in reminder_columns:
+            self.connection.execute("ALTER TABLE reminders ADD COLUMN event_time TEXT NULL")
+            reminder_columns.add("event_time")
         for column_name in (
             "recurrence_rule",
             "recurrence_timezone",
@@ -596,6 +600,9 @@ class SQLiteRepository(AssistantRepository):
                 SELECT reminder_id, user_id, reminder_time, recurrence_rule,
                        recurrence_timezone, next_fire_time
                 FROM reminders
+                -- Deliberately no user_id predicate: one worker must create
+                -- durable notifications for every due user, including offline
+                -- users who will retrieve them after reconnecting.
                 WHERE status = 'scheduled'
                   AND COALESCE(next_fire_time, reminder_time) <= ?
                 ORDER BY COALESCE(next_fire_time, reminder_time)
@@ -1420,6 +1427,7 @@ class SQLiteRepository(AssistantRepository):
         raw_reminder: str,
         reminder_summary: str,
         subject: str,
+        event_time: str | None = None,
         supporting_question: str | None = None,
         supporting_response: str | None = None,
         user_timezone: str = "UTC",
@@ -1435,12 +1443,12 @@ class SQLiteRepository(AssistantRepository):
             """
             INSERT INTO reminders (
                 reminder_id, user_id, source_topic_id, source_hop_id,
-                reminder_time, status, raw_reminder, reminder_summary, subject,
+                reminder_time, event_time, status, raw_reminder, reminder_summary, subject,
                 supporting_question, supporting_response, user_timezone,
                 original_time_text, recurrence_rule, recurrence_timezone,
                 next_fire_time, last_fire_time, parent_recurring_reminder_id,
                 created_at, updated_at, version
-            ) VALUES (?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 1)
             """,
             (
                 reminder_id,
@@ -1448,6 +1456,7 @@ class SQLiteRepository(AssistantRepository):
                 source_topic_id,
                 source_hop_id,
                 reminder_time,
+                event_time,
                 raw_reminder,
                 reminder_summary,
                 subject,
@@ -1958,6 +1967,7 @@ class SQLiteRepository(AssistantRepository):
                 source_topic_id=source_topic_id,
                 source_hop_id=audit_hop_id,
                 reminder_time=action.reminder_time.isoformat() if action.reminder_time else "",
+                event_time=action.event_time.isoformat() if action.event_time else None,
                 raw_reminder=action.raw_reminder or "",
                 reminder_summary=action.reminder_summary or "",
                 subject=action.subject or "",
@@ -1975,7 +1985,11 @@ class SQLiteRepository(AssistantRepository):
                 domain_entity_type="reminder",
                 domain_entity_id=reminder_id,
                 indexing_outbox_ids=(),
-                user_safe_summary=f"Added reminder '{action.subject}'.",
+                user_safe_summary=(
+                    f"Added reminder '{action.subject}'. Notification scheduled for "
+                    f"{action.reminder_time.isoformat() if action.reminder_time else 'the requested time'}"
+                    + (f"; event time is {action.event_time.isoformat()}." if action.event_time else ".")
+                ),
             )
         elif action_type is ReminderAction.MODIFY:
             reminder_id = action.target_reminder_ids[0]
@@ -1993,6 +2007,7 @@ class SQLiteRepository(AssistantRepository):
                 source_topic_id=source_topic_id,
                 source_hop_id=audit_hop_id,
                 reminder_time=action.replacement_time.isoformat() if action.replacement_time else (action.reminder_time.isoformat() if action.reminder_time else ""),
+                event_time=action.event_time.isoformat() if action.event_time else None,
                 raw_reminder=action.raw_reminder or "",
                 reminder_summary=action.replacement_summary or action.reminder_summary or "",
                 subject=action.replacement_subject or action.subject or "",
@@ -2010,7 +2025,10 @@ class SQLiteRepository(AssistantRepository):
                 domain_entity_type="reminder",
                 domain_entity_id=new_reminder_id,
                 indexing_outbox_ids=(),
-                user_safe_summary=f"Modified reminder '{action.replacement_subject or action.subject}'.",
+                user_safe_summary=(
+                    f"Modified reminder '{action.replacement_subject or action.subject}'. Notification scheduled for "
+                    f"{(action.replacement_time or action.reminder_time).isoformat() if (action.replacement_time or action.reminder_time) else 'the requested time'}."
+                ),
             )
         else:
             reminder_id = action.target_reminder_ids[0]

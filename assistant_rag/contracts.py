@@ -580,6 +580,11 @@ class ValidatedReminderAction:
     observed_reminder_time: datetime | None = None
 
     subject: Optional[str] = None
+    # The event/deadline and the notification fire time are distinct.  For an
+    # explicit notification request, event_time is None and reminder_time is
+    # preserved exactly.  For an event-only request, a timing planner derives
+    # reminder_time from this immutable event timestamp.
+    event_time: datetime | None = None
     reminder_time: datetime | None = None
     reminder_summary: Optional[str] = None
     raw_reminder: Optional[str] = None

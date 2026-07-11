@@ -397,15 +397,35 @@ class ValidatedActionBuilder:
             confidence = float(action_dict.get("confidence", 1.0))
             
             if action_type == ReminderAction.ADD:
-                time = action_dict.get("reminder_time")
+                # Notification time is authoritative only when the user stated
+                # it explicitly.  An event/deadline time is passed through to
+                # the timing planner later; it must not silently be treated as
+                # the notification timestamp.
+                event_value = action_dict.get("event_time")
+                notification_value = action_dict.get("notification_time")
+                legacy_value = action_dict.get("reminder_time")
+                semantics = str(action_dict.get("time_semantics") or "unspecified")
+                time = notification_value or event_value or legacy_value
                 subject = action_dict.get("subject")
                 if not time or not subject:
                     res = ActionValidationResult.CLARIFY_MISSING_FIELDS
                 else:
                     res = ActionValidationResult.EXECUTE
-                dt = datetime.fromisoformat(time) if time else None
+                try:
+                    dt = datetime.fromisoformat(str(time)) if time else None
+                    event_dt = datetime.fromisoformat(str(event_value)) if event_value else None
+                except (TypeError, ValueError):
+                    dt = None
+                    event_dt = None
+                    res = ActionValidationResult.CLARIFY_MISSING_FIELDS
+                # Legacy reminder_time has always meant notification time, so
+                # leave it untouched unless the extractor explicitly marked it
+                # as an event time.
+                if event_dt is None and semantics == "event_time" and dt is not None:
+                    event_dt = dt
                 validated.append(ValidatedReminderAction(
                     action=action_type, 
+                    event_time=event_dt,
                     reminder_time=dt, 
                     subject=subject,
                     reminder_summary=action_dict.get("reminder_summary"), 

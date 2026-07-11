@@ -160,6 +160,7 @@ reminders = Table(
     Column("source_topic_id", String, nullable=True),
     Column("source_hop_id", String, nullable=True),
     Column("reminder_time", String, nullable=False),
+    Column("event_time", String, nullable=True),
     Column("raw_reminder", Text, nullable=False),
     Column("reminder_summary", Text, nullable=False),
     Column("subject", String, nullable=False),

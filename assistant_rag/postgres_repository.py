@@ -234,6 +234,8 @@ class PostgresRepository(AssistantRepository):
                     reminders.c.recurrence_timezone,
                     reminders.c.next_fire_time,
                 )
+                # Deliberately global across users. The notification row still
+                # carries the owning user_id and remains access-controlled.
                 .where(and_(reminders.c.status == "scheduled", due_expr <= now_value))
                 .order_by(due_expr)
                 .limit(limit)
@@ -818,6 +820,7 @@ class PostgresRepository(AssistantRepository):
         raw_reminder: str,
         reminder_summary: str,
         subject: str,
+        event_time: str | None = None,
         supporting_question: str | None = None,
         supporting_response: str | None = None,
         user_timezone: str = "UTC",
@@ -836,6 +839,7 @@ class PostgresRepository(AssistantRepository):
                 source_topic_id=source_topic_id,
                 source_hop_id=source_hop_id,
                 reminder_time=reminder_time,
+                event_time=event_time,
                 raw_reminder=raw_reminder,
                 reminder_summary=reminder_summary,
                 subject=subject,
@@ -1293,6 +1297,7 @@ class PostgresRepository(AssistantRepository):
                 source_topic_id=source_topic_id,
                 source_hop_id=audit_hop_id,
                 reminder_time=action.reminder_time.isoformat(),
+                event_time=action.event_time.isoformat() if action.event_time else None,
                 raw_reminder=action.raw_reminder or "",
                 reminder_summary=action.reminder_summary or "",
                 subject=action.subject or "",
@@ -1310,7 +1315,11 @@ class PostgresRepository(AssistantRepository):
                 domain_entity_type="reminder",
                 domain_entity_id=reminder_id,
                 indexing_outbox_ids=(),
-                user_safe_summary=f"Added reminder '{action.subject}'.",
+                user_safe_summary=(
+                    f"Added reminder '{action.subject}'. Notification scheduled for "
+                    f"{action.reminder_time.isoformat()}"
+                    + (f"; event time is {action.event_time.isoformat()}." if action.event_time else ".")
+                ),
             )
 
         if not action.target_reminder_ids:
@@ -1335,6 +1344,7 @@ class PostgresRepository(AssistantRepository):
                 source_topic_id=source_topic_id,
                 source_hop_id=audit_hop_id,
                 reminder_time=replacement_time.isoformat(),
+                event_time=action.event_time.isoformat() if action.event_time else None,
                 raw_reminder=action.raw_reminder or "",
                 reminder_summary=action.replacement_summary or action.reminder_summary or "",
                 subject=action.replacement_subject or action.subject or "",
@@ -1352,7 +1362,10 @@ class PostgresRepository(AssistantRepository):
                 domain_entity_type="reminder",
                 domain_entity_id=new_reminder_id,
                 indexing_outbox_ids=(),
-                user_safe_summary=f"Modified reminder '{action.replacement_subject or action.subject}'.",
+                user_safe_summary=(
+                    f"Modified reminder '{action.replacement_subject or action.subject}'. Notification scheduled for "
+                    f"{replacement_time.isoformat()}."
+                ),
             )
 
         status_by_action = {

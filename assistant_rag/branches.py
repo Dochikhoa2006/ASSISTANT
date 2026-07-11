@@ -67,6 +67,7 @@ from .generation import QuestionGenerationStrategy
 from .branch_orchestration import ValidatedActionBuilder
 from .settings import MutationPartialExecutionPolicy
 from .reminder_safety import ReminderTimeNormalizer, ReminderTimeNormalizationError
+from .reminder_timing import ReminderTimingPlanner
 
 
 def _mutation_clarification_message_key(domain: str, missing_fields: list[str]) -> str:
@@ -180,6 +181,7 @@ def _validated_reminder_from_dict(payload: dict[str, Any]) -> ValidatedReminderA
         observed_version=payload.get("observed_version"),
         observed_reminder_time=_parse_dt(payload.get("observed_reminder_time")),
         subject=payload.get("subject"),
+        event_time=_parse_dt(payload.get("event_time")),
         reminder_time=_parse_dt(payload.get("reminder_time")),
         reminder_summary=payload.get("reminder_summary"),
         raw_reminder=payload.get("raw_reminder"),
@@ -873,6 +875,7 @@ class ReminderBranch:
     retriever: HybridRetriever | None = None
     context_filter: ContextFilter | None = None
     llm: LLMClient | None = None
+    reminder_timing_planner: ReminderTimingPlanner | None = None
 
     def _generate_clarification(self, context: PipelineContext, missing_fields: list[str], ambiguity_reason: str) -> BranchResult:
         question = GeneratedQuestion(
@@ -1004,8 +1007,11 @@ class ReminderBranch:
             updated_action = action
             try:
                 if action.action is ReminderAction.ADD and action.reminder_time:
+                    # A supplied event time is preserved separately.  Only an
+                    # explicit notification time bypasses the timing planner.
+                    source_time = action.event_time or action.reminder_time
                     normalized = normalizer.normalize(
-                        action.reminder_time,
+                        source_time,
                         platform_timezone=action.user_timezone or request_timezone,
                         original_time_text=action.original_time_text
                         or context.request.metadata.get("original_time_text")
@@ -1014,6 +1020,7 @@ class ReminderBranch:
                     updated_action = replace(
                         action,
                         reminder_time=normalized.reminder_time_utc,
+                        event_time=normalized.reminder_time_utc if action.event_time else None,
                         user_timezone=normalized.user_timezone,
                         original_time_text=normalized.original_time_text,
                     )
@@ -1042,6 +1049,48 @@ class ReminderBranch:
                 return self._generate_clarification(context, ["timezone"], str(exc))
             normalized_actions.append(updated_action)
         executable_actions = normalized_actions
+
+        # This is the only place an event time may become a notification time.
+        # Explicit notification timestamps never enter this block and are thus
+        # never moved by an LLM.
+        planned_actions: list[ValidatedReminderAction | dict[str, Any]] = []
+        for action in executable_actions:
+            if not isinstance(action, ValidatedReminderAction):
+                planned_actions.append(action)
+                continue
+            requires_timing_plan = (
+                action.action is ReminderAction.ADD
+                and action.event_time is not None
+                and action.reminder_time == action.event_time
+            )
+            if not requires_timing_plan:
+                planned_actions.append(action)
+                continue
+            planner = self.reminder_timing_planner
+            decision = planner.plan(
+                event_time=action.event_time,
+                subject=action.subject or action.reminder_summary or "event",
+                raw_query=context.request.raw_query,
+                user_timezone=action.user_timezone or self.config.default_timezone,
+            ) if planner else None
+            if decision is None or decision.needs_clarification or decision.notification_time is None:
+                event_text = action.event_time.strftime("%Y-%m-%d %H:%M UTC")
+                question = GeneratedQuestion(
+                    text=(
+                        f"You mentioned '{action.subject or 'this event'}' at {event_text}. "
+                        "How long before it should I notify you?"
+                    ),
+                    source=QuestionSource.CLARIFICATION_QUESTION,
+                    purpose="resolve_critical_reminder_timing",
+                    confidence=1.0,
+                )
+                return BranchResult(
+                    response_type=ResponseType.CLARIFICATION,
+                    clarification_question=question,
+                    warnings=warnings,
+                )
+            planned_actions.append(replace(action, reminder_time=decision.notification_time))
+        executable_actions = planned_actions
 
         if not context.request.metadata.get("confirmation_approved"):
             for action in executable_actions:

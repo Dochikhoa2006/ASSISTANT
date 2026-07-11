@@ -115,7 +115,7 @@ class AssistantRepository(ABC):
         return {}
 
     @abstractmethod
-    def add_reminder(self, cursor: sqlite3.Cursor, *, user_id: str, source_topic_id: str | None, source_hop_id: str | None, reminder_time: str, raw_reminder: str, reminder_summary: str, subject: str, supporting_question: str | None=None, supporting_response: str | None=None, user_timezone: str = "UTC", original_time_text: str | None=None, recurrence_rule: str | None=None, recurrence_timezone: str | None=None, next_fire_time: str | None=None, parent_recurring_reminder_id: str | None=None) -> str:
+    def add_reminder(self, cursor: sqlite3.Cursor, *, user_id: str, source_topic_id: str | None, source_hop_id: str | None, reminder_time: str, raw_reminder: str, reminder_summary: str, subject: str, event_time: str | None=None, supporting_question: str | None=None, supporting_response: str | None=None, user_timezone: str = "UTC", original_time_text: str | None=None, recurrence_rule: str | None=None, recurrence_timezone: str | None=None, next_fire_time: str | None=None, parent_recurring_reminder_id: str | None=None) -> str:
         pass
 
     @abstractmethod

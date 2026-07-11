@@ -26,6 +26,7 @@ from .onnx_llm import ONNXLLMClient
 from .hybrid_llm import HybridLLMClient
 from .pipeline import AssistantPipeline
 from .platform import PlatformSelector
+from .reminder_timing import ReminderTimingPlanner
 from .prompts import DEFAULT_PROMPT_REGISTRY
 from .retrieval import HybridRetriever
 from .reranking import SentenceTransformerCrossEncoderReranker
@@ -322,6 +323,7 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
                 retriever=retriever,
                 context_filter=context_filter,
                 llm=llm,
+                reminder_timing_planner=ReminderTimingPlanner(llm=llm),
             ),
         }
     )

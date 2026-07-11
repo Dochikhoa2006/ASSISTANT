@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from .contracts import ChatRequest, Intent
@@ -68,6 +69,7 @@ class LLMActionDetector:
                         intent=intent.value,
                         metadata=request.metadata,
                         platform_context=request.platform_context,
+                        extra={"current_time_utc": datetime.now(timezone.utc).isoformat()},
                     )
                 ),
                 schema=schema,
@@ -317,6 +319,9 @@ class LLMActionDetector:
             "properties": {
                 "action": {"type": "string", "enum": ["add", "delete", "modify", "turn_on", "turn_off"]},
                 "subject": {"type": "string"},
+                "event_time": {"type": "string"},
+                "notification_time": {"type": "string"},
+                "time_semantics": {"type": "string", "enum": ["event_time", "notification_time", "unspecified"]},
                 "reminder_time": {"type": "string"},
                 "target_description": {"type": "string"},
                 "new_reminder_time": {"type": "string"},
