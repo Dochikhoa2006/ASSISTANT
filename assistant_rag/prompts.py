@@ -255,18 +255,18 @@ class PromptContext:
 
         if self.stage in FAST_ROUTING_STAGES:
             base["metadata"] = _compact_value(_select_keys(self.metadata, FAST_METADATA_KEYS), max_string=metadata_max, max_items=max_items, max_depth=max_depth)
-            base["platform_context"] = _compact_value(_select_keys(self.platform_context, FAST_PLATFORM_KEYS), max_string=platform_max, max_items=max_items, max_depth=max_depth)
+            base["platform_context"] = _compact_value(_redact(_select_keys(self.platform_context, FAST_PLATFORM_KEYS)), max_string=platform_max, max_items=max_items, max_depth=max_depth)
             base["extra"] = _compact_value(_select_keys(self.extra, FAST_EXTRA_KEYS), max_string=extra_max, max_items=max_items, max_depth=max_depth)
             return {k: v for k, v in base.items() if v not in (None, {}, [])}
 
         if self.stage in MUTATION_STAGES or self.stage in RETRIEVAL_VALIDATION_STAGES:
             base["metadata"] = _compact_value(self.metadata, max_string=metadata_max, max_items=max_items, max_depth=max_depth)
-            base["platform_context"] = _compact_value(self.platform_context, max_string=platform_max, max_items=max_items, max_depth=max_depth)
+            base["platform_context"] = _compact_value(_redact(self.platform_context), max_string=platform_max, max_items=max_items, max_depth=max_depth)
             base["extra"] = _compact_value(self.extra, max_string=extra_max, max_items=max_items, max_depth=max_depth)
             return {k: v for k, v in base.items() if v not in (None, {}, [])}
 
         base["metadata"] = _compact_value(self.metadata, max_string=metadata_max, max_items=max_items, max_depth=max_depth)
-        base["platform_context"] = _compact_value(self.platform_context, max_string=platform_max, max_items=max_items, max_depth=max_depth)
+        base["platform_context"] = _compact_value(_redact(self.platform_context), max_string=platform_max, max_items=max_items, max_depth=max_depth)
         base["extra"] = _compact_value(self.extra, max_string=extra_max, max_items=max_items, max_depth=max_depth)
         return {k: v for k, v in base.items() if v not in (None, {}, [])}
 

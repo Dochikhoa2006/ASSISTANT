@@ -106,6 +106,14 @@ class AssistantRepository(ABC):
     def delete_generated_artifact(self, *, user_id: str, artifact_id: str) -> dict[str, Any]:
         pass
 
+    def record_platform_delivery(self, *, user_id: str, conversation_hop_id: str | None, channel: str, status: str, recipient: str, message: dict[str, Any], error_message: str | None = None) -> dict[str, Any]:
+        """Optionally persist safe outbound-delivery metadata.
+
+        Kept as a concrete no-op so existing custom repository implementations
+        remain compatible while SQLite/Postgres provide the audit record.
+        """
+        return {}
+
     @abstractmethod
     def add_reminder(self, cursor: sqlite3.Cursor, *, user_id: str, source_topic_id: str | None, source_hop_id: str | None, reminder_time: str, raw_reminder: str, reminder_summary: str, subject: str, supporting_question: str | None=None, supporting_response: str | None=None, user_timezone: str = "UTC", original_time_text: str | None=None, recurrence_rule: str | None=None, recurrence_timezone: str | None=None, next_fire_time: str | None=None, parent_recurring_reminder_id: str | None=None) -> str:
         pass

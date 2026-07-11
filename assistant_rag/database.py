@@ -273,6 +273,18 @@ class SQLiteRepository(AssistantRepository):
                 status TEXT NOT NULL CHECK (status IN ('created', 'deleted', 'failed'))
             );
 
+            CREATE TABLE IF NOT EXISTS platform_deliveries (
+                delivery_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                conversation_hop_id TEXT NULL,
+                channel TEXT NOT NULL CHECK (channel IN ('gmail', 'zalo', 'telegram')),
+                status TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                message_json TEXT NOT NULL,
+                error_message TEXT NULL,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS indexing_outbox (
                 job_id TEXT PRIMARY KEY,
                 entity_type TEXT NOT NULL CHECK (entity_type IN ('conversation_hop', 'knowledge_chunk')),
@@ -294,6 +306,7 @@ class SQLiteRepository(AssistantRepository):
             CREATE INDEX IF NOT EXISTS idx_sources_user_hash ON knowledge_sources(user_id, content_hash);
             CREATE INDEX IF NOT EXISTS idx_chunks_user_source ON knowledge_chunks(user_id, source_id);
             CREATE INDEX IF NOT EXISTS idx_artifacts_user_status ON generated_artifacts(user_id, status);
+            CREATE INDEX IF NOT EXISTS idx_platform_deliveries_user_created ON platform_deliveries(user_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_reminders_user_status_time ON reminders(user_id, status, reminder_time);
             CREATE INDEX IF NOT EXISTS idx_reminders_user_updated ON reminders(user_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_reminders_user_created ON reminders(user_id, created_at);
@@ -1385,6 +1398,16 @@ class SQLiteRepository(AssistantRepository):
             if cursor.rowcount != 1:
                 raise ValueError("Artifact not found for user")
         return self.get_generated_artifact(user_id=user_id, artifact_id=artifact_id, include_deleted=True)
+
+    def record_platform_delivery(self, *, user_id: str, conversation_hop_id: str | None, channel: str, status: str, recipient: str, message: dict[str, Any], error_message: str | None = None) -> dict[str, Any]:
+        delivery_id = new_id()
+        with self.transaction() as cursor:
+            cursor.execute(
+                """INSERT INTO platform_deliveries (delivery_id, user_id, conversation_hop_id, channel, status, recipient, message_json, error_message, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (delivery_id, user_id, conversation_hop_id, channel, status, recipient, json.dumps(message), error_message, now_iso()),
+            )
+        return {"delivery_id": delivery_id, "channel": channel, "status": status}
 
     def add_reminder(
         self,

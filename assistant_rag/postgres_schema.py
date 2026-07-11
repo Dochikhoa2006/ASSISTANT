@@ -136,6 +136,22 @@ generated_artifacts = Table(
     CheckConstraint("status IN ('created', 'deleted', 'failed')", name="ck_generated_artifacts_status"),
 )
 
+platform_deliveries = Table(
+    "platform_deliveries",
+    metadata,
+    Column("delivery_id", String, primary_key=True),
+    Column("user_id", String, nullable=False),
+    Column("conversation_hop_id", String, nullable=True),
+    Column("channel", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("recipient", String, nullable=False),
+    Column("message_json", Text, nullable=False),
+    Column("error_message", Text, nullable=True),
+    Column("created_at", String, nullable=False),
+    CheckConstraint("channel IN ('gmail', 'zalo', 'telegram')", name="ck_platform_deliveries_channel"),
+)
+Index("idx_platform_deliveries_user_created", platform_deliveries.c.user_id, platform_deliveries.c.created_at)
+
 reminders = Table(
     "reminders",
     metadata,

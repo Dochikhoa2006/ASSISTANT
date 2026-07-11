@@ -797,6 +797,16 @@ class PostgresRepository(AssistantRepository):
                 raise ValueError("Artifact not found for user")
         return self.get_generated_artifact(user_id=user_id, artifact_id=artifact_id, include_deleted=True)
 
+    def record_platform_delivery(self, *, user_id: str, conversation_hop_id: str | None, channel: str, status: str, recipient: str, message: dict[str, Any], error_message: str | None = None) -> dict[str, Any]:
+        delivery_id = new_id()
+        with self.transaction() as cursor:
+            cursor.execute(insert(platform_deliveries).values(
+                delivery_id=delivery_id, user_id=user_id, conversation_hop_id=conversation_hop_id,
+                channel=channel, status=status, recipient=recipient, message_json=json.dumps(message),
+                error_message=error_message, created_at=now_iso(),
+            ))
+        return {"delivery_id": delivery_id, "channel": channel, "status": status}
+
     def add_reminder(
         self,
         cursor: Connection,

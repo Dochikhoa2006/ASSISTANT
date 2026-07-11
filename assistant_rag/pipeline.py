@@ -17,7 +17,7 @@ from .contracts import (
 )
 from .contracts import Intent
 from .last_qa import InMemoryLastQAStore
-from .platform import PlatformSelector
+from .platform import PlatformSelector, PostSelectorHITL
 from .prompts import DEFAULT_PROMPT_REGISTRY, PromptRegistry
 from .retrieval import HybridRetriever
 from .branches import BranchRouter
@@ -41,6 +41,7 @@ class AssistantPipeline:
     bundler: ResponseBundler
     platform_selector: PlatformSelector
     chat_output: ChatOutput
+    post_selector_hitl: PostSelectorHITL = field(default_factory=PostSelectorHITL)
     prompt_registry: PromptRegistry = field(default_factory=lambda: DEFAULT_PROMPT_REGISTRY)
 
     def handle(self, request: ChatRequest, repository: AssistantRepository) -> BundledResponse:
@@ -165,14 +166,54 @@ class AssistantPipeline:
                 rewritten_query=intent_classifier_query,
                 branch_result=branch_result,
             )
-        platform_payload = self.platform_selector.select(bundled, request)
+        platform_state = self.platform_selector.select(bundled, request)
+        # This is the sole user-facing HITL decision point.  The selector only
+        # supplies channel/draft state; it cannot replace a normal HITL question.
+        platform_payload = self.post_selector_hitl.apply(bundled, platform_state)
         from dataclasses import replace
         trace = current_trace()
+        delivery = platform_payload.get("delivery", {})
+        hitl = platform_payload.get("hitl", {})
+        if hitl.get("required"):
+            question = str(hitl["question"])
+            if hitl.get("scope") == "general":
+                final_chat_text = (
+                    f"{bundled.final_chat_text}\n\n{question}".strip()
+                    if hitl.get("append_to_answer", True)
+                    else bundled.final_chat_text
+                )
+            else:
+                final_chat_text = question
+        elif delivery.get("status") == "sent":
+            final_chat_text = f"Sent via {delivery.get('provider', delivery.get('channel', 'platform')).title()} to {delivery.get('recipient', 'the recipient')}."
+        elif delivery.get("status") == "draft_ready":
+            final_chat_text = f"{delivery.get('channel', 'Message').title()} draft is ready for review."
+        else:
+            final_chat_text = bundled.final_chat_text
         bundled = replace(
             bundled,
+            final_chat_text=final_chat_text,
+            last_qa_state=replace(bundled.last_qa_state, last_response=final_chat_text),
             platform_payload=platform_payload,
             trace_summary=trace.summary() if trace else None,
         )
+        # Record delivery metadata separately from the conversation answer. The
+        # record intentionally contains no credential, token, or attachment path.
+        recorder = getattr(repository, "record_platform_delivery", None)
+        if callable(recorder) and delivery.get("channel") not in (None, "none"):
+            try:
+                recorder(
+                    user_id=request.user_id,
+                    conversation_hop_id=bundled.conversation_hop_id,
+                    channel=str(delivery.get("channel")),
+                    status=str(delivery.get("status", "unknown")),
+                    recipient=str(delivery.get("recipient") or bundled.platform_payload.get("draft", {}).get("recipient") or ""),
+                    message=bundled.platform_payload.get("draft", {}),
+                    error_message=str(bundled.platform_payload.get("hitl", {}).get("question") or "") if delivery.get("status") in {"failed", "needs_input"} else None,
+                )
+            except Exception:
+                # Delivery history must not hide a completed send or response.
+                pass
         self.last_qa_store.save(request.user_id, bundled.last_qa_state)
         self.chat_output.emit(bundled)
         return bundled

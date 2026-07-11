@@ -349,7 +349,7 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
         router=router,
         context_filter=context_filter,
         bundler=ResponseBundler(prompt_registry),
-        platform_selector=PlatformSelector(),
+        platform_selector=PlatformSelector(llm=llm),
         chat_output=ChatOutput(),
         prompt_registry=prompt_registry,
     )
