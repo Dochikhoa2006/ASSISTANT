@@ -15,7 +15,6 @@ from .llm import (
     LLMTask,
     ModelDecision,
     OllamaModelRouter,
-    _structured_attempt_format,
     _structured_attempt_plan,
     _structured_attempt_prompt,
     parse_json_object,
@@ -127,6 +126,23 @@ def _sentence_boundary_stop_reason(text: str, generated_tokens: int, max_new_tok
         return None
     return "complete_sentence_after_budget_floor"
 
+
+def _is_non_retryable_model_error(exc: Exception) -> bool:
+    """Return true for model-resolution failures a JSON retry cannot repair."""
+    message = str(exc).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "repository not found",
+            "revision not found",
+            "404 client error",
+            "401 client error",
+            "403 client error",
+            "gated repo",
+        )
+    )
+
+
 class ONNXLLMClient:
     def __init__(self, router: OllamaModelRouter, cache_dir: str = ".onnx_models", *, preload: bool = False):
         self.router = router
@@ -152,7 +168,7 @@ class ONNXLLMClient:
             variant_folder = "cpu_and_mobile/cpu-int4-rtn-block-32-acc-level-4"
             model_path = os.path.join(self.cache_dir, model_name.replace("/", "_"))
             exact_path = os.path.join(model_path, variant_folder)
-            if not os.path.exists(os.path.join(exact_path, "genai_config.json")):
+            if not os.path.exists(os.path.join(exact_path, "model.onnx.data")):
                 logger.info("Downloading ONNX model %s variant %s from Hugging Face...", model_name, variant_folder)
                 model_path = snapshot_download(
                     model_name,
@@ -268,12 +284,6 @@ class ONNXLLMClient:
                     schema=schema,
                     mode=attempt_mode,
                 )
-                if attempt_mode == "schema":
-                    attempt_prompt = (
-                        f"{attempt_prompt}\n\n"
-                        "Return only valid JSON for this schema:\n"
-                        f"{json.dumps(_structured_attempt_format(schema, attempt_mode), separators=(',', ':'))}"
-                    )
                 response = self._generate(task, system_prompt, attempt_prompt, decision)
                 payload = parse_json_object(response)
                 validate_json_schema(payload, schema)
@@ -298,6 +308,13 @@ class ONNXLLMClient:
                     attempt_mode,
                     exc,
                 )
+                if _is_non_retryable_model_error(exc):
+                    logger.debug(
+                        "Stopping ONNX JSON retries for task %s because model resolution cannot succeed: %s",
+                        task.value,
+                        exc,
+                    )
+                    break
 
         GLOBAL_METRICS.increment("llm_failures_total", task=task.value)
         payload = structured_fallback_payload(

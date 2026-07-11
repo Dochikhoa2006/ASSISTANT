@@ -13,6 +13,7 @@ from assistant_rag.branch_orchestration import (
     ReminderTargetResolver,
     ValidatedActionBuilder,
 )
+from assistant_rag.action_detection import LLMActionDetector
 from assistant_rag.branches import (
     BranchRouter,
     ClarificationBranch,
@@ -21,7 +22,7 @@ from assistant_rag.branches import (
     ReminderBranch,
 )
 from assistant_rag.bundler import ChatOutput, ResponseBundler
-from assistant_rag.classification import LastQAResolver, QueryRewriter
+from assistant_rag.classification import LLMLastQAResolver, LastQAResolver, QueryRewriter, can_skip_broad_retrieval
 from assistant_rag.config import GeneralPurposeConfig
 from assistant_rag.context_filter import HardRuleContextFilter, TwoLayerContextFilter
 from assistant_rag.content_composer import AnswerGenerationTool, ContentToolRegistry, ReActContentComposer
@@ -31,7 +32,9 @@ from assistant_rag.contracts import (
     ExpectedResponseType,
     GeneratedQuestion,
     Intent,
+    LastQAInteractionType,
     LastQAState,
+    PipelineContext,
     QuestionSource,
     ResponseType,
     RetrievalResult,
@@ -41,8 +44,10 @@ from assistant_rag.hybrid_llm import HybridLLMClient
 from assistant_rag.last_qa import InMemoryLastQAStore
 from assistant_rag.llm import (
     LLMTask,
+    OllamaIntentClassifier,
     OllamaLLMClient,
     OllamaModelRouter,
+    _structured_attempt_prompt,
     structured_fallback_payload,
     uses_onnx_runtime,
     validate_json_schema,
@@ -796,6 +801,10 @@ def scenario_structured_clarification_fallback_policy(settings: ProductionSettin
         raise AssertionError("human supporting-question JSON generation needs enough token budget")
     if default_settings.ollama.num_predict_generate_reminder_supporting < 160:
         raise AssertionError("reminder supporting-question JSON generation needs enough token budget")
+    if default_settings.ollama.temperature_generate_clarification != 0.0:
+        raise AssertionError("clarification JSON generation must use deterministic sampling")
+    if default_settings.ollama.model_generate_clarification_fallback != "qwen3.5:4b":
+        raise AssertionError("clarification generation needs an Ollama recovery model")
 
     schema = {
         "type": "object",
@@ -835,6 +844,382 @@ def scenario_structured_clarification_fallback_policy(settings: ProductionSettin
         True,
         "clarification structured fallback is schema-valid, registry-backed, and budgeted",
     )
+
+
+def scenario_mutation_clarification_fast_path(settings: ProductionSettings) -> ScenarioResult:
+    """Predictable mutation gaps must not spend latency on planning or question LLMs."""
+    state = build_scenario_state(settings)
+
+    class LowConfidenceDetector:
+        def __init__(self, missing_fields: list[str]) -> None:
+            self.missing_fields = missing_fields
+
+        def detect(self, *_: Any, **__: Any) -> Any:
+            return type(
+                "Detection",
+                (),
+                {"requires_clarification": True, "missing_fields": self.missing_fields, "metadata": {}},
+            )()
+
+    class MustNotRun:
+        def chat(self, **_: Any) -> str:
+            raise AssertionError("unused action planning LLM was invoked")
+
+        def generate(self, *_: Any, **__: Any) -> GeneratedQuestion:
+            raise AssertionError("predictable mutation clarification invoked question generation")
+
+    knowledge_branch = KnowledgeFactsBranch(
+        config=state.pipeline.config,
+        action_detector=LowConfidenceDetector(["low_confidence_action_detection"]),
+        clarification_strategy=MustNotRun(),
+        prompt_registry=DEFAULT_PROMPT_REGISTRY,
+        llm=MustNotRun(),
+    )
+    knowledge_result = knowledge_branch.execute(
+        PipelineContext(
+            request=ChatRequest(user_id=state.user_id, raw_query="Remember something important."),
+            rewritten_query="Remember something important.",
+            last_qa_state=None,
+            conversation_results=[],
+            intent=Intent.KNOWLEDGE_FACTS,
+        ),
+        state.repository,
+    )
+    reminder_branch = ReminderBranch(
+        config=state.pipeline.config,
+        action_detector=LowConfidenceDetector(["reminder_time"]),
+        clarification_strategy=MustNotRun(),
+        prompt_registry=DEFAULT_PROMPT_REGISTRY,
+        llm=MustNotRun(),
+    )
+    reminder_result = reminder_branch.execute(
+        PipelineContext(
+            request=ChatRequest(user_id=state.user_id, raw_query="Remind me to call the bank."),
+            rewritten_query="Remind me to call the bank.",
+            last_qa_state=None,
+            conversation_results=[],
+            intent=Intent.REMINDER,
+        ),
+        state.repository,
+    )
+    if knowledge_result.clarification_question is None or knowledge_result.clarification_question.text != DEFAULT_PROMPT_REGISTRY.message("knowledge_missing_action"):
+        raise AssertionError(f"knowledge fast clarification was not deterministic: {knowledge_result}")
+    if reminder_result.clarification_question is None or reminder_result.clarification_question.text != DEFAULT_PROMPT_REGISTRY.message("reminder_missing_time"):
+        raise AssertionError(f"reminder fast clarification did not request time: {reminder_result}")
+    return ScenarioResult("mutation_clarification_fast_path", True, "predictable mutation gaps skip unused action planning and LLM question generation")
+
+
+def scenario_state_mutation_preflight_bypass(settings: ProductionSettings) -> ScenarioResult:
+    """Current state mutations must not consult stale Last-QA or broad conversation retrieval."""
+    class MustNotResolveLastQA:
+        def resolve(self, *_: Any, **__: Any) -> Any:
+            raise AssertionError("state mutation invoked Last-QA resolution")
+
+    state = build_scenario_state(settings)
+    state.pipeline.last_qa_resolver = MustNotResolveLastQA()
+    response = run_request(
+        state,
+        "Store the current project retention policy.",
+        metadata={
+            "intent": Intent.KNOWLEDGE_FACTS.value,
+            "knowledge_actions": [{"action": "add", "text": "The project retention policy is current."}],
+        },
+    )
+    assert_response(response, ResponseType.KNOWLEDGE_ACTION, "Added new knowledge")
+    if state.retriever.conversation_calls:
+        raise AssertionError("state mutation invoked broad conversation retrieval")
+    if response.last_qa_state.response_type is not ResponseType.KNOWLEDGE_ACTION:
+        raise AssertionError("state mutation did not preserve its knowledge branch")
+    return ScenarioResult("state_mutation_preflight_bypass", True, "state mutations bypass stale Last-QA and conversation retrieval")
+
+
+def scenario_model_backed_action_extraction(settings: ProductionSettings) -> ScenarioResult:
+    """Mutation content must come from the configured semantic extractor, not lexical shortcuts."""
+    class ScriptedActionLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_json(self, **_: Any) -> dict[str, Any]:
+            self.calls += 1
+            return {
+                "intent": Intent.KNOWLEDGE_FACTS.value,
+                "confidence": 0.96,
+                "knowledge_actions": [
+                    {
+                        "action": "add",
+                        "text": "The weekly release note should include operational risks.",
+                        "confidence": 0.96,
+                    }
+                ],
+                "reminder_actions": [],
+                "missing_fields": [],
+                "risk_flags": [],
+                "normalized_entities": {},
+            }
+
+    llm = ScriptedActionLLM()
+    detector = LLMActionDetector(llm)
+    result = detector.detect(
+        ChatRequest(
+            user_id=DEBUG_USER,
+            raw_query="Keep this as a durable project fact: the weekly release note should include operational risks.",
+        ),
+        "Keep this as a durable project fact: the weekly release note should include operational risks.",
+        Intent.KNOWLEDGE_FACTS,
+    )
+    actions = result.metadata.get("knowledge_actions") or []
+    if llm.calls != 1:
+        raise AssertionError(f"action extraction bypassed its configured semantic model: {llm.calls} calls")
+    if len(actions) != 1 or actions[0].get("text") != "The weekly release note should include operational risks.":
+        raise AssertionError(f"action extraction did not preserve the model-extracted fact: {actions}")
+    if result.requires_clarification:
+        raise AssertionError(f"complete model action was incorrectly sent to clarification: {result}")
+    required_rule = "The selected branch is authoritative; never reclassify it."
+    if required_rule not in DEFAULT_PROMPT_REGISTRY.system("action_detection"):
+        raise AssertionError("action-detection prompt lost its selected-branch rule")
+    schema = detector._schema(Intent.KNOWLEDGE_FACTS)
+    if "intent" in schema["properties"] or "reminder_actions" in schema["properties"]:
+        raise AssertionError("knowledge extraction schema must contain only the selected branch contract")
+    malformed_action = {
+        "confidence": 0.96,
+        "knowledge_actions": [{"action": "persist"}],
+        "missing_fields": [],
+        "risk_flags": [],
+        "normalized_entities": {},
+    }
+    try:
+        validate_json_schema(malformed_action, schema)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("nested unsupported action values must fail structured validation")
+    return ScenarioResult("model_backed_action_extraction", True, "complete knowledge content is extracted by the configured semantic model")
+
+
+def scenario_knowledge_action_recovery(settings: ProductionSettings) -> ScenarioResult:
+    """A failed first extraction may recover only through the same semantic action contract."""
+    class RecoveryLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_json(self, **_: Any) -> dict[str, Any]:
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "confidence": 0.0,
+                    "knowledge_actions": [],
+                    "missing_fields": ["target_description"],
+                    "risk_flags": ["ambiguous"],
+                }
+            if self.calls == 2:
+                return {"operation": "add"}
+            return {"text": "Archived records use a reversible lifecycle."}
+
+    llm = RecoveryLLM()
+    result = LLMActionDetector(llm).detect(
+        ChatRequest(user_id=DEBUG_USER, raw_query="Store the archival lifecycle policy."),
+        "Store the archival lifecycle policy.",
+        Intent.KNOWLEDGE_FACTS,
+    )
+    actions = result.metadata.get("knowledge_actions") or []
+    if llm.calls != 3 or result.requires_clarification or actions != [{"action": "add", "text": "Archived records use a reversible lifecycle."}]:
+        raise AssertionError(f"knowledge extraction recovery failed: calls={llm.calls}, result={result}")
+    if "outer storage operation" not in DEFAULT_PROMPT_REGISTRY.system("knowledge_operation_recovery"):
+        raise AssertionError("knowledge recovery prompt lost its outer-operation rule")
+    return ScenarioResult("knowledge_action_recovery", True, "failed knowledge extraction recovers through a bounded semantic retry")
+
+
+def scenario_sql_backed_knowledge_lookup(settings: ProductionSettings) -> ScenarioResult:
+    """Explicit lookups must see active user-owned SQL facts before derived indexes catch up."""
+    class LookupDetector:
+        def detect(self, *_: Any, **__: Any) -> Any:
+            return type(
+                "LookupDetection",
+                (),
+                {
+                    "metadata": {"knowledge_lookup": True},
+                    "requires_clarification": False,
+                    "missing_fields": [],
+                },
+            )()
+
+    state = build_scenario_state(settings)
+    fact = "The stored infrastructure locality preference is Tokyo."
+    seed_knowledge(state, title="Infrastructure preference", text=fact)
+    state.pipeline.router.branches[Intent.KNOWLEDGE_FACTS].action_detector = LookupDetector()
+    response = run_request(
+        state,
+        "What is the stored infrastructure locality preference?",
+        metadata={"intent": Intent.KNOWLEDGE_FACTS.value},
+    )
+    if response.response_type is not ResponseType.NORMAL or response.final_chat_text != fact:
+        raise AssertionError(f"SQL-backed lookup did not return the exact stored fact: {response}")
+    if state.retriever.knowledge_calls:
+        raise AssertionError("explicit SQL-backed lookup incorrectly required derived knowledge retrieval")
+    return ScenarioResult("sql_backed_knowledge_lookup", True, "active user-owned SQL knowledge is returned exactly before index catch-up")
+
+
+def scenario_general_sql_knowledge_fallback(settings: ProductionSettings) -> ScenarioResult:
+    """General factual questions must fall back to SQL when derived knowledge retrieval is empty."""
+    state = build_scenario_state(settings)
+    fact = "The deployment preference for the assistant backend is Tokyo."
+    seed_knowledge(state, title="Deployment preference", text=fact)
+    state.retriever.retrieve_knowledge = lambda **_: []  # type: ignore[method-assign]
+    response = run_request(
+        state,
+        "What is the deployment preference for the assistant backend?",
+    )
+    if response.response_type is not ResponseType.NORMAL or response.final_chat_text != fact:
+        raise AssertionError(f"general SQL fallback did not return the exact stored fact: {response}")
+    return ScenarioResult("general_sql_knowledge_fallback", True, "general factual lookup falls back to active user-owned SQL knowledge")
+
+
+def scenario_model_backed_knowledge_update(settings: ProductionSettings) -> ScenarioResult:
+    """A complete update instruction must retain both its target and replacement."""
+    class ScriptedUpdateLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_json(self, **_: Any) -> dict[str, Any]:
+            self.calls += 1
+            return {
+                "confidence": 0.97,
+                "knowledge_actions": [
+                    {
+                        "action": "modify",
+                        "target_description": "primary data store",
+                        "replacement_text": "The primary data store is the production source of truth.",
+                    }
+                ],
+                "missing_fields": [],
+                "risk_flags": [],
+            }
+
+    llm = ScriptedUpdateLLM()
+    detector = LLMActionDetector(llm)
+    request = ChatRequest(user_id=DEBUG_USER, raw_query="Update the primary data-store policy to the new source-of-truth statement.")
+    result = detector.detect(request, request.raw_query, Intent.KNOWLEDGE_FACTS)
+    actions = result.metadata.get("knowledge_actions") or []
+    if llm.calls != 1 or result.requires_clarification:
+        raise AssertionError(f"complete update was not accepted by action extraction: {result}")
+    expected = {
+        "action": "modify",
+        "target_description": "primary data store",
+        "replacement_text": "The primary data store is the production source of truth.",
+    }
+    if len(actions) != 1 or any(actions[0].get(key) != value for key, value in expected.items()):
+        raise AssertionError(f"update extraction lost target or replacement: {actions}")
+
+    state = build_scenario_state(settings)
+    seed_knowledge(state, title="Data policy", text="The primary data store is under review.")
+    response = run_request(
+        state,
+        request.raw_query,
+        metadata={"intent": Intent.KNOWLEDGE_FACTS.value, "knowledge_actions": actions},
+    )
+    assert_response(response, ResponseType.KNOWLEDGE_ACTION, "confirm")
+    if not response.actions_pending_confirmation:
+        raise AssertionError("validated knowledge update must require confirmation before writing")
+    return ScenarioResult("model_backed_knowledge_update", True, "complete updates preserve target and replacement, then require confirmation")
+
+
+def scenario_clarification_schema_echo_recovery(settings: ProductionSettings) -> ScenarioResult:
+    """Question generation must request data instances, never induce schema copying."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "question_text": {"type": "string"},
+            "question_source": {"type": "string"},
+            "purpose": {"type": "string"},
+            "confidence": {"type": "number"},
+            "should_ask": {"type": "boolean"},
+            "expected_response_type": {"type": "string", "enum": [e.value for e in ExpectedResponseType]},
+            "reason_summary": {"type": "string"},
+        },
+        "required": [
+            "question_text",
+            "question_source",
+            "purpose",
+            "confidence",
+            "should_ask",
+            "expected_response_type",
+            "reason_summary",
+        ],
+    }
+    system_prompt = DEFAULT_PROMPT_REGISTRY.system("question_generation")
+    if "Never return, describe, or copy a JSON Schema." not in system_prompt:
+        raise AssertionError("question-generation prompt does not forbid schema echoes")
+    repair_prompt = _structured_attempt_prompt(
+        user_prompt='Runtime context:\n{"stage":"generate_clarification"}',
+        schema=schema,
+        mode="schema",
+    )
+    if "not a JSON Schema" not in repair_prompt or '"properties"' in repair_prompt:
+        raise AssertionError(f"schema retry prompt is still likely to trigger a schema echo: {repair_prompt}")
+
+    default_settings = ProductionSettings()
+    onnx_settings = replace(
+        default_settings.ollama,
+        model_generate_clarification="microsoft/Phi-4-mini-instruct-onnx",
+    )
+    router = OllamaModelRouter(onnx_settings)
+    onnx_client = ONNXLLMClient(router)
+    prompts: list[str] = []
+    valid_payload_text = '{"question_text":"Which preference should I update?","question_source":"clarification_question","purpose":"resolve_missing_info","confidence":0.95,"should_ask":true,"expected_response_type":"free_text_answer","reason_summary":"missing target"}'
+    responses = [
+        '{"type":"object","properties":{}}',
+        valid_payload_text,
+    ]
+
+    def scripted_generate(task: LLMTask, system_prompt: str, user_prompt: str, decision: Any) -> str:
+        prompts.append(user_prompt)
+        return responses.pop(0)
+
+    onnx_client._generate = scripted_generate  # type: ignore[method-assign]
+    payload = onnx_client.generate_json(
+        task=LLMTask.GENERATE_CLARIFICATION,
+        system_prompt=system_prompt,
+        user_prompt='Runtime context:\n{"stage":"generate_clarification"}',
+        schema=schema,
+    )
+    if payload["question_text"] != "Which preference should I update?" or len(prompts) != 2:
+        raise AssertionError(f"ONNX correction retry did not recover the clarification data: {payload}, prompts={len(prompts)}")
+    if any('"properties"' in prompt for prompt in prompts):
+        raise AssertionError("ONNX clarification retry received the full JSON Schema")
+
+    ollama_client = OllamaLLMClient(onnx_settings, router)
+    fallback_onnx = ONNXLLMClient(router)
+    hybrid = HybridLLMClient(ollama_client, fallback_onnx)
+    def failed_onnx(**_: Any) -> dict[str, Any]:
+        fallback_onnx.last_error_by_task[LLMTask.GENERATE_CLARIFICATION] = "structured_fallback_used_after_2_failures: schema echo"
+        return structured_fallback_payload(
+            task=LLMTask.GENERATE_CLARIFICATION,
+            schema=schema,
+            user_prompt='Runtime context:\n{}',
+            error=ValueError("schema echo"),
+        )
+
+    fallback_onnx.generate_json = failed_onnx  # type: ignore[method-assign]
+    fallback_calls: list[dict[str, Any]] = []
+
+    def successful_ollama(**kwargs: Any) -> str:
+        fallback_calls.append(kwargs)
+        return valid_payload_text
+
+    ollama_client._chat_raw = successful_ollama  # type: ignore[method-assign]
+    recovered = hybrid.generate_json(
+        task=LLMTask.GENERATE_CLARIFICATION,
+        system_prompt=system_prompt,
+        user_prompt='Runtime context:\n{}',
+        schema=schema,
+    )
+    if recovered["question_text"] != "Which preference should I update?":
+        raise AssertionError(f"clarification recovery returned fallback data: {recovered}")
+    if not fallback_calls or fallback_calls[0].get("model_override") != onnx_settings.model_generate_clarification_fallback:
+        raise AssertionError(f"clarification recovery used the wrong fallback model: {fallback_calls}")
+    if LLMTask.GENERATE_CLARIFICATION in hybrid.last_error_by_task:
+        raise AssertionError(f"recovered clarification error leaked as active: {hybrid.last_error_by_task}")
+    return ScenarioResult("clarification_schema_echo_recovery", True, "clarification retries use data instances and recover through Ollama when ONNX cannot")
 
 
 def scenario_content_composer_react_structured_policy(settings: ProductionSettings) -> ScenarioResult:
@@ -913,20 +1298,20 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
     default_settings = ProductionSettings()
     router = OllamaModelRouter(default_settings.ollama)
     expected_models = {
-        LLMTask.QUERY_REWRITE: "microsoft/Phi-4-mini-instruct-onnx",
-        LLMTask.LAST_QA: "qwen3.5:2b",
-        LLMTask.INTENT: "qwen3.5:2b",
-        LLMTask.ACTION_EXTRACTION: "qwen3.5:2b",
-        LLMTask.GENERATE_CLARIFICATION: "microsoft/Phi-4-mini-instruct-onnx",
-        LLMTask.GENERATE_HUMAN_SUPPORTING: "qwen3.5:2b",
-        LLMTask.GENERATE_REMINDER_SUPPORTING: "microsoft/Phi-4-mini-instruct-onnx",
-        LLMTask.CLARIFICATION_MERGE: "qwen3.5:2b",
+        LLMTask.QUERY_REWRITE: "qwen3.5:4b",
+        LLMTask.LAST_QA: "qwen3.5:4b",
+        LLMTask.INTENT: "qwen3.5:4b",
+        LLMTask.ACTION_EXTRACTION: "qwen3.5:4b",
+        LLMTask.GENERATE_CLARIFICATION: "qwen3.5:4b",
+        LLMTask.GENERATE_HUMAN_SUPPORTING: "qwen3.5:4b",
+        LLMTask.GENERATE_REMINDER_SUPPORTING: "qwen3.5:4b",
+        LLMTask.CLARIFICATION_MERGE: "qwen3.5:4b",
         LLMTask.ANSWER: "microsoft/Phi-4-mini-instruct-onnx",
         LLMTask.WRITING: "microsoft/Phi-4-mini-instruct-onnx",
-        LLMTask.RISKY_ACTION: "qwen3.5:2b",
+        LLMTask.RISKY_ACTION: "qwen3.5:4b",
         LLMTask.RETRIEVAL_VALIDATION: "microsoft/Phi-4-mini-instruct-onnx",
-        LLMTask.GENERAL_SUB_BRANCH_DETECTION: "qwen3.5:2b",
-        LLMTask.CONTENT_COMPOSER_REACT: "qwen3.5:2b",
+        LLMTask.GENERAL_SUB_BRANCH_DETECTION: "qwen3.5:4b",
+        LLMTask.CONTENT_COMPOSER_REACT: "qwen3.5:4b",
         LLMTask.ACTION_PLANNING: "microsoft/Phi-4-mini-instruct-onnx",
     }
     actual_models = {task: router.model_for_task(task) for task in expected_models}
@@ -1014,7 +1399,7 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
     }
     if policy_mismatches:
         raise AssertionError(f"policy default mismatches: {policy_mismatches}")
-    if default_settings.prompt_policy.risky_action_operations != ("delete", "modify", "turn_off"):
+    if default_settings.prompt_policy.risky_action_operations != ("delete", "turn_off"):
         raise AssertionError(f"risky action operations mismatch: {default_settings.prompt_policy.risky_action_operations}")
     if not default_settings.retrieval_validation.reminder_llm_validation_enabled:
         raise AssertionError("reminder LLM validation should be enabled by default")
@@ -1026,12 +1411,18 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         raise AssertionError(f"embedding model mismatch: {default_settings.embeddings.model_name}")
     if router.decision_for_task(LLMTask.ANSWER).num_ctx != default_settings.ollama.num_ctx_answer:
         raise AssertionError("answer task should use writing context window")
+    if default_settings.ollama.model_intent != "qwen3.5:4b":
+        raise AssertionError("intent must use the validated semantic routing model")
+    if default_settings.ollama.model_intent_fallback != "qwen3.5:4b":
+        raise AssertionError("intent must have a non-ONNX recovery model")
+    if default_settings.ollama.preload_onnx_models:
+        raise AssertionError("ONNX model preloading must remain opt-in")
 
     expected_timeouts = {
         LLMTask.QUERY_REWRITE: 12.0,
         LLMTask.LAST_QA: 18.0,
-        LLMTask.INTENT: 30.0,
-        LLMTask.ACTION_EXTRACTION: 30.0,
+        LLMTask.INTENT: 20.0,
+        LLMTask.ACTION_EXTRACTION: 24.0,
         LLMTask.RISKY_ACTION: 35.0,
         LLMTask.RETRIEVAL_VALIDATION: 35.0,
         LLMTask.ANSWER: 75.0,
@@ -1045,6 +1436,240 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
     if timeout_mismatches:
         raise AssertionError(f"LLM timeout mismatches: {timeout_mismatches}")
     return ScenarioResult("model_routing_policy", True, "LLM task routing, retrieval, action, context, and worker defaults match policy")
+
+
+def scenario_intent_branch_ownership_policy(settings: ProductionSettings) -> ScenarioResult:
+    """State commands must retain their branch; clarification is context-bound."""
+    class ScriptedIntentLLM:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self.payload = payload
+            self.calls = 0
+
+        def generate_json(self, **_: Any) -> dict[str, Any]:
+            self.calls += 1
+            return dict(self.payload)
+
+    def classify(
+        query: str,
+        payload: dict[str, Any],
+        *,
+        resolution: Any = None,
+    ) -> tuple[Intent, int]:
+        kind_for_intent = {
+            Intent.KNOWLEDGE_FACTS.value: "durable_knowledge",
+            Intent.REMINDER.value: "reminder_lifecycle",
+            Intent.CLARIFICATION.value: "clarification_reply",
+            Intent.GENERAL_RESPONSE.value: "none",
+        }
+        payload = {
+            **payload,
+            "operation_kind": payload.get("operation_kind") or kind_for_intent[payload["intent"]],
+        }
+        llm = ScriptedIntentLLM(payload)
+        intent = OllamaIntentClassifier(llm).classify(
+            ChatRequest(user_id=DEBUG_USER, raw_query=query),
+            query,
+            last_qa_resolution=resolution,
+        )
+        return intent, llm.calls
+
+    knowledge, knowledge_calls = classify(
+        "Keep a durable note that weekly reports should be concise.",
+        {"intent": "knowledge_facts", "confidence": 1.0, "multi_intent": False, "requires_clarification": False},
+    )
+    reminder, reminder_calls = classify(
+        "Remind me tomorrow at 9 AM to submit expenses.",
+        {"intent": "reminder", "confidence": 1.0, "multi_intent": False, "requires_clarification": False},
+    )
+    ordinary_save, ordinary_save_calls = classify(
+        "Save my file as quarterly_report.pdf.",
+        {"intent": "general_response", "confidence": 1.0, "multi_intent": False, "requires_clarification": False},
+    )
+    conversational_reminder, conversational_reminder_calls = classify(
+        "Remind me what I said about the deployment plan.",
+        {"intent": "general_response", "confidence": 1.0, "multi_intent": False, "requires_clarification": False},
+    )
+    durable_kind_wins, _ = classify(
+        "Retain the deployment preference for future use.",
+        {"intent": "reminder", "operation_kind": "durable_knowledge", "confidence": 1.0},
+    )
+    model_knowledge, _ = classify(
+        "Keep a durable note that the Atlas project uses PostgreSQL.",
+        {"intent": "knowledge_facts", "confidence": 0.96, "multi_intent": False, "requires_clarification": True},
+    )
+    general, _ = classify(
+        "Explain the tradeoffs between PostgreSQL and SQLite.",
+        {"intent": "general_response", "confidence": 0.96, "multi_intent": True, "requires_clarification": True},
+    )
+    ungrounded_clarification, _ = classify(
+        "Help me organize my project notes.",
+        {"intent": "clarification", "confidence": 0.98, "multi_intent": False, "requires_clarification": True},
+    )
+    pending_question = GeneratedQuestion(
+        text="Which saved preference should I replace?",
+        source=QuestionSource.CLARIFICATION_QUESTION,
+        purpose="resolve_missing_info",
+        confidence=1.0,
+    )
+    pending_resolution = type(
+        "PendingClarificationResolution",
+        (),
+        {
+            "state": LastQAState(
+                last_user_query="Update my preference",
+                last_response="Which saved preference should I replace?",
+                response_type=ResponseType.CLARIFICATION,
+                clarification_question=pending_question,
+            )
+        },
+    )()
+    grounded_clarification, _ = classify(
+        "The concise-report preference.",
+        {"intent": "clarification", "confidence": 0.98, "multi_intent": False, "requires_clarification": True},
+        resolution=pending_resolution,
+    )
+
+    expected = {
+        "explicit knowledge": knowledge,
+        "explicit reminder": reminder,
+        "ordinary file save": ordinary_save,
+        "conversational remind-me question": conversational_reminder,
+        "durable operation kind wins over a conflicting label": durable_kind_wins,
+        "model-selected knowledge with missing fields": model_knowledge,
+        "general request despite advisory flags": general,
+        "ungrounded clarification": ungrounded_clarification,
+        "grounded clarification": grounded_clarification,
+    }
+    wanted = {
+        "explicit knowledge": Intent.KNOWLEDGE_FACTS,
+        "explicit reminder": Intent.REMINDER,
+        "ordinary file save": Intent.GENERAL_RESPONSE,
+        "conversational remind-me question": Intent.GENERAL_RESPONSE,
+        "durable operation kind wins over a conflicting label": Intent.KNOWLEDGE_FACTS,
+        "model-selected knowledge with missing fields": Intent.KNOWLEDGE_FACTS,
+        "general request despite advisory flags": Intent.GENERAL_RESPONSE,
+        "ungrounded clarification": Intent.GENERAL_RESPONSE,
+        "grounded clarification": Intent.CLARIFICATION,
+    }
+    wrong = {label: {"expected": wanted[label].value, "actual": actual.value} for label, actual in expected.items() if actual != wanted[label]}
+    if wrong:
+        raise AssertionError(f"intent branch ownership regressed: {wrong}")
+    if any(calls != 1 for calls in (knowledge_calls, reminder_calls, ordinary_save_calls, conversational_reminder_calls)):
+        raise AssertionError("intent routing must use the configured semantic classifier for every request")
+
+    prompt = DEFAULT_PROMPT_REGISTRY.system("intent_classifier")
+    required_prompt_rules = (
+        "Choose operation_kind before intent; intent must agree with it.",
+        "durable_knowledge means the user asks to retain, inspect, change, or remove",
+        "reminder_lifecycle means the user asks to create, inspect, change, or remove a scheduled future notification.",
+        "a new request is never clarification.",
+    )
+    missing_rules = [rule for rule in required_prompt_rules if rule not in prompt]
+    if missing_rules:
+        raise AssertionError(f"intent prompt lost required routing rules: {missing_rules}")
+    if "multi_intent" in DEFAULT_PROMPT_REGISTRY.system("intent_classifier"):
+        raise AssertionError("intent prompt must not request unused multi_intent output")
+    return ScenarioResult("intent_branch_ownership_policy", True, "knowledge, reminders, general requests, and clarification follow semantic branch-ownership rules")
+
+
+def scenario_last_qa_relationship_policy(settings: ProductionSettings) -> ScenarioResult:
+    """Only evidence-backed Last-QA relationships may bypass broad retrieval."""
+    config = build_assistant_config(ProductionSettings()).last_qa
+    supporting_question = GeneratedQuestion(
+        text="Which report format do you prefer?",
+        source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+        purpose="optional_context",
+        confidence=1.0,
+    )
+    state = LastQAState(
+        last_user_query="Create the weekly report.",
+        last_response="I can prepare it. Which report format do you prefer?",
+        response_type=ResponseType.NORMAL,
+        supporting_questions=[supporting_question],
+        linked_topic_id="topic-last-qa",
+        linked_hop_id="hop-last-qa",
+    )
+    standard = {
+        "confidence": 0.95,
+        "llm_suggested_skip_broad_retrieval": True,
+    }
+    request = ChatRequest(user_id=DEBUG_USER, raw_query="Use PDF.")
+    supporting = {
+        **standard,
+        "question_source": QuestionSource.HUMAN_SUPPORTING_QUESTION.value,
+        "matched_question": supporting_question.text,
+    }
+    forged_supporting = {**supporting, "matched_question": "What output format should I use?"}
+    normal = {
+        **standard,
+        "question_source": QuestionSource.NONE.value,
+        "matched_question": "",
+    }
+    normal_with_question = {**normal, "matched_question": supporting_question.text}
+    reminder_request = ChatRequest(
+        user_id=DEBUG_USER,
+        raw_query="Done.",
+        metadata={
+            "reminder_id": "reminder-1",
+            "notification_id": "notification-1",
+            "source_topic_id": "topic-reminder",
+            "source_hop_id": "hop-reminder",
+        },
+    )
+    reminder = {**normal}
+
+    checks = {
+        "exact supporting answer": can_skip_broad_retrieval(
+            supporting, state, LastQAInteractionType.SUPPORTING_QUESTION_ANSWER, config, request
+        ),
+        "forged supporting match": can_skip_broad_retrieval(
+            forged_supporting, state, LastQAInteractionType.SUPPORTING_QUESTION_ANSWER, config, request
+        ),
+        "direct normal follow-up": can_skip_broad_retrieval(
+            normal, state, LastQAInteractionType.NORMAL_FOLLOW_UP, config, request
+        ),
+        "normal follow-up carrying a question": can_skip_broad_retrieval(
+            normal_with_question, state, LastQAInteractionType.NORMAL_FOLLOW_UP, config, request
+        ),
+        "metadata-backed reminder reply": can_skip_broad_retrieval(
+            reminder, state, LastQAInteractionType.REMINDER_NOTIFICATION_REPLY, config, reminder_request
+        ),
+        "metadata-free reminder reply": can_skip_broad_retrieval(
+            reminder, state, LastQAInteractionType.REMINDER_NOTIFICATION_REPLY, config, request
+        ),
+        "clarification answer": can_skip_broad_retrieval(
+            normal, state, LastQAInteractionType.CLARIFICATION_ANSWER, config, request
+        ),
+    }
+    expected = {
+        "exact supporting answer": True,
+        "forged supporting match": False,
+        "direct normal follow-up": True,
+        "normal follow-up carrying a question": False,
+        "metadata-backed reminder reply": True,
+        "metadata-free reminder reply": False,
+        "clarification answer": False,
+    }
+    wrong = {name: {"expected": expected[name], "actual": actual} for name, actual in checks.items() if actual != expected[name]}
+    if wrong:
+        raise AssertionError(f"Last-QA retrieval-skip evidence policy regressed: {wrong}")
+
+    prompt = DEFAULT_PROMPT_REGISTRY.system("last_qa")
+    required_rules = (
+        "Use this precedence: reminder_notification_reply, supporting_question_answer, normal_follow_up",
+        "Copy that question verbatim into matched_question.",
+        "Text such as 'done', 'yes', or 'thanks' without those IDs is not a reminder reply.",
+        "A new standalone request, even on a similar topic, is unrelated.",
+        "clarification_merge runs first",
+    )
+    missing = [rule for rule in required_rules if rule not in prompt]
+    if missing:
+        raise AssertionError(f"Last-QA prompt lost relationship safeguards: {missing}")
+    clarification_prompt = DEFAULT_PROMPT_REGISTRY.system("clarification_merge")
+    standalone_rule = "A latest message that starts a distinct standalone request is not a clarification answer"
+    if standalone_rule not in clarification_prompt:
+        raise AssertionError("clarification merge lost its standalone-request safeguard")
+    return ScenarioResult("last_qa_relationship_policy", True, "Last-QA precedence and skip gates require exact supporting-question or reminder evidence")
 
 
 def scenario_debug_hybrid_llm_compatibility(settings: ProductionSettings) -> ScenarioResult:
@@ -1062,7 +1687,7 @@ def scenario_debug_hybrid_llm_compatibility(settings: ProductionSettings) -> Sce
         "base_url: http://localhost:11434",
         "onnx_cache_dir: .onnx_models",
         "answer=microsoft/Phi-4-mini-instruct-onnx",
-        "query_rewrite=microsoft/Phi-4-mini-instruct-onnx",
+        "query_rewrite=qwen3.5:4b",
         "synthetic ONNX compatibility error",
         '"model": "microsoft/Phi-4-mini-instruct-onnx"',
     )
@@ -1072,6 +1697,84 @@ def scenario_debug_hybrid_llm_compatibility(settings: ProductionSettings) -> Sce
     if "base_url: unknown" in text or "keep_alive: unknown" in text:
         raise AssertionError(f"hybrid debug LLM output regressed to unknown settings:\n{text}")
     return ScenarioResult("debug_hybrid_llm_compatibility", True, "debug report exposes hybrid Ollama/ONNX routes and errors")
+
+
+def scenario_hybrid_structured_onnx_failover(settings: ProductionSettings) -> ScenarioResult:
+    """An unavailable ONNX structured route must recover through its configured Ollama model."""
+    default_settings = ProductionSettings()
+    onnx_route_settings = replace(
+        default_settings.ollama,
+        model_intent="microsoft/Phi-4-mini-instruct-onnx",
+    )
+    router = OllamaModelRouter(onnx_route_settings)
+    ollama_client = OllamaLLMClient(onnx_route_settings, router)
+    onnx_client = ONNXLLMClient(router)
+    llm = HybridLLMClient(ollama_client, onnx_client)
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+    }
+    calls: list[dict[str, Any]] = []
+
+    def failed_onnx(**_: Any) -> dict[str, Any]:
+        onnx_client.last_error_by_task[LLMTask.INTENT] = "structured_fallback_used_after_2_failures: repository unavailable"
+        return {"ok": False}
+
+    def successful_ollama(**kwargs: Any) -> str:
+        calls.append(kwargs)
+        return '{"ok":true}'
+
+    onnx_client.generate_json = failed_onnx  # type: ignore[method-assign]
+    ollama_client._chat_raw = successful_ollama  # type: ignore[method-assign]
+    payload = llm.generate_json(
+        task=LLMTask.INTENT,
+        system_prompt="Return JSON.",
+        user_prompt="Runtime context:\n{}",
+        schema=schema,
+    )
+    if payload != {"ok": True}:
+        raise AssertionError(f"Ollama fallback result was not returned: {payload}")
+    if len(calls) != 1:
+        raise AssertionError(f"expected one Ollama fallback attempt, got {len(calls)}")
+    if calls[0].get("model_override") != onnx_route_settings.model_intent_fallback:
+        raise AssertionError(f"intent fallback used the wrong model: {calls[0]}")
+    if LLMTask.INTENT in llm.last_error_by_task:
+        raise AssertionError(f"recovered ONNX failure leaked as active error: {llm.last_error_by_task}")
+    return ScenarioResult("hybrid_structured_onnx_failover", True, "unavailable ONNX intent route recovers through Ollama without leaking a stale error")
+
+
+def scenario_onnx_non_retryable_model_error(settings: ProductionSettings) -> ScenarioResult:
+    """A bad model ID must not consume every configured structured retry."""
+    default_settings = ProductionSettings()
+    router = OllamaModelRouter(default_settings.ollama)
+    onnx_client = ONNXLLMClient(router)
+    attempts = 0
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+    }
+
+    def missing_model(*_: Any, **__: Any) -> str:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("404 Client Error: Repository Not Found")
+
+    onnx_client._generate = missing_model  # type: ignore[method-assign]
+    payload = onnx_client.generate_json(
+        task=LLMTask.INTENT,
+        system_prompt="Return JSON.",
+        user_prompt="Runtime context:\n{}",
+        schema=schema,
+    )
+    if payload.get("ok") is not False:
+        raise AssertionError(f"unexpected structured fallback payload: {payload}")
+    if attempts != 1:
+        raise AssertionError(f"non-retryable model error made {attempts} attempts instead of one")
+    if "after_1_failures" not in onnx_client.last_error_by_task.get(LLMTask.INTENT, ""):
+        raise AssertionError(f"non-retryable failure did not report one attempt: {onnx_client.last_error_by_task}")
+    return ScenarioResult("onnx_non_retryable_model_error", True, "missing ONNX repositories stop retrying after the first definitive failure")
 
 
 def scenario_content_composer_general_react(settings: ProductionSettings) -> ScenarioResult:
@@ -1511,10 +2214,22 @@ SCENARIOS: tuple[ScenarioFn, ...] = (
     scenario_general_new_conversation_skips_sub_branch_llm,
     scenario_answer_adaptive_token_budget,
     scenario_structured_clarification_fallback_policy,
+    scenario_mutation_clarification_fast_path,
+    scenario_state_mutation_preflight_bypass,
+    scenario_model_backed_action_extraction,
+    scenario_knowledge_action_recovery,
+    scenario_sql_backed_knowledge_lookup,
+    scenario_general_sql_knowledge_fallback,
+    scenario_model_backed_knowledge_update,
+    scenario_clarification_schema_echo_recovery,
     scenario_content_composer_react_structured_policy,
     scenario_structured_fallback_terminal_quiet,
     scenario_model_routing_policy,
+    scenario_intent_branch_ownership_policy,
+    scenario_last_qa_relationship_policy,
     scenario_debug_hybrid_llm_compatibility,
+    scenario_hybrid_structured_onnx_failover,
+    scenario_onnx_non_retryable_model_error,
     scenario_content_composer_general_react,
     scenario_general_broad_retrieval_approved,
     scenario_lastqa_supporting_skip,

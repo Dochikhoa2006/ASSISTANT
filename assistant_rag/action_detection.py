@@ -48,14 +48,13 @@ class LLMActionDetector:
     risky_action_confidence_threshold: float = field(
         default_factory=lambda: PromptPolicySettings.risky_action_confidence_threshold
     )
-
     def detect(self, request: ChatRequest, rewritten_query: str, intent: Intent) -> ActionDetectionResult:
         if request.metadata.get("knowledge_actions") or request.metadata.get("reminder_actions"):
             return ActionDetectionResult(intent=intent, confidence=1.0, metadata={})
         if intent not in {Intent.KNOWLEDGE_FACTS, Intent.REMINDER}:
             return ActionDetectionResult(intent=intent, confidence=1.0, metadata={})
 
-        schema = self._schema()
+        schema = self._schema(intent)
         try:
             payload = self.llm.generate_json(
                 task=LLMTask.ACTION_EXTRACTION,
@@ -82,16 +81,21 @@ class LLMActionDetector:
                 missing_fields=["llm_action_detection_unavailable"],
                 risk_flags=["safe_fallback_to_clarification"],
             )
-        result = self._parse_payload(payload, fallback_intent=intent)
+        result = self._parse_payload(payload, selected_intent=intent)
+        if self._needs_knowledge_recovery(result):
+            recovered = self._recover_knowledge_action(request, rewritten_query)
+            if recovered is not None:
+                result = recovered
         
         if self.risky_action_validation_enabled and result.metadata:
             result = self._validate_risky_actions(request, rewritten_query, result)
             
         return result
 
-    def _parse_payload(self, payload: dict[str, Any], *, fallback_intent: Intent) -> ActionDetectionResult:
-        intent_value = str(payload.get("intent") or fallback_intent.value)
-        intent = Intent(intent_value) if intent_value in {item.value for item in Intent} else fallback_intent
+    def _parse_payload(self, payload: dict[str, Any], *, selected_intent: Intent) -> ActionDetectionResult:
+        # Action extraction is downstream of intent routing. The extractor may
+        # describe fields for that branch, but it must never reroute the request.
+        intent = selected_intent
         confidence = float(payload.get("confidence", 0.0))
         metadata = {}
         if intent is Intent.KNOWLEDGE_FACTS:
@@ -108,6 +112,89 @@ class LLMActionDetector:
             metadata=metadata,
             missing_fields=missing_fields,
             risk_flags=risk_flags,
+        )
+
+    @staticmethod
+    def _needs_knowledge_recovery(result: ActionDetectionResult) -> bool:
+        return bool(
+            result.intent is Intent.KNOWLEDGE_FACTS
+            and not result.metadata.get("knowledge_actions")
+        )
+
+    def _recover_knowledge_action(
+        self, request: ChatRequest, rewritten_query: str
+    ) -> ActionDetectionResult | None:
+        operation_schema = {
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string", "enum": ["add", "modify", "delete", "lookup"]},
+            },
+            "required": ["operation"],
+        }
+        try:
+            operation_payload = self.llm.generate_json(
+                task=LLMTask.ACTION_EXTRACTION,
+                system_prompt=self.prompt_registry.system("knowledge_operation_recovery"),
+                user_prompt=self.prompt_registry.user(
+                    PromptContext(
+                        stage="action_detection",
+                        user_id=request.user_id,
+                        raw_query=request.raw_query,
+                        rewritten_query=rewritten_query,
+                        intent=Intent.KNOWLEDGE_FACTS.value,
+                        metadata=request.metadata,
+                        platform_context=request.platform_context,
+                        extra={"recovery_reason": "initial knowledge extraction returned no executable action"},
+                    )
+                ),
+                schema=operation_schema,
+            )
+            validate_json_schema(operation_payload, operation_schema)
+        except Exception:
+            return None
+
+        operation = operation_payload.get("operation")
+        if operation == "lookup":
+            return ActionDetectionResult(
+                intent=Intent.KNOWLEDGE_FACTS,
+                confidence=1.0,
+                metadata={"knowledge_lookup": True},
+            )
+        if operation != "add":
+            return None
+
+        content_schema = {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        }
+        try:
+            content_payload = self.llm.generate_json(
+                task=LLMTask.ACTION_EXTRACTION,
+                system_prompt=self.prompt_registry.system("knowledge_add_content_recovery"),
+                user_prompt=self.prompt_registry.user(
+                    PromptContext(
+                        stage="action_detection",
+                        user_id=request.user_id,
+                        raw_query=request.raw_query,
+                        rewritten_query=rewritten_query,
+                        intent=Intent.KNOWLEDGE_FACTS.value,
+                        metadata=request.metadata,
+                        platform_context=request.platform_context,
+                    )
+                ),
+                schema=content_schema,
+            )
+            validate_json_schema(content_payload, content_schema)
+        except Exception:
+            return None
+        text = str(content_payload.get("text") or "").strip()
+        if not text:
+            return None
+        return ActionDetectionResult(
+            intent=Intent.KNOWLEDGE_FACTS,
+            confidence=1.0,
+            metadata={"knowledge_actions": [{"action": "add", "text": text}]},
         )
 
     def _validate_risky_actions(self, request: ChatRequest, rewritten_query: str, result: ActionDetectionResult) -> ActionDetectionResult:
@@ -185,64 +272,14 @@ class LLMActionDetector:
             "required": ["results"]
         }
 
-    def _schema(self) -> dict[str, Any]:
+    def _schema(self, selected_intent: Intent) -> dict[str, Any]:
+        action_key = "knowledge_actions" if selected_intent is Intent.KNOWLEDGE_FACTS else "reminder_actions"
+        action_schema = self._knowledge_action_schema() if selected_intent is Intent.KNOWLEDGE_FACTS else self._reminder_action_schema()
         return {
             "type": "object",
             "properties": {
-                "intent": {
-                    "type": "string",
-                    "enum": [
-                        "clarification",
-                        "general_response",
-                        "knowledge_facts",
-                        "reminder",
-                    ],
-                },
                 "confidence": {"type": "number"},
-                "knowledge_actions": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "action": {
-                                "type": "string",
-                                "enum": ["add", "delete", "modify"]
-                            },
-                            "topic_title": {"type": "string"},
-                            "text": {"type": "string"},
-                            "target_description": {"type": "string"},
-                            "target_entities": {"type": "array", "items": {"type": "string"}},
-                            "replacement_text": {"type": "string"},
-                            "raw_user_instruction": {"type": "string"},
-                            "confidence": {"type": "number"},
-                            "missing_fields": {"type": "array", "items": {"type": "string"}}
-                        },
-                        "required": ["action", "raw_user_instruction"]
-                    },
-                },
-                "reminder_actions": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "action": {
-                                "type": "string",
-                                "enum": ["add", "delete", "modify", "turn_on", "turn_off"]
-                            },
-                            "subject": {"type": "string"},
-                            "reminder_time": {"type": "string"},
-                            "raw_reminder": {"type": "string"},
-                            "target_description": {"type": "string"},
-                            "target_entities": {"type": "array", "items": {"type": "string"}},
-                            "new_reminder_time": {"type": "string"},
-                            "new_subject": {"type": "string"},
-                            "raw_user_instruction": {"type": "string"},
-                            "confidence": {"type": "number"},
-                            "missing_fields": {"type": "array", "items": {"type": "string"}}
-                        },
-                        "required": ["action", "raw_user_instruction"]
-                    },
-                },
+                action_key: {"type": "array", "items": action_schema},
                 "missing_fields": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -251,17 +288,39 @@ class LLMActionDetector:
                     "type": "array",
                     "items": {"type": "string"},
                 },
-                "normalized_entities": {
-                    "type": "object",
-                }
             },
             "required": [
-                "intent",
                 "confidence",
-                "knowledge_actions",
-                "reminder_actions",
+                action_key,
                 "missing_fields",
                 "risk_flags",
-                "normalized_entities"
             ],
+        }
+
+    @staticmethod
+    def _knowledge_action_schema() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["add", "delete", "modify"]},
+                "text": {"type": "string"},
+                "target_description": {"type": "string"},
+                "replacement_text": {"type": "string"},
+            },
+            "required": ["action"],
+        }
+
+    @staticmethod
+    def _reminder_action_schema() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["add", "delete", "modify", "turn_on", "turn_off"]},
+                "subject": {"type": "string"},
+                "reminder_time": {"type": "string"},
+                "target_description": {"type": "string"},
+                "new_reminder_time": {"type": "string"},
+                "new_subject": {"type": "string"},
+            },
+            "required": ["action"],
         }

@@ -50,46 +50,51 @@ class OllamaSettings:
     structured_retry_count: int = 1
     keep_alive: int | str = "30m"
     disable_thinking: bool = True
+    # Loading the Phi ONNX bundle can download several gigabytes. Keep startup
+    # responsive by loading it on first use unless an operator explicitly opts in.
+    preload_onnx_models: bool = False
 
     # Task: QUERY_REWRITE
-    model_query_rewrite: str = "microsoft/Phi-4-mini-instruct-onnx"
+    model_query_rewrite: str = "qwen3.5:4b"
     timeout_query_rewrite: float = 12.0
-    num_ctx_query_rewrite: int = 256
-    num_predict_query_rewrite: int | None = 64
+    num_ctx_query_rewrite: int = 384
+    num_predict_query_rewrite: int | None = 48
     temperature_query_rewrite: float = 0.0
 
     # Task: LAST_QA
-    model_last_qa: str = "qwen3.5:2b"
+    model_last_qa: str = "qwen3.5:4b"
     timeout_last_qa: float = 18.0
-    num_ctx_last_qa: int = 896
+    num_ctx_last_qa: int = 1024
     num_predict_last_qa: int | None = 96
     temperature_last_qa: float = 0.0
     json_retry_count_last_qa: int = 1
 
     # Task: INTENT
-    model_intent: str = "qwen3.5:2b"
-    timeout_intent: float = 30.0
+    model_intent: str = "qwen3.5:4b"
+    model_intent_fallback: str | None = "qwen3.5:4b"
+    timeout_intent: float = 20.0
     num_ctx_intent: int = 1024
-    num_predict_intent: int | None = 96
+    num_predict_intent: int | None = 48
     temperature_intent: float = 0.0
 
     # Task: ACTION_EXTRACTION
-    model_action_extraction: str = "qwen3.5:2b"
-    timeout_action_extraction: float = 30.0
+    model_action_extraction: str = "qwen3.5:4b"
+    timeout_action_extraction: float = 24.0
     num_ctx_action_extraction: int = 1536
-    num_predict_action_extraction: int | None = 256
+    num_predict_action_extraction: int | None = 160
     temperature_action_extraction: float = 0.0
 
     # Task: GENERATE_CLARIFICATION
-    model_generate_clarification: str = "microsoft/Phi-4-mini-instruct-onnx"
+    model_generate_clarification: str = "qwen3.5:4b"
+    model_generate_clarification_fallback: str | None = "qwen3.5:4b"
     timeout_generate_clarification: float = 15.0
-    num_ctx_generate_clarification: int = 768
+    num_ctx_generate_clarification: int = 1024
     num_predict_generate_clarification: int | None = 160
-    temperature_generate_clarification: float = 0.15
+    temperature_generate_clarification: float = 0.0
     json_retry_count_generate_clarification: int = 1
 
     # Task: GENERATE_HUMAN_SUPPORTING
-    model_generate_human_supporting: str = "qwen3.5:2b"
+    model_generate_human_supporting: str = "qwen3.5:4b"
     timeout_generate_human_supporting: float = 15.0
     num_ctx_generate_human_supporting: int = 1024
     num_predict_generate_human_supporting: int | None = 160
@@ -97,7 +102,7 @@ class OllamaSettings:
     json_retry_count_generate_human_supporting: int = 1
 
     # Task: GENERATE_REMINDER_SUPPORTING
-    model_generate_reminder_supporting: str = "microsoft/Phi-4-mini-instruct-onnx"
+    model_generate_reminder_supporting: str = "qwen3.5:4b"
     timeout_generate_reminder_supporting: float = 15.0
     num_ctx_generate_reminder_supporting: int = 1024
     num_predict_generate_reminder_supporting: int | None = 160
@@ -105,30 +110,30 @@ class OllamaSettings:
     json_retry_count_generate_reminder_supporting: int = 1
 
     # Task: CLARIFICATION_MERGE
-    model_clarification_merge: str = "qwen3.5:2b"
+    model_clarification_merge: str = "qwen3.5:4b"
     timeout_clarification_merge: float = 24.0
-    num_ctx_clarification_merge: int = 1024
+    num_ctx_clarification_merge: int = 768
     num_predict_clarification_merge: int | None = 128
     temperature_clarification_merge: float = 0.0
     json_retry_count_clarification_merge: int = 1
 
     # Task: ANSWER
     model_answer: str = "microsoft/Phi-4-mini-instruct-onnx"
-    model_answer_fallback: str | None = "microsoft/Phi-4-mini-instruct-onnx"
+    model_answer_fallback: str | None = "qwen3.5:4b"
     timeout_answer: float = 75.0
-    num_ctx_answer: int = 3072
+    num_ctx_answer: int = 4096
     num_predict_answer: int | None = 1024
     temperature_answer: float = 0.22
 
     # Task: WRITING
     model_writing: str = "microsoft/Phi-4-mini-instruct-onnx"
     timeout_writing: float = 90.0
-    num_ctx_writing: int = 1536
+    num_ctx_writing: int = 3096
     num_predict_writing: int | None = 1024
     temperature_writing: float = 0.38
 
     # Task: RISKY_ACTION
-    model_risky_action: str = "qwen3.5:2b"
+    model_risky_action: str = "qwen3.5:4b"
     timeout_risky_action: float = 35.0
     num_ctx_risky_action: int = 1024
     num_predict_risky_action: int | None = 192
@@ -138,19 +143,19 @@ class OllamaSettings:
     # Task: RETRIEVAL_VALIDATION
     model_retrieval_validation: str = "microsoft/Phi-4-mini-instruct-onnx"
     timeout_retrieval_validation: float = 35.0
-    num_ctx_retrieval_validation: int = 1024
+    num_ctx_retrieval_validation: int = 1536
     num_predict_retrieval_validation: int | None = 192
     temperature_retrieval_validation: float = 0.0
 
     # Task: GENERAL_SUB_BRANCH_DETECTION
-    model_general_sub_branch_detection: str = "qwen3.5:2b"
+    model_general_sub_branch_detection: str = "qwen3.5:4b"
     timeout_general_sub_branch_detection: float = 30.0
-    num_ctx_general_sub_branch_detection: int = 768
+    num_ctx_general_sub_branch_detection: int = 1024
     num_predict_general_sub_branch_detection: int | None = 96
     temperature_general_sub_branch_detection: float = 0.0
 
     # Task: CONTENT_COMPOSER_REACT
-    model_content_composer_react: str = "qwen3.5:2b"
+    model_content_composer_react: str = "qwen3.5:4b"
     timeout_content_composer_react: float = 35.0
     num_ctx_content_composer_react: int = 768
     num_predict_content_composer_react: int | None = 160
@@ -159,7 +164,7 @@ class OllamaSettings:
     # Task: ACTION_PLANNING
     model_action_planning: str = "microsoft/Phi-4-mini-instruct-onnx"
     timeout_action_planning: float = 35.0
-    num_ctx_action_planning: int = 1024
+    num_ctx_action_planning: int = 3096
     num_predict_action_planning: int | None = 256
     temperature_action_planning: float = 0.0
 
@@ -297,12 +302,12 @@ class PromptPolicySettings:
     skip_broad_retrieval_allowed_relationships: tuple[str, ...] = (
         "supporting_question_answer",
         "normal_follow_up",
-        "reminder_reply",
+        "reminder_notification_reply",
     )
     clarification_merge_enabled: bool = True
     last_qa_enable_reminder_metadata_reply: bool = True
     risky_action_validation_enabled: bool = True
-    risky_action_operations: tuple[str, ...] = ("delete", "modify", "turn_off")
+    risky_action_operations: tuple[str, ...] = ("delete", "turn_off")
     risky_action_confidence_threshold: float = 0.90
     knowledge_modify_requires_replacement_text: bool = True
     context_filter_knowledge_min_confidence: float = 0.38
@@ -604,6 +609,7 @@ class ProductionSettings:
                 structured_retry_count=_get_int("OLLAMA_STRUCTURED_RETRY_COUNT", OllamaSettings.structured_retry_count),
                 keep_alive=-1 if os.getenv("OLLAMA_KEEP_ALIVE", str(OllamaSettings.keep_alive)) == "-1" else os.getenv("OLLAMA_KEEP_ALIVE", OllamaSettings.keep_alive),
                 disable_thinking=_get_bool("OLLAMA_DISABLE_THINKING", OllamaSettings.disable_thinking),
+                preload_onnx_models=_get_bool("ASSISTANT_PRELOAD_ONNX_MODELS", OllamaSettings.preload_onnx_models),
                 model_query_rewrite=os.getenv("OLLAMA_QUERY_REWRITE_MODEL", OllamaSettings.model_query_rewrite),
                 timeout_query_rewrite=_get_float("OLLAMA_QUERY_REWRITE_TIMEOUT", OllamaSettings.timeout_query_rewrite),
                 num_ctx_query_rewrite=_get_int("OLLAMA_QUERY_REWRITE_NUM_CTX", OllamaSettings.num_ctx_query_rewrite),
@@ -616,6 +622,7 @@ class ProductionSettings:
                 temperature_last_qa=_get_float("OLLAMA_LAST_QA_TEMPERATURE", OllamaSettings.temperature_last_qa),
                 json_retry_count_last_qa=_get_int("OLLAMA_LAST_QA_JSON_RETRY_COUNT", OllamaSettings.json_retry_count_last_qa),
                 model_intent=os.getenv("OLLAMA_INTENT_MODEL", OllamaSettings.model_intent),
+                model_intent_fallback=os.getenv("OLLAMA_INTENT_FALLBACK_MODEL", OllamaSettings.model_intent_fallback) or None,
                 timeout_intent=_get_float("OLLAMA_INTENT_TIMEOUT", OllamaSettings.timeout_intent),
                 num_ctx_intent=_get_int("OLLAMA_INTENT_NUM_CTX", OllamaSettings.num_ctx_intent),
                 num_predict_intent=_get_int("OLLAMA_INTENT_NUM_PREDICT", OllamaSettings.num_predict_intent) if os.getenv("OLLAMA_INTENT_NUM_PREDICT") else OllamaSettings.num_predict_intent,
@@ -626,6 +633,7 @@ class ProductionSettings:
                 num_predict_action_extraction=_get_int("OLLAMA_ACTION_EXTRACTION_NUM_PREDICT", OllamaSettings.num_predict_action_extraction) if os.getenv("OLLAMA_ACTION_EXTRACTION_NUM_PREDICT") else OllamaSettings.num_predict_action_extraction,
                 temperature_action_extraction=_get_float("OLLAMA_ACTION_EXTRACTION_TEMPERATURE", OllamaSettings.temperature_action_extraction),
                 model_generate_clarification=os.getenv("OLLAMA_GENERATE_CLARIFICATION_MODEL", OllamaSettings.model_generate_clarification),
+                model_generate_clarification_fallback=os.getenv("OLLAMA_GENERATE_CLARIFICATION_FALLBACK_MODEL", OllamaSettings.model_generate_clarification_fallback) or None,
                 timeout_generate_clarification=_get_float("OLLAMA_GENERATE_CLARIFICATION_TIMEOUT", OllamaSettings.timeout_generate_clarification),
                 num_ctx_generate_clarification=_get_int("OLLAMA_GENERATE_CLARIFICATION_NUM_CTX", OllamaSettings.num_ctx_generate_clarification),
                 num_predict_generate_clarification=_get_int("OLLAMA_GENERATE_CLARIFICATION_NUM_PREDICT", OllamaSettings.num_predict_generate_clarification) if os.getenv("OLLAMA_GENERATE_CLARIFICATION_NUM_PREDICT") else OllamaSettings.num_predict_generate_clarification,

@@ -69,6 +69,62 @@ from .settings import MutationPartialExecutionPolicy
 from .reminder_safety import ReminderTimeNormalizer, ReminderTimeNormalizationError
 
 
+def _mutation_clarification_message_key(domain: str, missing_fields: list[str]) -> str:
+    """Choose a fast, user-facing question for predictable mutation gaps."""
+    missing = {str(field).casefold() for field in missing_fields}
+    if domain == "knowledge":
+        if {"replacement_text", "replacement", "new_text"} & missing:
+            return "knowledge_missing_replacement"
+        if {"target_description", "target", "target_entities"} & missing:
+            return "knowledge_missing_target"
+        if {"text", "knowledge_text", "content"} & missing:
+            return "knowledge_missing_content"
+        return "knowledge_missing_action"
+
+    if {"reminder_time", "new_reminder_time", "time", "date", "timezone"} & missing:
+        return "reminder_missing_time"
+    if {"subject", "new_subject", "reminder_subject"} & missing:
+        return "reminder_missing_subject"
+    if {"target_description", "target", "reminder_id"} & missing:
+        return "reminder_missing_target"
+    if {"new_reminder_time", "new_subject", "replacement"} & missing:
+        return "reminder_missing_update"
+    return "reminder_missing_action"
+
+
+def _knowledge_lookup_match(
+    repository: AssistantRepository,
+    *,
+    user_id: str,
+    query: str,
+    minimum_score: float,
+    ambiguity_margin: float,
+) -> tuple[str, str] | None:
+    """Read user-owned SQL facts when derived retrieval has not indexed a recent write."""
+    query_terms = set(re.findall(r"[\w]+", query.casefold()))
+    if not query_terms:
+        return None
+
+    candidates: list[tuple[float, str, str]] = []
+    for fact in repository.list_knowledge_facts(user_id=user_id, include_deleted=False):
+        text = str(fact.get("raw_text") or fact.get("normalized_text") or "").strip()
+        chunk_id = str(fact.get("chunk_id") or "")
+        fact_terms = set(re.findall(r"[\w]+", text.casefold()))
+        if not text or not chunk_id or not fact_terms:
+            continue
+        overlap = len(query_terms & fact_terms) / min(len(query_terms), len(fact_terms))
+        if overlap >= minimum_score:
+            candidates.append((overlap, chunk_id, text))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    top_score, top_chunk_id, top_text = candidates[0]
+    if len(candidates) > 1 and (top_score - candidates[1][0]) < ambiguity_margin:
+        return None
+    return top_chunk_id, top_text
+
+
 def _json_safe(value: Any) -> Any:
     if is_dataclass(value):
         return {key: _json_safe(val) for key, val in asdict(value).items()}
@@ -263,6 +319,19 @@ class GeneralResponseBranch:
             user_id=context.request.user_id,
             results=knowledge_results,
         )
+        if not knowledge_results:
+            sql_match = _knowledge_lookup_match(
+                repository,
+                user_id=context.request.user_id,
+                query=context.rewritten_query,
+                minimum_score=self.config.mutation_policy.knowledge_relevance_threshold,
+                ambiguity_margin=self.config.mutation_policy.knowledge_ambiguity_margin,
+            )
+            if sql_match:
+                return BranchResult(
+                    response_type=ResponseType.NORMAL,
+                    normal_response_text=sql_match[1],
+                )
 
         reminder_raw: list[dict[str, Any]] = []
         if self._should_retrieve_reminder_context(context):
@@ -557,47 +626,44 @@ class KnowledgeFactsBranch:
     llm: LLMClient | None = None
 
     def _generate_clarification(self, context: PipelineContext, missing_fields: list[str], ambiguity_reason: str) -> BranchResult:
-        question = None
-        if self.clarification_strategy:
-            question = self.clarification_strategy.generate(context, missing_fields=missing_fields, ambiguity_reason=ambiguity_reason)
-        if not question:
-            fallback = self.config.question_generation.fallback_policy if self.config else "fallback_message"
-            question = GeneratedQuestion(
-                text=self.prompt_registry.message(fallback),
-                source=QuestionSource.CLARIFICATION_QUESTION,
-                purpose="resolve_missing_info",
-                confidence=1.0,
-            )
+        question = GeneratedQuestion(
+            text=self.prompt_registry.message(
+                _mutation_clarification_message_key("knowledge", missing_fields)
+            ),
+            source=QuestionSource.CLARIFICATION_QUESTION,
+            purpose="resolve_missing_info",
+            confidence=1.0,
+        )
         return BranchResult(
             response_type=ResponseType.CLARIFICATION,
             clarification_question=question,
         )
 
     def execute(self, context: PipelineContext, repository: AssistantRepository) -> BranchResult:
-        if self.llm:
-            history_str = ""
-            if context.approved_conversation_context:
-                history_str = json.dumps(context.approved_conversation_context.approved_conversation_history, indent=2)
-            elif context.last_qa_state:
-                history_str = f"Last User Query: {context.last_qa_state.last_user_query}\nLast Response: {context.last_qa_state.last_response}"
-            determinant_text = self.llm.chat(
-                task=LLMTask.ACTION_PLANNING,
-                system_prompt=self.prompt_registry.system("action_planning"),
-                user_prompt=self.prompt_registry.user(
-                    PromptContext(
-                        stage="action_planning",
-                        user_id=context.request.user_id,
-                        rewritten_query=context.rewritten_query,
-                        extra={"history_str": history_str}
-                    )
-                )
-            )
         actions = list(context.request.metadata.get("knowledge_actions", []))
         if not actions:
             if self.action_detector:
                 detection = self.action_detector.detect(
                     context.request, context.rewritten_query, Intent.KNOWLEDGE_FACTS
                 )
+                if detection.metadata.get("knowledge_lookup"):
+                    stored_text = _knowledge_lookup_match(
+                        repository,
+                        user_id=context.request.user_id,
+                        query=context.rewritten_query,
+                        minimum_score=self.config.mutation_policy.knowledge_relevance_threshold,
+                        ambiguity_margin=self.config.mutation_policy.knowledge_ambiguity_margin,
+                    )
+                    if stored_text:
+                        return BranchResult(
+                            response_type=ResponseType.NORMAL,
+                            normal_response_text=stored_text[1],
+                        )
+                    return self._generate_clarification(
+                        context,
+                        ["target_description"],
+                        "No single stored knowledge item matched the lookup.",
+                    )
                 if detection.requires_clarification:
                     return self._generate_clarification(context, getattr(detection, "missing_fields", []), "Missing fields for knowledge action.")
                 if detection.metadata:
@@ -629,16 +695,20 @@ class KnowledgeFactsBranch:
                     repository,
                 )
             clarification_needed = False
+            clarification_missing_fields: list[str] = []
             for v_act in validated_actions:
                 if v_act.validation_result in (ActionValidationResult.CLARIFY_AMBIGUOUS_TARGET, ActionValidationResult.CLARIFY_MISSING_FIELDS):
                     clarification_needed = True
-                    break
+                    if v_act.action is KnowledgeAction.MODIFY and not v_act.new_text:
+                        clarification_missing_fields.append("replacement_text")
+                    elif v_act.action in {KnowledgeAction.MODIFY, KnowledgeAction.DELETE}:
+                        clarification_missing_fields.append("target_description")
             
             if clarification_needed:
                 if self.config.mutation_policy.partial_execution_policy == MutationPartialExecutionPolicy.ALL_OR_NOTHING:
-                    return self._generate_clarification(context, [], "Action requires clarification.")
+                    return self._generate_clarification(context, clarification_missing_fields, "Action requires clarification.")
                 else:
-                    return self._generate_clarification(context, [], "Ambiguous destructive actions block partial execution.")
+                    return self._generate_clarification(context, clarification_missing_fields, "Ambiguous destructive actions block partial execution.")
                     
             from .contracts import RepositoryActionResult
             for v_act in validated_actions:
@@ -805,41 +875,20 @@ class ReminderBranch:
     llm: LLMClient | None = None
 
     def _generate_clarification(self, context: PipelineContext, missing_fields: list[str], ambiguity_reason: str) -> BranchResult:
-        question = None
-        if self.clarification_strategy:
-            question = self.clarification_strategy.generate(context, missing_fields=missing_fields, ambiguity_reason=ambiguity_reason)
-        if not question:
-            fallback = self.config.question_generation.fallback_policy if self.config else "fallback_message"
-            question = GeneratedQuestion(
-                text=self.prompt_registry.message(fallback),
-                source=QuestionSource.CLARIFICATION_QUESTION,
-                purpose="resolve_missing_info",
-                confidence=1.0,
-            )
+        question = GeneratedQuestion(
+            text=self.prompt_registry.message(
+                _mutation_clarification_message_key("reminder", missing_fields)
+            ),
+            source=QuestionSource.CLARIFICATION_QUESTION,
+            purpose="resolve_missing_info",
+            confidence=1.0,
+        )
         return BranchResult(
             response_type=ResponseType.CLARIFICATION,
             clarification_question=question,
         )
 
     def execute(self, context: PipelineContext, repository: AssistantRepository) -> BranchResult:
-        if self.llm:
-            history_str = ""
-            if context.approved_conversation_context:
-                history_str = json.dumps(context.approved_conversation_context.approved_conversation_history, indent=2)
-            elif context.last_qa_state:
-                history_str = f"Last User Query: {context.last_qa_state.last_user_query}\nLast Response: {context.last_qa_state.last_response}"
-            determinant_text = self.llm.chat(
-                task=LLMTask.ACTION_PLANNING,
-                system_prompt=self.prompt_registry.system("action_planning"),
-                user_prompt=self.prompt_registry.user(
-                    PromptContext(
-                        stage="action_planning",
-                        user_id=context.request.user_id,
-                        rewritten_query=context.rewritten_query,
-                        extra={"history_str": history_str}
-                    )
-                )
-            )
         actions = list(context.request.metadata.get("reminder_actions", []))
         if not actions:
             if self.action_detector:
@@ -877,16 +926,28 @@ class ReminderBranch:
                     repository,
                 )
             clarification_needed = False
+            clarification_missing_fields: list[str] = []
             for v_act in validated_actions:
                 if v_act.validation_result in (ActionValidationResult.CLARIFY_AMBIGUOUS_TARGET, ActionValidationResult.CLARIFY_MISSING_FIELDS):
                     clarification_needed = True
-                    break
+                    if v_act.action is ReminderAction.ADD:
+                        if not v_act.reminder_time:
+                            clarification_missing_fields.append("reminder_time")
+                        if not v_act.subject:
+                            clarification_missing_fields.append("subject")
+                    elif v_act.action is ReminderAction.MODIFY:
+                        if not v_act.replacement_time and not v_act.replacement_subject:
+                            clarification_missing_fields.append("new_reminder_time")
+                        else:
+                            clarification_missing_fields.append("target_description")
+                    else:
+                        clarification_missing_fields.append("target_description")
             
             if clarification_needed:
                 if self.config.mutation_policy.partial_execution_policy == MutationPartialExecutionPolicy.ALL_OR_NOTHING:
-                    return self._generate_clarification(context, [], "Action requires clarification.")
+                    return self._generate_clarification(context, clarification_missing_fields, "Action requires clarification.")
                 else:
-                    return self._generate_clarification(context, [], "Ambiguous actions block execution.")
+                    return self._generate_clarification(context, clarification_missing_fields, "Ambiguous actions block execution.")
                     
             from .contracts import RepositoryActionResult
             for v_act in validated_actions:

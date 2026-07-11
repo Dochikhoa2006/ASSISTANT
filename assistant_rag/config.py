@@ -173,7 +173,7 @@ class LastQAConfig:
     clarification_merge_min_confidence: float = 0.84
     skip_allowed_interaction_types: tuple[str, ...] = (
         "normal_follow_up",
-        "human_supporting_question_answer",
+        "supporting_question_answer",
         "reminder_notification_reply",
     )
     semantic_match_model: str | None = None

@@ -6,7 +6,15 @@ from dataclasses import dataclass, field
 from .bundler import ChatOutput, ResponseBundler
 from .classification import IntentClassifier, LastQAResolver, QueryRewriter
 from .config import AssistantConfig
-from .contracts import BundledResponse, ChatRequest, PipelineContext, ApprovedConversationContext
+from .contracts import (
+    BundledResponse,
+    ChatRequest,
+    PipelineContext,
+    ApprovedConversationContext,
+    LastQAPath,
+    LastQAResolution,
+    validate_last_qa_resolution,
+)
 from .contracts import Intent
 from .last_qa import InMemoryLastQAStore
 from .platform import PlatformSelector
@@ -38,9 +46,32 @@ class AssistantPipeline:
     def handle(self, request: ChatRequest, repository: AssistantRepository) -> BundledResponse:
         with StageTimer("rewrite"):
             rewritten = self.query_rewriter.rewrite(request.raw_query)
-        with StageTimer("last_qa"):
-            last_state = self.last_qa_store.get(request.user_id)
-            resolution = self.last_qa_resolver.resolve(request, rewritten, last_state)
+
+        # State mutations own their current request. Resolve their branch before
+        # consulting temporary conversational state so an unrelated stale turn
+        # cannot add model latency, trigger retrieval, or redirect the mutation.
+        with StageTimer("classification_preflight"):
+            preflight_intent = self.classifier.classify(request, rewritten)
+
+        state_mutation = preflight_intent in {Intent.KNOWLEDGE_FACTS, Intent.REMINDER}
+        if state_mutation:
+            resolution = LastQAResolution(
+                path=LastQAPath.CURRENT_STATE_MUTATION,
+                rewritten_query=rewritten,
+                state=None,
+                did_merge_query=False,
+                skip_broad_retrieval=True,
+                diagnostic_context={"preflight_intent": preflight_intent.value},
+                merge_reason="current_state_mutation_bypassed_last_qa",
+                skip_reason="current_state_mutation_bypassed_broad_retrieval",
+                is_authoritative_state=False,
+            )
+            validate_last_qa_resolution(resolution)
+            intent = preflight_intent
+        else:
+            with StageTimer("last_qa"):
+                last_state = self.last_qa_store.get(request.user_id)
+                resolution = self.last_qa_resolver.resolve(request, rewritten, last_state)
         
         retrieval_query = resolution.rewritten_query
         intent_classifier_query = resolution.rewritten_query
@@ -90,13 +121,14 @@ class AssistantPipeline:
                     approved_conversation_count=0,
                 )
         
-        with StageTimer("classification"):
-            intent = self.classifier.classify(
-                request, 
-                intent_classifier_query, 
-                last_qa_resolution=resolution, 
-                approved_conversation_context=approved_conversation_context
-            )
+        if not state_mutation:
+            with StageTimer("classification"):
+                intent = self.classifier.classify(
+                    request,
+                    intent_classifier_query,
+                    last_qa_resolution=resolution,
+                    approved_conversation_context=approved_conversation_context,
+                )
 
         last_qa_trace = {
             "input_rewritten_query": rewritten,

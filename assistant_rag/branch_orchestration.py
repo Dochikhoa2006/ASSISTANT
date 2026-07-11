@@ -74,9 +74,12 @@ class KnowledgeTargetResolver:
                 return (), ActionValidationResult.CLARIFY_AMBIGUOUS_TARGET
             return (), ActionValidationResult.SKIP_NOT_FOUND
         
+        # A single candidate has already passed retrieval's configured relevance
+        # threshold and SQL rehydration/user-ownership checks. Mutating knowledge
+        # still requires an explicit confirmation later in the branch, so a second
+        # model pass adds latency and GPU pressure without improving target choice.
         if len(active_results) == 1:
-            if not self.llm_validator or not self.config.retrieval_validation.knowledge_llm_validation_enabled:
-                return (active_results[0].entity_id,), ActionValidationResult.EXECUTE
+            return (active_results[0].entity_id,), ActionValidationResult.EXECUTE
             
         # Optional LLM validation
         if self.llm_validator and self.config.retrieval_validation.knowledge_llm_validation_enabled:

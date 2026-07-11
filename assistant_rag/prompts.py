@@ -319,7 +319,7 @@ def _task_guidance(name: str) -> tuple[str, ...]:
         ),
         "intent_classifier": (
             "Fast four-way router.",
-            "Prefer general_response for safely answerable non-mutating requests.",
+            "Choose the branch that owns the current request's requested state transition, if any.",
         ),
         "action_detection": (
             "Extract only schema-valid mutations for the selected branch.",
@@ -416,6 +416,24 @@ def _fast_routing_safety_rules() -> tuple[str, ...]:
     )
 
 
+def _intent_routing_safety_rules() -> tuple[str, ...]:
+    return (
+        "This is a routing stage, not an answer, action extractor, or execution stage.",
+        "Do not invent state, targets, dates, times, IDs, operation results, or hidden context.",
+        "Missing state-action fields are validated and clarified by the selected branch downstream.",
+        "Return strict JSON only.",
+    )
+
+
+def _last_qa_safety_rules() -> tuple[str, ...]:
+    return (
+        "This is a conservative temporary-context gate, not an answer, intent, or execution stage.",
+        "Skip broad retrieval only when the declared relationship has the exact required evidence in Last-QA state or trusted reminder metadata.",
+        "Do not infer a relationship from topical similarity, a short acknowledgement, or an omitted target.",
+        "Return strict JSON only.",
+    )
+
+
 def _compact_mutation_safety_rules() -> tuple[str, ...]:
     return (
         "This stage may only extract or validate mutation intent; it must not execute writes.",
@@ -486,6 +504,10 @@ def _gmail_safety_rules() -> tuple[str, ...]:
 
 
 def _safety_rules_for_stage(name: str) -> tuple[str, ...]:
+    if name == "intent_classifier":
+        return _intent_routing_safety_rules()
+    if name == "last_qa":
+        return _last_qa_safety_rules()
     if name in FAST_ROUTING_STAGES:
         return _fast_routing_safety_rules()
     if name in MUTATION_STAGES:
@@ -726,34 +748,30 @@ def _default_templates() -> dict[str, PromptTemplate]:
         "last_qa": PromptTemplate(
             name="last_qa",
             role=(
-                "Decide whether the latest query depends on the temporary Last-QA state. "
-                "This stage protects retrieval skipping. It must not answer, classify final intent, retrieve records, mutate SQL, or merge clarification answers."
+                "Conservatively identify one mutually exclusive relationship between the current query and temporary Last-QA state. "
+                "Its sole purpose is deciding whether broad conversation retrieval may be skipped."
             ),
             non_responsibilities=(
-                "Do not answer the user.",
-                "Do not classify final branch intent.",
-                "Do not retrieve records or mutate state.",
-                "Do not merge clarification answers; clarification_merge handles that.",
+                "Do not answer, classify final intent, retrieve, mutate state, or invent a connection.",
+                "Do not merge a clarification answer; clarification_merge owns that operation.",
+                "Do not use topic similarity alone as evidence of a follow-up.",
             ),
             inputs=("rewritten_query", "last_qa_state", "platform reminder metadata when present"),
             output_contract=(
                 'Return strict JSON: {"interaction_detected": boolean, '
-                '"interaction_type": "clarification_answer|supporting_question_answer|normal_follow_up|reminder_reply|unrelated|ambiguous", '
-                '"question_source": "system|human|reminder|none", "matched_question": string, '
+                '"interaction_type": "clarification_answer|supporting_question_answer|normal_follow_up|reminder_notification_reply|unrelated|ambiguous", '
+                '"question_source": "clarification_question|human_supporting_question|reminder_supporting_question|none", "matched_question": string, '
                 '"llm_suggested_skip_broad_retrieval": boolean, "confidence": number}.'
             ),
             decision_rules=(
-                "Set interaction_detected to true if the query relies on the previous context.",
-                "interaction_type rules:",
-                "  clarification_answer: previous assistant asked a blocking clarification and the latest query clearly answers it.",
-                "  supporting_question_answer: latest query clearly answers exactly one prior supporting question.",
-                "  normal_follow_up: latest query clearly continues the previous completed answer.",
-                "  reminder_reply: trusted platform or Last-QA metadata proves this is replying to a reminder notification.",
-                "  unrelated: latest query starts a new task or topic.",
-                "  ambiguous: relation might exist but target, link, or required context is not safe.",
-                "Set question_source to match who originated the context (system, human, reminder) or none.",
-                "Set llm_suggested_skip_broad_retrieval=true only for supporting_question_answer, normal_follow_up, or reminder_reply when confidence is high.",
-                "Set llm_suggested_skip_broad_retrieval=false for unrelated, ambiguous, incomplete, stale, weak, or mutation-target-dependent context.",
+                "Use this precedence: reminder_notification_reply, supporting_question_answer, normal_follow_up, then unrelated or ambiguous. Return exactly one type.",
+                "reminder_notification_reply requires trusted reminder_id, notification_id, source_topic_id, and source_hop_id in platform/request metadata. Text such as 'done', 'yes', or 'thanks' without those IDs is not a reminder reply. Use question_source=none and matched_question=''.",
+                "supporting_question_answer requires the query to directly answer exactly one active listed supporting question. Copy that question verbatim into matched_question. Use human_supporting_question or reminder_supporting_question to identify its source. Do not use this type for a general continuation.",
+                "normal_follow_up requires an explicit reference, refinement, correction, or request for more detail about the immediately previous completed answer. Use question_source=none and matched_question=''. A new standalone request, even on a similar topic, is unrelated.",
+                "clarification_answer is reserved for a direct answer to an active mandatory clarification question. This call normally does not process it because clarification_merge runs first; do not emit it without that exact state.",
+                "unrelated means a new independent task or topic. ambiguous means a possible link that lacks exact evidence. Set interaction_detected=false for both.",
+                "Set llm_suggested_skip_broad_retrieval=true only for reminder_notification_reply with complete metadata, supporting_question_answer with an exact active question, or normal_follow_up with direct reference and high confidence.",
+                "For every missing, stale, weak, conflicting, or target-dependent link, set llm_suggested_skip_broad_retrieval=false.",
             ),
             safety_rules=_safety_rules_for_stage("last_qa"),
             error_handling=("If uncertain, set interaction_detected=false and interaction_type=ambiguous.",),
@@ -777,6 +795,7 @@ def _default_templates() -> dict[str, PromptTemplate]:
             ),
             decision_rules=(
                 "Merge only when the latest answer directly resolves the clarification question.",
+                "A latest message that starts a distinct standalone request is not a clarification answer, even if it mentions a related subject or operation.",
                 "Preserve the original user intent, language, requested action, and explicit constraints.",
                 "Fill only information present in the latest answer or unambiguous clarification context.",
                 "Do not concatenate blindly; produce a clean standalone query.",
@@ -788,47 +807,30 @@ def _default_templates() -> dict[str, PromptTemplate]:
         ),
         "intent_classifier": PromptTemplate(
             name="intent_classifier",
-            role=(
-                "Classify the user's next workflow branch. Choose exactly one intent: "
-                "clarification, general_response, knowledge_facts, or reminder."
-            ),
+            role="Route the current request to exactly one owning branch: knowledge_facts, reminder, general_response, or clarification.",
             non_responsibilities=(
-                "Do not answer the user.",
-                "Do not extract actions or choose SQL targets.",
-                "Do not retrieve records or mutate state.",
+                "Do not answer, extract actions, retrieve, or mutate.",
+                "Do not let old context override a new explicit request.",
             ),
-            inputs=(
-                "raw_query",
-                "rewritten_query",
-                "Last-QA resolver result",
-                "approved conversation chat history",
-                "safe request metadata",
-            ),
+            inputs=("current query", "trusted recent context"),
             output_contract=(
-                "Return strict JSON with intent, confidence, "
-                "multi_intent, and requires_clarification. "
-                f"intent must be one of: {_intent_values()}."
+                'Return JSON only: {"intent":"knowledge_facts|reminder|general_response|clarification",'
+                '"operation_kind":"durable_knowledge|reminder_lifecycle|clarification_reply|none",'
+                '"confidence":0.0}. Do not return action fields or advisory flags.'
             ),
             decision_rules=(
-                "general_response owns answering, teaching, coding help, architecture discussion, explanation, analysis, writing, rewriting, summarization, translation, planning advice, recommendations, and normal Q&A.",
-                "knowledge_facts owns explicit durable personal-memory operations: save, remember, store, update, correct, delete, forget, list, or inspect stored user-specific knowledge.",
-                "reminder owns explicit reminder lifecycle operations: remind me, notify me later, schedule reminder, list reminders, modify/delete/dismiss/cancel/turn on/turn off reminder, or reminder notification reply.",
-                "clarification is only for blocked branch selection or unsafe mutation/external action requirements.",
-                "Default to general_response for safely answerable non-mutating requests, even if optional personalization is missing.",
-                "Use approved conversation chat history only to disambiguate follow-ups, pronouns, omitted targets, and references in the current user query.",
-                "If chat history conflicts with the current user query, the current user query wins for intent classification.",
-                "Do not infer a knowledge or reminder mutation solely from chat history; the current user query must explicitly request the state change or notification lifecycle operation.",
-                "Do not choose clarification only because a better answer could ask for preferences, scope, level, format, examples, or timeline.",
-                "Do not choose knowledge_facts for public facts, architecture discussion, coding help, or normal explanations unless the user explicitly asks to change stored memory.",
-                "Do not choose reminder for study plans, goals, future intentions, or planning advice unless the user explicitly asks to be reminded or notified later.",
-                "If a mutation target or required mutation field is missing, choose clarification.",
-                "If the user asks for both knowledge and reminder mutations and cross-branch execution is unsupported, choose clarification.",
-                "If in doubt between general_response and mutation, choose general_response unless the state-changing request is explicit.",
-                "If in doubt between two mutation-capable branches, choose clarification.",
-                "Examples: 'I want to learn Python from zero' => general_response; 'Remember that I prefer Python' => knowledge_facts; 'Remind me tomorrow at 9 AM to study Python' => reminder; 'Delete it' with no safe target => clarification.",
+                "Choose operation_kind before intent; intent must agree with it.",
+                "durable_knowledge means the user asks to retain, inspect, change, or remove a fact, preference, rule, or project knowledge. It is storage, not a future notification.",
+                "reminder_lifecycle means the user asks to create, inspect, change, or remove a scheduled future notification. It requires notification or scheduling semantics, not merely language about recall or retention.",
+                "Evidence for reminder_lifecycle must be either a requested future notification or schedule, or an explicit operation on an existing reminder/notification. Without either, do not choose reminder_lifecycle.",
+                "clarification_reply is only a direct answer to an active mandatory assistant question; a new request is never clarification.",
+                "none covers all other questions and conversation. Missing action fields never change a state branch to general_response or clarification.",
             ),
             safety_rules=_safety_rules_for_stage("intent_classifier"),
-            error_handling=("If safely answerable and non-mutating, return general_response. If mutation safety is blocked, return clarification.",),
+            error_handling=(
+                "If no explicit state operation is present, return general_response.",
+                "If context does not prove an active mandatory question, never return clarification.",
+            ),
         ),
         "general_sub_branch_detector": PromptTemplate(
             name="general_sub_branch_detector",
@@ -863,23 +865,50 @@ def _default_templates() -> dict[str, PromptTemplate]:
             ),
             inputs=("selected intent", "raw_query", "rewritten_query", "trusted metadata", "platform_context"),
             output_contract=(
-                "Return strict JSON with intent, confidence, knowledge_actions, reminder_actions, "
-                "missing_fields, risk_flags, and normalized_entities."
+                "Return strict JSON for the selected branch only: confidence, its action array, "
+                "missing_fields, and risk_flags. Do not return intent or unused metadata."
             ),
             decision_rules=(
-                "Extract actions only for the selected intent.",
-                "For knowledge_facts: add requires durable user-specific text; delete requires target_description; modify requires target_description and replacement_text.",
-                "Do not create knowledge actions for public facts, normal questions, temporary context, or generated answer text.",
-                "For reminder: add requires subject and reminder_time; modify requires target_description plus new time or new subject; delete/turn_on/turn_off require target_description or trusted target metadata.",
-                "Do not invent reminder_time; it must come from user input or trusted parsed metadata.",
-                "For recurrence, include recurrence fields only when the user explicitly requests a repeated reminder and trusted parsing is available.",
-                "Correction requests are modify unless the user explicitly asks to delete.",
-                "Multiple actions are allowed only within the selected branch and only when each action is independently clear.",
-                "If any action is destructive, bulk, cross-domain, ambiguous, or low-confidence, preserve risk in missing_fields/risk_flags.",
-                "If the user is merely asking about facts/reminders instead of changing them, return no executable actions.",
+                "The selected branch is authoritative; never reclassify it.",
+                "For knowledge_facts, a current request to retain supplied factual, preference, rule, or policy content produces one add action. An add action must put the complete supplied content in text; it must not use target_description or replacement_text.",
+                "Use exactly one supported action value from the selected schema; never substitute a natural-language verb for an action value.",
+                "Determine the operation from the outer change requested of the assistant's stored record. Verbs, lifecycle terms, and conditions inside supplied fact or policy content are data; they do not turn a request to record that content into modify or delete.",
+                "For a knowledge update that supplies both an existing value/reference and a desired value in one message, emit modify with both target_description and replacement_text. Keep the existing reference and desired replacement separate; neither may be discarded because the other is present.",
+                "For other knowledge changes, delete needs target_description; modify needs target_description and replacement_text. Those fields are never substitutes for text on add.",
+                "For reminders, add needs subject and time; every other action needs a target and any requested replacement field.",
+                "Never invent values. Mark destructive, bulk, cross-domain, ambiguous, or incomplete requests in missing_fields/risk_flags.",
             ),
             safety_rules=_safety_rules_for_stage("action_detection"),
             error_handling=("If vague, risky, or cross-branch, return missing_fields or risk_flags instead of executable actions.",),
+        ),
+        "knowledge_operation_recovery": PromptTemplate(
+            name="knowledge_operation_recovery",
+            role="Classify only the outer operation requested for an already selected knowledge branch.",
+            non_responsibilities=(
+                "Do not extract fields, answer, retrieve, execute, or invent a target.",
+            ),
+            inputs=("raw query", "rewritten query", "failed extraction reason"),
+            output_contract="Return only the operation JSON contract.",
+            decision_rules=(
+                "Classify the outer storage operation requested of the assistant, not verbs or lifecycle terms inside supplied content.",
+                "A supplied fact, rule, or policy to retain is add, even when its content discusses changes, deletion, lifecycle, or conditions.",
+                "Modify or delete applies only to an already stored item the user asks to change or remove. Lookup is a request to inspect stored knowledge.",
+            ),
+            safety_rules=_safety_rules_for_stage("action_detection"),
+            error_handling=("If the request is unclear, return lookup rather than inventing a mutation.",),
+        ),
+        "knowledge_add_content_recovery": PromptTemplate(
+            name="knowledge_add_content_recovery",
+            role="Extract content for an already selected non-destructive knowledge add operation.",
+            non_responsibilities=("Do not reclassify, answer, retrieve, execute, or add fields not supplied by the user.",),
+            inputs=("raw query", "rewritten query"),
+            output_contract="Return only the text JSON contract.",
+            decision_rules=(
+                "Copy only the fact, rule, preference, or policy the user wants retained.",
+                "Exclude outer request wording and do not interpret verbs inside the content as commands.",
+            ),
+            safety_rules=_safety_rules_for_stage("action_detection"),
+            error_handling=("If no content is supplied, return an empty string.",),
         ),
         "risky_action_validation": PromptTemplate(
             name="risky_action_validation",
@@ -1018,7 +1047,7 @@ def _default_templates() -> dict[str, PromptTemplate]:
         "question_generation": PromptTemplate(
             name="question_generation",
             role=(
-                "Generate zero or more typed questions for exactly one requested question task: "
+                "Generate the requested typed question data for exactly one task: "
                 "clarification, human_supporting, or reminder_supporting."
             ),
             non_responsibilities=(
@@ -1028,13 +1057,13 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "Do not ask unrelated or generic questions.",
             ),
             inputs=("task_type", "context", "schema", "missing_required_fields", "answer_or_operation_summary", "reminder_context", "confidence_threshold"),
-            output_contract="Return strict JSON matching the caller-provided question schema.",
+            output_contract="Return a JSON data object matching the caller-provided schema. Never return, describe, or copy a JSON Schema.",
             decision_rules=(
-                "For clarification, ask only for blocking missing information required to continue safely.",
-                "For human_supporting, ask an optional next-step/preference question only after a useful answer exists.",
-                "For reminder_supporting, ask one useful reminder-related follow-up only when context supports it.",
+                "For clarification, ask one short, concrete question for the supplied missing field or ambiguity; do not ask for speculative preferences, architecture, scale, or unrelated context.",
+                "For human_supporting, ask at most one optional next-step question after a useful answer exists.",
+                "For reminder_supporting, ask one useful reminder-specific follow-up only when the supplied context supports it.",
                 "Do not mix question types.",
-                "Prefer one clear question over several weak questions.",
+                "Use only the fields in the caller-provided data contract; never emit JSON-Schema keys such as type, properties, required, items, or $schema.",
                 "Return should_ask=false when the question would be redundant, speculative, unsafe, or low-value.",
             ),
             safety_rules=_safety_rules_for_stage("question_generation"),
@@ -1154,7 +1183,14 @@ def _default_messages() -> dict[str, str]:
         "clarification_default": "What information should I use to complete that request safely?",
         "action_missing_fields": "What missing information should I use to complete that action safely?",
         "knowledge_missing_action": "Which knowledge fact should I add, delete, or modify?",
+        "knowledge_missing_content": "What knowledge fact would you like me to save?",
+        "knowledge_missing_target": "Which stored knowledge item would you like me to change or remove?",
+        "knowledge_missing_replacement": "What should replace the current stored knowledge?",
         "reminder_missing_action": "Which reminder action should I perform?",
+        "reminder_missing_subject": "What should the reminder be about?",
+        "reminder_missing_time": "When should I remind you?",
+        "reminder_missing_target": "Which existing reminder would you like me to change or remove?",
+        "reminder_missing_update": "What should I change about that reminder?",
         "knowledge_updated": "I updated the knowledge.",
         "reminder_updated": "I updated the reminder.",
         "general_no_evidence": "I do not have enough stored context to answer that confidently yet.",

@@ -120,21 +120,52 @@ def can_skip_broad_retrieval(
         return False
         
         
-    if interaction_type not in config.skip_allowed_interaction_types:
+    if interaction_type.value not in config.skip_allowed_interaction_types:
         return False
 
+    question_source = str(payload.get("question_source") or QuestionSource.NONE.value)
+    matched_question = " ".join(str(payload.get("matched_question") or "").casefold().split())
+
     if interaction_type == LastQAInteractionType.NORMAL_FOLLOW_UP:
-        return bool(state.linked_topic_id and state.linked_hop_id and state.last_response)
-        
+        return bool(
+            state.linked_topic_id
+            and state.linked_hop_id
+            and state.last_response
+            and question_source == QuestionSource.NONE.value
+            and not matched_question
+        )
+
     if interaction_type == LastQAInteractionType.SUPPORTING_QUESTION_ANSWER:
-        return bool(state.linked_topic_id and state.linked_hop_id and state.last_response and payload.get("matched_question"))
-        
+        human_questions = {
+            " ".join(question.text.casefold().split())
+            for question in state.supporting_questions
+            if question.text
+        }
+        reminder_question = state.reminder_supporting_question
+        reminder_questions = {
+            " ".join(reminder_question.text.casefold().split())
+        } if reminder_question and reminder_question.text else set()
+        source_matches_question = (
+            question_source == QuestionSource.HUMAN_SUPPORTING_QUESTION.value
+            and matched_question in human_questions
+        ) or (
+            question_source == QuestionSource.REMINDER_SUPPORTING_QUESTION.value
+            and matched_question in reminder_questions
+        )
+        return bool(
+            state.linked_topic_id
+            and state.linked_hop_id
+            and state.last_response
+            and source_matches_question
+        )
+
     if interaction_type == LastQAInteractionType.REMINDER_NOTIFICATION_REPLY:
         if not config.enable_reminder_metadata_reply:
             return False
         md = request.metadata or {}
         pc = request.platform_context or {}
         return bool(
+            question_source == QuestionSource.NONE.value and
             (md.get("reminder_id") or pc.get("reminder_id")) and
             (md.get("notification_id") or pc.get("notification_id")) and
             (md.get("source_topic_id") or pc.get("source_topic_id")) and
@@ -338,9 +369,22 @@ class LLMLastQAResolver:
             schema = {
                 "type": "object",
                 "properties": {
-                    "interaction_detected": {"type": "boolean"},
-                    "interaction_type": {"type": "string"},
-                    "question_source": {"type": "string"},
+                "interaction_detected": {"type": "boolean"},
+                    "interaction_type": {
+                        "type": "string",
+                        "enum": [
+                            LastQAInteractionType.CLARIFICATION_ANSWER.value,
+                            LastQAInteractionType.SUPPORTING_QUESTION_ANSWER.value,
+                            LastQAInteractionType.NORMAL_FOLLOW_UP.value,
+                            LastQAInteractionType.REMINDER_NOTIFICATION_REPLY.value,
+                            "unrelated",
+                            "ambiguous",
+                        ],
+                    },
+                    "question_source": {
+                        "type": "string",
+                        "enum": [source.value for source in QuestionSource],
+                    },
                     "matched_question": {"type": "string"},
                     "confidence": {"type": "number"},
                     "llm_suggested_skip_broad_retrieval": {"type": "boolean"},

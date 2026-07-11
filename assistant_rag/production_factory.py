@@ -170,7 +170,10 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
     prompt_registry = DEFAULT_PROMPT_REGISTRY
     model_router = OllamaModelRouter(settings.ollama)
     ollama_llm = OllamaLLMClient(settings.ollama, model_router)
-    onnx_llm = ONNXLLMClient(model_router)
+    onnx_llm = ONNXLLMClient(
+        model_router,
+        preload=settings.ollama.preload_onnx_models,
+    )
     llm = HybridLLMClient(ollama_llm, onnx_llm)
     reranker = SentenceTransformerCrossEncoderReranker(settings.reranker)
     retriever = HybridRetriever(

@@ -10,13 +10,24 @@ import time
 from typing import Any, Protocol
 from urllib import error, request
 
-from .contracts import Intent
+from .contracts import Intent, ResponseType
 from .metrics import GLOBAL_METRICS
 from .observability import StageTimer, current_trace
 from .prompts import DEFAULT_PROMPT_REGISTRY, PromptContext, PromptRegistry
 from .settings import OllamaSettings, PromptPolicySettings
 
 logger = logging.getLogger(__name__)
+
+
+def _has_pending_clarification(last_qa_resolution: Any) -> bool:
+    state = getattr(last_qa_resolution, "state", None)
+    response_type = getattr(state, "response_type", None)
+    response_value = getattr(response_type, "value", response_type)
+    return bool(
+        state
+        and getattr(state, "clarification_question", None)
+        and response_value == ResponseType.CLARIFICATION.value
+    )
 
 
 class LLMTask(str, Enum):
@@ -56,6 +67,8 @@ class LLMClient(Protocol):
         system_prompt: str,
         user_prompt: str,
         schema: dict[str, Any],
+        model_override: str | None = None,
+        fallback_for: str | None = None,
     ) -> dict[str, Any]:
         ...
 
@@ -107,6 +120,8 @@ class OllamaLLMClient:
         system_prompt: str,
         user_prompt: str,
         schema: dict[str, Any],
+        model_override: str | None = None,
+        fallback_for: str | None = None,
     ) -> dict[str, Any]:
         with StageTimer(f"llm_{task.value}"):
             last_error: Exception | None = None
@@ -126,6 +141,8 @@ class OllamaLLMClient:
                         system_prompt=system_prompt,
                         user_prompt=attempt_prompt,
                         format_schema=_structured_attempt_format(schema, attempt_mode),
+                        model_override=model_override,
+                        fallback_for=fallback_for,
                         expect_json=True,
                         attempt_index=attempt_index,
                         total_attempts=len(attempt_plan),
@@ -318,9 +335,8 @@ class OllamaLLMClient:
         return content
 
     def _fallback_model_for_task(self, task: LLMTask) -> str | None:
-        if task == LLMTask.ANSWER:
-            return self.settings.model_answer_fallback
-        return None
+        fallback = getattr(self.settings, f"model_{task.value}_fallback", None)
+        return str(fallback) if fallback else None
 
     def _request_json(self, path: str, body: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
         url = f"{self.settings.base_url.rstrip('/')}{path}"
@@ -353,30 +369,8 @@ class OllamaLLMClient:
 
 
 def parse_json_object(raw: str) -> dict[str, Any]:
-    stripped = raw.strip()
-    if not stripped:
-        raise ValueError("Expected JSON object, got empty LLM response")
-    if stripped.startswith("```"):
-        stripped = stripped.strip("`")
-        if stripped.startswith("json"):
-            stripped = stripped[4:].strip()
-    try:
-        parsed = json.loads(stripped)
-    except json.JSONDecodeError as exc:
-        extracted = _extract_json_object(stripped)
-        if extracted is None:
-            preview = stripped[:240].replace("\n", "\\n")
-            raise ValueError(f"Expected JSON object, got non-JSON response: {preview!r}") from exc
-        try:
-            parsed = json.loads(extracted)
-        except json.JSONDecodeError as extracted_exc:
-            preview = extracted[:240].replace("\n", "\\n")
-            raise ValueError(f"Extracted invalid JSON object from LLM response: {preview!r}") from extracted_exc
-    if not isinstance(parsed, dict):
-        if isinstance(parsed, str) and "{" in parsed:
-            return parse_json_object(parsed)
-        raise ValueError("Expected JSON object")
-    return parsed
+    from .json_repair import advanced_parse_json
+    return advanced_parse_json(raw)
 
 
 def _structured_attempt_plan(configured_attempts: int) -> list[str]:
@@ -397,9 +391,6 @@ def _structured_attempt_format(schema: dict[str, Any], mode: str) -> dict[str, A
 
 
 def _structured_attempt_prompt(*, user_prompt: str, schema: dict[str, Any], mode: str) -> str:
-    if mode == "schema":
-        return user_prompt
-
     template = json.dumps(_schema_default_object(schema), indent=2)
     rules = []
     properties = schema.get("properties") or {}
@@ -413,68 +404,66 @@ def _structured_attempt_prompt(*, user_prompt: str, schema: dict[str, Any], mode
     if rules_text:
         rules_text = f"\nConstraints:\n{rules_text}"
 
+    retry_instruction = (
+        "Correction: the previous output was invalid. Return a JSON data object, not a JSON Schema. "
+        "Never output keys such as 'type', 'properties', 'required', 'items', or '$schema'.\n"
+        if mode == "schema"
+        else ""
+    )
     return (
         f"{user_prompt}\n\n"
-        "Structured output repair instruction:\n"
+        f"{retry_instruction}"
+        "Structured output instruction:\n"
         "Return exactly one JSON object and nothing else. No markdown, no code fence, no prose.\n"
-        f"The JSON object must have exactly this shape:\n{template}{rules_text}"
+        f"Return a data instance with exactly this shape:\n{template}{rules_text}"
     )
 
 
 def _extract_json_object(text: str) -> str | None:
-    start = text.find("{")
-    if start < 0:
-        return None
-
-    depth = 0
-    in_string = False
-    escape = False
-    for idx, char in enumerate(text[start:], start=start):
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start:idx + 1]
-
-    return None
+    from .json_repair import _extract_json_object as advanced_extract
+    return advanced_extract(text)
 
 
 def validate_json_schema(payload: dict[str, Any], schema: dict[str, Any]) -> None:
-    required = schema.get("required") or []
-    for key in required:
-        if key not in payload:
-            raise ValueError(f"Structured output missing required field: {key}")
-    properties = schema.get("properties") or {}
-    for key, rules in properties.items():
-        if key not in payload:
-            continue
-        value = payload[key]
-        expected_type = rules.get("type")
-        if expected_type == "string" and not isinstance(value, str):
-            raise ValueError(f"Structured output field must be string: {key}")
-        if expected_type == "number" and (isinstance(value, bool) or not isinstance(value, (int, float))):
-            raise ValueError(f"Structured output field must be number: {key}")
-        if expected_type == "boolean" and not isinstance(value, bool):
-            raise ValueError(f"Structured output field must be boolean: {key}")
-        if expected_type == "array" and not isinstance(value, list):
-            raise ValueError(f"Structured output field must be array: {key}")
-        if expected_type == "object" and not isinstance(value, dict):
-            raise ValueError(f"Structured output field must be object: {key}")
-        enum_values = rules.get("enum")
-        if enum_values is not None and value not in enum_values:
-            raise ValueError(f"Structured output field has unsupported value: {key}")
+    """Validate the complete structured-output contract, including nested actions.
+
+    Action schemas carry their safety-critical operation enum inside array items.
+    A root-only check would let an invalid nested operation reach mutation
+    validation, where it becomes an opaque no-op instead of consuming the
+    configured structured-output retry.
+    """
+    _validate_json_value(payload, schema, path="$")
+
+
+def _validate_json_value(value: Any, rules: dict[str, Any], *, path: str) -> None:
+    expected_type = rules.get("type")
+    if expected_type == "string" and not isinstance(value, str):
+        raise ValueError(f"Structured output field must be string: {path}")
+    if expected_type == "number" and (isinstance(value, bool) or not isinstance(value, (int, float))):
+        raise ValueError(f"Structured output field must be number: {path}")
+    if expected_type == "boolean" and not isinstance(value, bool):
+        raise ValueError(f"Structured output field must be boolean: {path}")
+    if expected_type == "array" and not isinstance(value, list):
+        raise ValueError(f"Structured output field must be array: {path}")
+    if expected_type == "object" and not isinstance(value, dict):
+        raise ValueError(f"Structured output field must be object: {path}")
+
+    enum_values = rules.get("enum")
+    if enum_values is not None and value not in enum_values:
+        raise ValueError(f"Structured output field has unsupported value at {path}: {value!r}")
+
+    if isinstance(value, dict):
+        required = rules.get("required") or []
+        for key in required:
+            if key not in value:
+                raise ValueError(f"Structured output missing required field: {path}.{key}")
+        for key, nested_rules in (rules.get("properties") or {}).items():
+            if key in value:
+                _validate_json_value(value[key], nested_rules, path=f"{path}.{key}")
+    elif isinstance(value, list) and isinstance(rules.get("items"), dict):
+        item_rules = rules["items"]
+        for index, item in enumerate(value):
+            _validate_json_value(item, item_rules, path=f"{path}[{index}]")
 
 
 def structured_fallback_payload(
@@ -783,7 +772,10 @@ class OllamaIntentClassifier:
     ) -> Intent:
         explicit_intent = request.metadata.get("intent")
         if explicit_intent:
-            return Intent(explicit_intent)
+            try:
+                return Intent(explicit_intent)
+            except ValueError:
+                pass
         schema = {
             "type": "object",
             "properties": {
@@ -796,15 +788,21 @@ class OllamaIntentClassifier:
                         "reminder",
                     ],
                 },
+                "operation_kind": {
+                    "type": "string",
+                    "enum": [
+                        "durable_knowledge",
+                        "reminder_lifecycle",
+                        "clarification_reply",
+                        "none",
+                    ],
+                },
                 "confidence": {"type": "number"},
-                "multi_intent": {"type": "boolean"},
-                "requires_clarification": {"type": "boolean"},
             },
             "required": [
                 "intent",
+                "operation_kind",
                 "confidence",
-                "multi_intent",
-                "requires_clarification",
             ],
         }
         try:
@@ -830,10 +828,17 @@ class OllamaIntentClassifier:
             validate_json_schema(payload, schema)
         except Exception:
             return Intent.GENERAL_RESPONSE
-        if (
-            float(payload.get("confidence", 0.0)) < self.min_confidence
-            or bool(payload.get("requires_clarification"))
-            or bool(payload.get("multi_intent"))
-        ):
-            return Intent.CLARIFICATION
-        return Intent(str(payload["intent"]))
+        if float(payload.get("confidence", 0.0)) < self.min_confidence:
+            return Intent.GENERAL_RESPONSE
+
+        operation_kind = str(payload["operation_kind"])
+        operation_intents = {
+            "durable_knowledge": Intent.KNOWLEDGE_FACTS,
+            "reminder_lifecycle": Intent.REMINDER,
+            "clarification_reply": Intent.CLARIFICATION,
+            "none": Intent.GENERAL_RESPONSE,
+        }
+        intent = operation_intents[operation_kind]
+        if intent is Intent.CLARIFICATION and not _has_pending_clarification(last_qa_resolution):
+            return Intent.GENERAL_RESPONSE
+        return intent
