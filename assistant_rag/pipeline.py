@@ -13,6 +13,8 @@ from .contracts import (
     ApprovedConversationContext,
     LastQAPath,
     LastQAResolution,
+    LastQAInteractionType,
+    QuestionSource,
     validate_last_qa_resolution,
 )
 from .contracts import Intent
@@ -54,9 +56,47 @@ class AssistantPipeline:
         with StageTimer("classification_preflight"):
             preflight_intent = self.classifier.classify(request, rewritten)
 
-        state_mutation = preflight_intent in {Intent.KNOWLEDGE_FACTS, Intent.REMINDER}
+        reminder_reply = bool((request.metadata or {}).get("reminder_reply_context"))
+        # A notification reply carries an exact reminder-to-source-hop mapping.
+        # It must restore that Last-QA state before normal routing, even when
+        # its text contains a reminder action such as "turn it off".
+        state_mutation = (
+            preflight_intent in {Intent.KNOWLEDGE_FACTS, Intent.REMINDER}
+            and not reminder_reply
+        )
         with StageTimer("last_qa_resolution", {"state_mutation": state_mutation}) as last_qa_stage:
-            if state_mutation:
+            if reminder_reply:
+                last_state = self.last_qa_store.get(request.user_id)
+                metadata = request.metadata or {}
+                source_topic_id = metadata.get("source_topic_id")
+                source_hop_id = metadata.get("source_hop_id")
+                if (
+                    last_state is not None
+                    and source_topic_id == last_state.linked_topic_id
+                    and source_hop_id == last_state.linked_hop_id
+                ):
+                    resolution = LastQAResolution(
+                        path=LastQAPath.LATEST_CONTEXT_INTERACTION,
+                        rewritten_query=rewritten,
+                        state=last_state,
+                        did_merge_query=False,
+                        skip_broad_retrieval=True,
+                        interaction_type=LastQAInteractionType.REMINDER_NOTIFICATION_REPLY,
+                        question_source=QuestionSource.NONE,
+                        linked_topic_id=last_state.linked_topic_id,
+                        linked_hop_id=last_state.linked_hop_id,
+                        reminder_id=metadata.get("reminder_id"),
+                        notification_id=metadata.get("notification_id"),
+                        source_topic_id=source_topic_id,
+                        source_hop_id=source_hop_id,
+                        merge_reason="exact_reminder_notification_context",
+                        skip_reason="reminder_reply_context_hash_matched_source_hop",
+                        is_authoritative_state=True,
+                    )
+                    validate_last_qa_resolution(resolution)
+                else:
+                    resolution = self.last_qa_resolver.resolve(request, rewritten, last_state)
+            elif state_mutation:
                 resolution = LastQAResolution(
                     path=LastQAPath.CURRENT_STATE_MUTATION,
                     rewritten_query=rewritten,

@@ -10,6 +10,12 @@ from assistant_rag.llm import LLMTask
 from assistant_rag.autoscan import ReminderAutoscan
 from assistant_rag.platform import GmailSender
 from assistant_rag.observability import new_request_id, start_trace, trace_summary_asdict
+from assistant_rag.reminder_reply import (
+    build_reminder_reply_context_index,
+    build_reminder_reply_last_qa,
+    build_reminder_reply_metadata,
+    reminder_notification_key,
+)
 from assistant_rag.production_factory import (
     build_production_pipeline,
     build_production_repository,
@@ -106,7 +112,9 @@ def _format_notification_time(notification: dict[str, object]) -> str:
         return str(value)
 
 
-def _render_reminder_notifications(st: object, *, repository: object, user_id: str) -> None:
+def _render_reminder_notifications(
+    st: object, *, repository: object, pipeline: object, user_id: str,
+) -> None:
     """Render every durable notification, nearest at the sidebar top."""
     notifications = repository.list_notifications(user_id=user_id)
     unread_count = sum(item.get("ui_status") == "unread" for item in notifications)
@@ -114,6 +122,9 @@ def _render_reminder_notifications(st: object, *, repository: object, user_id: s
     if not notifications:
         st.caption("No due reminder notifications.")
         return
+    context_index = build_reminder_reply_context_index(
+        repository=repository, user_id=user_id, notifications=notifications
+    )
 
     # The repository orders fire time descending: nearest due notification is
     # at the top, while increasingly older/farther overdue items flow down.
@@ -127,6 +138,61 @@ def _render_reminder_notifications(st: object, *, repository: object, user_id: s
             st.caption(_format_notification_time(notification))
             if summary:
                 st.caption(summary)
+            context = context_index.get(
+                reminder_notification_key(
+                    str(notification["reminder_id"]), str(notification["notification_id"])
+                ),
+                {},
+            )
+            supporting_question = context.get("supporting_question")
+            if supporting_question:
+                st.caption(f"Supporting question: {supporting_question}")
+            with st.form(key=f"notification-reply-form-{notification['notification_id']}", clear_on_submit=True):
+                reply_text = st.text_area(
+                    "Reply or comment for the assistant",
+                    key=f"notification-reply-text-{notification['notification_id']}",
+                    placeholder="Answer the supporting question, add a comment, or ask for help…",
+                )
+                submitted = st.form_submit_button("Send to chatbot")
+            if submitted:
+                reply = reply_text.strip()
+                if not reply:
+                    st.warning("Enter a reply or comment first.")
+                elif not context or not context.get("source_hop_id"):
+                    st.warning("This reminder’s source conversation is unavailable. Nothing was sent.")
+                else:
+                    # The hash lookup restores the source hop's user query,
+                    # response, and supporting questions before normal routing.
+                    pipeline.last_qa_store.save(user_id, build_reminder_reply_last_qa(context))
+                    start_trace(new_request_id())
+                    response = pipeline.handle(
+                        ChatRequest(
+                            user_id=user_id,
+                            raw_query=reply,
+                            parent_hop_id=context.get("source_hop_id"),
+                            metadata=build_reminder_reply_metadata(
+                                reminder_id=str(notification["reminder_id"]),
+                                notification_id=str(notification["notification_id"]),
+                                context=context,
+                            ),
+                            platform_context={
+                                "gmail_username": st.session_state.get("gmail_username", ""),
+                                "gmail_app_password": st.session_state.get("gmail_app_password", ""),
+                            },
+                        ),
+                        repository,
+                    )
+                    st.session_state.chat_messages.extend([
+                        {"role": "user", "content": reply},
+                        {"role": "assistant", "content": response.final_chat_text},
+                    ])
+                    repository.update_notification_ui_status(
+                        user_id=user_id,
+                        notification_id=str(notification["notification_id"]),
+                        ui_status="read",
+                    )
+                    st.session_state.reminder_reply_notice = "Your reminder reply was sent through the main chatbot."
+                    st.rerun()
             if unread and st.button("Mark read", key=f"notification-read-{notification['notification_id']}"):
                 repository.update_notification_ui_status(
                     user_id=user_id,
@@ -185,13 +251,16 @@ def main() -> None:
             st.warning("Reminder catch-up is temporarily unavailable. Use refresh to retry; chat remains available.")
 
         _render_reminder_notifications(
-            st, repository=st.session_state.repository, user_id=user_id
+            st,
+            repository=st.session_state.repository,
+            pipeline=st.session_state.pipeline,
+            user_id=user_id,
         )
 
         st.divider()
         st.subheader("Gmail & Debug")
-        gmail_username = st.text_input("Gmail username", value="")
-        gmail_app_password = st.text_input("Gmail app password", value="", type="password")
+        gmail_username = st.text_input("Gmail username", value="", key="gmail_username")
+        gmail_app_password = st.text_input("Gmail app password", value="", type="password", key="gmail_app_password")
         show_pipeline_trace = st.checkbox(
             "Show real pipeline trace",
             value=False,
@@ -230,6 +299,9 @@ def main() -> None:
     notice = st.session_state.pop("new_chat_notice", None)
     if notice:
         st.success(notice)
+    reminder_reply_notice = st.session_state.pop("reminder_reply_notice", None)
+    if reminder_reply_notice:
+        st.success(reminder_reply_notice)
 
     for message in st.session_state.chat_messages:
         with st.chat_message(message["role"]):

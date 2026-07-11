@@ -755,12 +755,19 @@ class SQLiteRepository(AssistantRepository):
                 r.subject,
                 r.reminder_summary,
                 r.supporting_question,
+                r.supporting_response,
                 r.source_hop_id,
                 n.ui_status,
-                h.topic_id
+                h.topic_id,
+                h.raw_user_query AS source_raw_user_query,
+                h.rewritten_user_query AS source_rewritten_user_query,
+                h.raw_response AS source_raw_response,
+                h.supporting_questions_json,
+                h.response_type AS source_response_type
             FROM reminders r
             JOIN reminder_notifications n ON r.reminder_id = n.reminder_id
-            LEFT JOIN conversation_hops h ON r.source_hop_id = h.hop_id
+            LEFT JOIN conversation_hops h
+              ON r.source_hop_id = h.hop_id AND h.user_id = r.user_id
             WHERE r.user_id = ? AND r.reminder_id = ? AND n.notification_id = ?
             """,
             (user_id, reminder_id, notification_id),

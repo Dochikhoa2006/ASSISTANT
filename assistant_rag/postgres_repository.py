@@ -387,16 +387,25 @@ class PostgresRepository(AssistantRepository):
             reminders.c.subject,
             reminders.c.reminder_summary,
             reminders.c.supporting_question,
+            reminders.c.supporting_response,
             reminders.c.source_hop_id,
             reminder_notifications.c.ui_status,
-            conversation_hops.c.topic_id
+            conversation_hops.c.topic_id,
+            conversation_hops.c.raw_user_query.label("source_raw_user_query"),
+            conversation_hops.c.rewritten_user_query.label("source_rewritten_user_query"),
+            conversation_hops.c.raw_response.label("source_raw_response"),
+            conversation_hops.c.supporting_questions_json,
+            conversation_hops.c.response_type.label("source_response_type"),
         ).select_from(
             reminders.join(
                 reminder_notifications,
                 reminders.c.reminder_id == reminder_notifications.c.reminder_id
             ).outerjoin(
                 conversation_hops,
-                reminders.c.source_hop_id == conversation_hops.c.hop_id
+                and_(
+                    reminders.c.source_hop_id == conversation_hops.c.hop_id,
+                    reminders.c.user_id == conversation_hops.c.user_id,
+                ),
             )
         ).where(
             and_(
@@ -414,9 +423,15 @@ class PostgresRepository(AssistantRepository):
                 "subject": row[0],
                 "reminder_summary": row[1],
                 "supporting_question": row[2],
-                "source_hop_id": row[3],
-                "ui_status": row[4],
-                "topic_id": row[5]
+                "supporting_response": row[3],
+                "source_hop_id": row[4],
+                "ui_status": row[5],
+                "topic_id": row[6],
+                "source_raw_user_query": row[7],
+                "source_rewritten_user_query": row[8],
+                "source_raw_response": row[9],
+                "supporting_questions_json": row[10],
+                "source_response_type": row[11],
             }
 
 

@@ -22,6 +22,7 @@ from .pipeline import AssistantPipeline
 from .auth import authenticate_token, get_auth_context
 from .rate_limit import RateLimiter, build_rate_limiter
 from .settings import ProductionSettings
+from .reminder_reply import build_reminder_reply_last_qa, build_reminder_reply_metadata
 
 
 @dataclass
@@ -533,14 +534,45 @@ def build_api_app(
         if not user_id or user_id != auth_context.user_id:
             raise HTTPException(status_code=403, detail="Not authorized for this user_id")
         try:
-            write = repository.append_reminder_reply(
-                user_id=payload["user_id"],
+            reply_text = str(payload.get("reply_text") or "").strip()
+            if not reply_text:
+                raise HTTPException(status_code=422, detail="reply_text is required")
+            notification_id = str(payload.get("notification_id") or "")
+            context = repository.load_reminder_reply_context(
+                user_id=user_id,
                 reminder_id=reminder_id,
-                notification_id=payload["notification_id"],
-                reply_text=payload["reply_text"],
-                response_text="Noted. (Context saved)",
+                notification_id=notification_id,
             )
-            return {"conversation_hop_id": write.hop_id, "indexing_outbox_job_id": write.outbox_job_id}
+            if not context:
+                raise ValueError("Reminder reply context not found for user")
+            if not context.get("source_hop_id"):
+                raise ValueError("Reminder source conversation is unavailable")
+            pipeline.last_qa_store.save(user_id, build_reminder_reply_last_qa(context))
+            request_id = new_request_id()
+            start_trace(request_id)
+            started_at = time.perf_counter()
+            response = pipeline.handle(
+                ChatRequest(
+                    user_id=user_id,
+                    raw_query=reply_text,
+                    parent_hop_id=context.get("source_hop_id"),
+                    metadata=build_reminder_reply_metadata(
+                        reminder_id=reminder_id,
+                        notification_id=notification_id,
+                        context=context,
+                    ),
+                ),
+                repository,
+            )
+            repository.update_notification_ui_status(
+                user_id=user_id, notification_id=notification_id, ui_status="read"
+            )
+            return _response_payload(
+                response,
+                request_id=request_id,
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+                include_trace=True,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
