@@ -151,16 +151,21 @@ class ONNXLLMClient:
         self._tokenizers: dict[str, og.Tokenizer] = {}
         self.last_error_by_task: dict[LLMTask, str] = {}
         if preload:
-            self._preload_models()
+            self.preload_models()
 
-    def _preload_models(self) -> None:
+    def preload_models(self) -> list[str]:
+        """Load every configured ONNX model into memory."""
         import dataclasses
         settings = self.router.settings
+        loaded: list[str] = []
         for field in dataclasses.fields(settings):
             if field.name.startswith("model_"):
                 model_name = getattr(settings, field.name)
                 if model_name and "onnx" in model_name.lower():
                     self._get_model_and_tokenizer(model_name)
+                    if model_name not in loaded:
+                        loaded.append(model_name)
+        return loaded
 
     def _get_model_and_tokenizer(self, model_name: str) -> tuple[og.Model, og.Tokenizer]:
         if model_name not in self._models:

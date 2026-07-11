@@ -113,6 +113,29 @@ class OllamaLLMClient:
     router: OllamaModelRouter
     last_error_by_task: dict[LLMTask, str] = field(default_factory=dict)
 
+    def warmup_models(self) -> list[str]:
+        """Ask Ollama to load every configured local model and keep it resident."""
+        models: list[str] = []
+        for field_info in fields(self.settings):
+            if not field_info.name.startswith("model_"):
+                continue
+            model = str(getattr(self.settings, field_info.name) or "")
+            if model and not uses_onnx_runtime(model) and model not in models:
+                models.append(model)
+
+        for model in models:
+            self._request_json(
+                "/api/generate",
+                {
+                    "model": model,
+                    "prompt": "",
+                    "stream": False,
+                    "keep_alive": self.settings.keep_alive,
+                },
+                timeout=max(60.0, max(self.router.timeout_for_task(task) for task in LLMTask)),
+            )
+        return models
+
     def generate_json(
         self,
         *,

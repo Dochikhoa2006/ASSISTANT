@@ -50,8 +50,8 @@ class OllamaSettings:
     structured_retry_count: int = 1
     keep_alive: int | str = "30m"
     disable_thinking: bool = True
-    # Loading the Phi ONNX bundle can download several gigabytes. Keep startup
-    # responsive by loading it on first use unless an operator explicitly opts in.
+    # Standalone ONNX clients remain lazy. The production pipeline performs its
+    # configured startup warm-up before accepting the first user query.
     preload_onnx_models: bool = False
 
     # Task: QUERY_REWRITE
@@ -226,6 +226,13 @@ class RerankerSettings:
     device: str | None = None
     batch_size: int = 24
     max_candidates: int = 20
+
+
+@dataclass(frozen=True)
+class ModelWarmupSettings:
+    """Controls eager model execution before the assistant accepts requests."""
+
+    enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -573,6 +580,7 @@ class ProductionSettings:
     chroma: ChromaSettings = field(default_factory=ChromaSettings)
     embeddings: EmbeddingSettings = field(default_factory=EmbeddingSettings)
     reranker: RerankerSettings = field(default_factory=RerankerSettings)
+    model_warmup: ModelWarmupSettings = field(default_factory=ModelWarmupSettings)
     last_qa: LastQASettings = field(default_factory=LastQASettings)
     worker: WorkerSettings = field(default_factory=WorkerSettings)
     ui: UISettings = field(default_factory=UISettings)
@@ -801,6 +809,9 @@ class ProductionSettings:
                 max_candidates=_get_int(
                     "ASSISTANT_RERANKER_MAX_CANDIDATES", RerankerSettings.max_candidates
                 ),
+            ),
+            model_warmup=ModelWarmupSettings(
+                enabled=_get_bool("ASSISTANT_MODEL_WARMUP", ModelWarmupSettings.enabled),
             ),
             last_qa=LastQASettings(
                 path=os.getenv("ASSISTANT_LAST_QA_PATH", LastQASettings.path),

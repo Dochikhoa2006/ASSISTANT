@@ -58,6 +58,14 @@ class SentenceTransformerCrossEncoderReranker:
             if item.rerank_score >= self.settings.min_score
         ]
 
+    def warmup(self) -> None:
+        """Execute the smallest valid scoring operation at process startup."""
+        if self.remote is not None:
+            # A remote reranker owns its own model lifecycle. There is no
+            # empty request contract we can safely assume here.
+            return
+        self.model.predict([("assistant model warmup", "assistant model warmup")], batch_size=1)
+
 
 @dataclass
 class HTTPReranker:

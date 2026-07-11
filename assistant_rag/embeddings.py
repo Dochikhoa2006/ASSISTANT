@@ -38,6 +38,10 @@ class SentenceTransformerEmbeddingClient:
         )
         return [list(map(float, vector)) for vector in vectors]
 
+    def warmup(self) -> None:
+        """Execute one encode so runtime kernels are ready before a user query."""
+        self.embed(["assistant model warmup"])
+
 
 @dataclass(frozen=True)
 class HashEmbeddingClient:

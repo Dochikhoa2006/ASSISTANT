@@ -191,6 +191,8 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
     )
     llm = HybridLLMClient(ollama_llm, onnx_llm)
     reranker = SentenceTransformerCrossEncoderReranker(settings.reranker)
+    if settings.model_warmup.enabled:
+        _warm_production_models(embeddings, reranker, ollama_llm, onnx_llm)
     retriever = HybridRetriever(
         bm25=bm25,
         chroma=chroma,
@@ -368,3 +370,23 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
         chat_output=ChatOutput(),
         prompt_registry=prompt_registry,
     )
+
+
+def _warm_production_models(
+    embeddings: SentenceTransformerEmbeddingClient,
+    reranker: SentenceTransformerCrossEncoderReranker,
+    ollama_llm: OllamaLLMClient,
+    onnx_llm: ONNXLLMClient,
+) -> None:
+    """Make startup fail early instead of making the first chat request cold."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    logger.info("Warming embedding, reranking, and configured LLM models before accepting requests")
+    embeddings.warmup()
+    reranker.warmup()
+    warmed_ollama_models = ollama_llm.warmup_models()
+    warmed_onnx_models = onnx_llm.preload_models()
+    if warmed_onnx_models:
+        logger.info("ONNX models warmed: %s", ", ".join(warmed_onnx_models))
+    logger.info("Ollama models warmed: %s", ", ".join(warmed_ollama_models))
