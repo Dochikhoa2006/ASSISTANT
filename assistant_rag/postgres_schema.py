@@ -192,6 +192,8 @@ reminder_notifications = Table(
     Column("notification_id", String, primary_key=True),
     Column("reminder_id", String, ForeignKey("reminders.reminder_id"), nullable=False),
     Column("user_id", String, nullable=False),
+    Column("source_topic_id", String, nullable=True),
+    Column("source_hop_id", String, nullable=True),
     Column("ui_status", String, nullable=False),
     Column("delivery_status", String, nullable=False, default="pending"),
     Column("delivery_attempts", Integer, nullable=False, default=0),

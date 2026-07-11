@@ -225,6 +225,8 @@ class SQLiteRepository(AssistantRepository):
                 notification_id TEXT PRIMARY KEY,
                 reminder_id TEXT NOT NULL,
                 user_id TEXT NOT NULL,
+                source_topic_id TEXT NULL,
+                source_hop_id TEXT NULL,
                 ui_status TEXT NOT NULL CHECK (ui_status IN ('unread', 'read', 'deleted')),
                 delivery_status TEXT NOT NULL DEFAULT 'pending' CHECK (delivery_status IN ('pending', 'sent', 'failed', 'retrying')),
                 delivery_attempts INTEGER NOT NULL DEFAULT 0,
@@ -323,6 +325,7 @@ class SQLiteRepository(AssistantRepository):
         self._ensure_release2_sqlite_columns()
         self._ensure_release3_sqlite_columns()
         self._ensure_release4_sqlite_columns()
+        self._ensure_release5_reminder_source_bindings()
         self.connection.commit()
 
     def _ensure_release2_sqlite_columns(self) -> None:
@@ -413,6 +416,63 @@ class SQLiteRepository(AssistantRepository):
         )
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_reminders_user_parent_recurring ON reminders(user_id, parent_recurring_reminder_id)"
+        )
+
+    def _ensure_release5_reminder_source_bindings(self) -> None:
+        """Persist an immutable source-hop snapshot for every notification."""
+        def columns(table_name: str) -> set[str]:
+            rows = self.connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+            return {str(row["name"]) for row in rows}
+
+        notification_columns = columns("reminder_notifications")
+        if "source_topic_id" not in notification_columns:
+            self.connection.execute(
+                "ALTER TABLE reminder_notifications ADD COLUMN source_topic_id TEXT NULL"
+            )
+        if "source_hop_id" not in notification_columns:
+            self.connection.execute(
+                "ALTER TABLE reminder_notifications ADD COLUMN source_hop_id TEXT NULL"
+            )
+
+        # Existing notifications acquire the source identity they had when
+        # this invariant was introduced. New notifications copy it at insert
+        # time, so subsequent reminder changes can never redirect a reply.
+        self.connection.execute(
+            """
+            UPDATE reminder_notifications
+            SET source_topic_id = (
+                    SELECT r.source_topic_id FROM reminders r
+                    WHERE r.reminder_id = reminder_notifications.reminder_id
+                      AND r.user_id = reminder_notifications.user_id
+                ),
+                source_hop_id = (
+                    SELECT r.source_hop_id FROM reminders r
+                    WHERE r.reminder_id = reminder_notifications.reminder_id
+                      AND r.user_id = reminder_notifications.user_id
+                )
+            WHERE source_topic_id IS NULL AND source_hop_id IS NULL
+            """
+        )
+        self.connection.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS prevent_reminder_source_rebind
+            BEFORE UPDATE OF source_topic_id, source_hop_id ON reminders
+            FOR EACH ROW
+            WHEN OLD.source_topic_id IS NOT NEW.source_topic_id
+              OR OLD.source_hop_id IS NOT NEW.source_hop_id
+            BEGIN
+                SELECT RAISE(ABORT, 'Reminder source conversation binding is immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS prevent_notification_source_rebind
+            BEFORE UPDATE OF source_topic_id, source_hop_id ON reminder_notifications
+            FOR EACH ROW
+            WHEN OLD.source_topic_id IS NOT NEW.source_topic_id
+              OR OLD.source_hop_id IS NOT NEW.source_hop_id
+            BEGIN
+                SELECT RAISE(ABORT, 'Reminder notification source binding is immutable');
+            END;
+            """
         )
 
     def _has_legacy_notification_unique_constraint(self) -> bool:
@@ -756,7 +816,8 @@ class SQLiteRepository(AssistantRepository):
                 r.reminder_summary,
                 r.supporting_question,
                 r.supporting_response,
-                r.source_hop_id,
+                n.source_topic_id,
+                n.source_hop_id,
                 n.ui_status,
                 h.topic_id,
                 h.raw_user_query AS source_raw_user_query,
@@ -767,7 +828,7 @@ class SQLiteRepository(AssistantRepository):
             FROM reminders r
             JOIN reminder_notifications n ON r.reminder_id = n.reminder_id
             LEFT JOIN conversation_hops h
-              ON r.source_hop_id = h.hop_id AND h.user_id = r.user_id
+              ON n.source_hop_id = h.hop_id AND h.user_id = r.user_id
             WHERE r.user_id = ? AND r.reminder_id = ? AND n.notification_id = ?
             """,
             (user_id, reminder_id, notification_id),
@@ -1526,6 +1587,21 @@ class SQLiteRepository(AssistantRepository):
         next_fire_time: str | None = None,
         parent_recurring_reminder_id: str | None = None,
     ) -> str:
+        if not source_hop_id:
+            raise RepositoryValidationError("A reminder must be bound to its source conversation hop")
+        source = cursor.execute(
+            """
+            SELECT topic_id FROM conversation_hops
+            WHERE hop_id = ? AND user_id = ?
+            """,
+            (source_hop_id, user_id),
+        ).fetchone()
+        if not source:
+            raise RepositoryValidationError("Reminder source hop does not belong to this user")
+        canonical_topic_id = str(source["topic_id"])
+        if source_topic_id and source_topic_id != canonical_topic_id:
+            raise RepositoryValidationError("Reminder source topic does not match its source hop")
+        source_topic_id = canonical_topic_id
         reminder_id = new_id()
         timestamp = now_iso()
         cursor.execute(
@@ -1639,16 +1715,29 @@ class SQLiteRepository(AssistantRepository):
         ).fetchone()
         if current:
             return str(current["notification_id"])
+        source = cursor.execute(
+            """
+            SELECT source_topic_id, source_hop_id FROM reminders
+            WHERE user_id = ? AND reminder_id = ?
+            """,
+            (user_id, reminder_id),
+        ).fetchone()
+        if not source or not source["source_hop_id"]:
+            raise RepositoryValidationError("Reminder has no immutable source conversation hop")
         notification_id = new_id()
         timestamp = now_iso()
         cursor.execute(
             """
             INSERT INTO reminder_notifications (
-                notification_id, reminder_id, user_id, ui_status,
+                notification_id, reminder_id, user_id, source_topic_id, source_hop_id, ui_status,
                 delivery_status, delivery_attempts, created_at, fire_time
-            ) VALUES (?, ?, ?, 'unread', 'pending', 0, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, 'unread', 'pending', 0, ?, ?)
             """,
-            (notification_id, reminder_id, user_id, timestamp, fire_time),
+            (
+                notification_id, reminder_id, user_id,
+                source["source_topic_id"], source["source_hop_id"],
+                timestamp, fire_time,
+            ),
         )
         return notification_id
 
@@ -2084,6 +2173,15 @@ class SQLiteRepository(AssistantRepository):
             replacement_time = action.replacement_time or action.reminder_time or action.observed_reminder_time
             if not replacement_time:
                 raise RepositoryValidationError("Replacement reminder time is required")
+            original_source = cursor.execute(
+                """
+                SELECT source_topic_id, source_hop_id FROM reminders
+                WHERE user_id = ? AND reminder_id = ?
+                """,
+                (user_id, reminder_id),
+            ).fetchone()
+            if not original_source:
+                raise ReminderConflictError("Reminder source binding was not found")
             self.update_reminder_status(
                 cursor,
                 user_id=user_id,
@@ -2095,8 +2193,11 @@ class SQLiteRepository(AssistantRepository):
             new_reminder_id = self.add_reminder(
                 cursor,
                 user_id=user_id,
-                source_topic_id=source_topic_id,
-                source_hop_id=audit_hop_id,
+                # A modification produces a successor reminder, but it must
+                # keep the original conversation identity used by reminder
+                # replies and its supporting question.
+                source_topic_id=original_source["source_topic_id"] or source_topic_id,
+                source_hop_id=original_source["source_hop_id"] or audit_hop_id,
                 reminder_time=replacement_time.isoformat(),
                 event_time=(action.event_time or replacement_time).isoformat(),
                 raw_reminder=action.raw_reminder or "",

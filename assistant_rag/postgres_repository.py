@@ -388,7 +388,8 @@ class PostgresRepository(AssistantRepository):
             reminders.c.reminder_summary,
             reminders.c.supporting_question,
             reminders.c.supporting_response,
-            reminders.c.source_hop_id,
+            reminder_notifications.c.source_topic_id,
+            reminder_notifications.c.source_hop_id,
             reminder_notifications.c.ui_status,
             conversation_hops.c.topic_id,
             conversation_hops.c.raw_user_query.label("source_raw_user_query"),
@@ -403,7 +404,7 @@ class PostgresRepository(AssistantRepository):
             ).outerjoin(
                 conversation_hops,
                 and_(
-                    reminders.c.source_hop_id == conversation_hops.c.hop_id,
+                    reminder_notifications.c.source_hop_id == conversation_hops.c.hop_id,
                     reminders.c.user_id == conversation_hops.c.user_id,
                 ),
             )
@@ -424,14 +425,15 @@ class PostgresRepository(AssistantRepository):
                 "reminder_summary": row[1],
                 "supporting_question": row[2],
                 "supporting_response": row[3],
-                "source_hop_id": row[4],
-                "ui_status": row[5],
-                "topic_id": row[6],
-                "source_raw_user_query": row[7],
-                "source_rewritten_user_query": row[8],
-                "source_raw_response": row[9],
-                "supporting_questions_json": row[10],
-                "source_response_type": row[11],
+                "source_topic_id": row[4],
+                "source_hop_id": row[5],
+                "ui_status": row[6],
+                "topic_id": row[7],
+                "source_raw_user_query": row[8],
+                "source_rewritten_user_query": row[9],
+                "source_raw_response": row[10],
+                "supporting_questions_json": row[11],
+                "source_response_type": row[12],
             }
 
 
@@ -932,6 +934,22 @@ class PostgresRepository(AssistantRepository):
         next_fire_time: str | None = None,
         parent_recurring_reminder_id: str | None = None,
     ) -> str:
+        if not source_hop_id:
+            raise RepositoryValidationError("A reminder must be bound to its source conversation hop")
+        source = cursor.execute(
+            select(conversation_hops.c.topic_id).where(
+                and_(
+                    conversation_hops.c.hop_id == source_hop_id,
+                    conversation_hops.c.user_id == user_id,
+                )
+            )
+        ).fetchone()
+        if not source:
+            raise RepositoryValidationError("Reminder source hop does not belong to this user")
+        canonical_topic_id = str(source[0])
+        if source_topic_id and source_topic_id != canonical_topic_id:
+            raise RepositoryValidationError("Reminder source topic does not match its source hop")
+        source_topic_id = canonical_topic_id
         reminder_id = new_id()
         timestamp = now_iso()
         cursor.execute(
@@ -1041,6 +1059,16 @@ class PostgresRepository(AssistantRepository):
         row = cursor.execute(stmt).fetchone()
         if row:
             return str(row[0])
+        source = cursor.execute(
+            select(reminders.c.source_topic_id, reminders.c.source_hop_id).where(
+                and_(
+                    reminders.c.user_id == user_id,
+                    reminders.c.reminder_id == reminder_id,
+                )
+            )
+        ).fetchone()
+        if not source or not source[1]:
+            raise RepositoryValidationError("Reminder has no immutable source conversation hop")
             
         notification_id = new_id()
         cursor.execute(
@@ -1048,6 +1076,8 @@ class PostgresRepository(AssistantRepository):
                 notification_id=notification_id,
                 reminder_id=reminder_id,
                 user_id=user_id,
+                source_topic_id=source[0],
+                source_hop_id=source[1],
                 ui_status='unread',
                 delivery_status=NotificationDeliveryStatus.PENDING.value,
                 delivery_attempts=0,
@@ -1427,6 +1457,16 @@ class PostgresRepository(AssistantRepository):
 
         reminder_id = action.target_reminder_ids[0]
         if action_type is ReminderAction.MODIFY:
+            original_source = cursor.execute(
+                select(reminders.c.source_topic_id, reminders.c.source_hop_id).where(
+                    and_(
+                        reminders.c.user_id == user_id,
+                        reminders.c.reminder_id == reminder_id,
+                    )
+                )
+            ).fetchone()
+            if not original_source:
+                raise ReminderConflictError("Reminder source binding was not found")
             self.update_reminder_status(
                 cursor,
                 user_id=user_id,
@@ -1441,8 +1481,8 @@ class PostgresRepository(AssistantRepository):
             new_reminder_id = self.add_reminder(
                 cursor,
                 user_id=user_id,
-                source_topic_id=source_topic_id,
-                source_hop_id=audit_hop_id,
+                source_topic_id=original_source[0] or source_topic_id,
+                source_hop_id=original_source[1] or audit_hop_id,
                 reminder_time=replacement_time.isoformat(),
                 event_time=(action.event_time or replacement_time).isoformat(),
                 raw_reminder=action.raw_reminder or "",
