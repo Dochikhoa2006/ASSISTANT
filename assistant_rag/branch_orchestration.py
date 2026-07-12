@@ -22,6 +22,8 @@ from .contracts import (
 )
 from .database import AssistantRepository
 from .retrieval import HybridRetriever
+from .canonical_retrieval import retrieve_knowledge
+from .reminder_retrieval import retrieve_reminder_candidates
 from .settings import TargetNotFoundPolicy, UnsupportedActionPolicy
 from .retrieval_validation import KnowledgeRetrievalValidationStrategy, ReminderRetrievalValidationStrategy
 
@@ -48,11 +50,11 @@ class KnowledgeTargetResolver:
         if not target_description:
             return (), ActionValidationResult.CLARIFY_MISSING_FIELDS
 
-        results = self.retriever.retrieve_knowledge(
+        results = retrieve_knowledge(
+            retriever=self.retriever,
+            repository=repository,
             user_id=user_id,
             query=target_description,
-            limit=self.config.retrieval.max_results,
-            min_confidence=self.config.mutation_policy.knowledge_relevance_threshold,
         )
         
         if not results:
@@ -60,19 +62,10 @@ class KnowledgeTargetResolver:
                 return (), ActionValidationResult.CLARIFY_AMBIGUOUS_TARGET
             return (), ActionValidationResult.SKIP_NOT_FOUND
             
-        chunk_ids = [r.entity_id for r in results]
+        chunk_ids = [result.entity_id for result in results]
         sql_chunks = repository.get_knowledge_chunks_by_ids(user_id, chunk_ids, include_deleted=False)
-        chunk_map = {str(c["chunk_id"]): c for c in sql_chunks}
-        
-        active_results = []
-        for r in results:
-            if r.entity_id in chunk_map:
-                active_results.append(r)
-        
-        if not active_results:
-            if self.config.mutation_policy.knowledge_not_found_policy == TargetNotFoundPolicy.CLARIFY_ON_NOT_FOUND:
-                return (), ActionValidationResult.CLARIFY_AMBIGUOUS_TARGET
-            return (), ActionValidationResult.SKIP_NOT_FOUND
+        chunk_map = {str(chunk["chunk_id"]): chunk for chunk in sql_chunks}
+        active_results = [result for result in results if result.entity_id in chunk_map]
         
         # A single candidate has already passed retrieval's configured relevance
         # threshold and SQL rehydration/user-ownership checks. Mutating knowledge
@@ -194,11 +187,11 @@ class ReminderTargetResolver:
             return ReminderTargetResolution(validation_result=ActionValidationResult.CLARIFY_MISSING_FIELDS)
             
         statuses = self.candidate_statuses_for_action(action)
-        candidates = repository.list_reminder_candidates(
+        candidates = retrieve_reminder_candidates(
+            repository=repository,
             user_id=user_id,
             statuses=statuses,
-            time_window=None,
-            limit=self.config.reminder_target_candidate_limit,
+            candidate_limit=self.config.reminder_target_candidate_limit,
         )
         
         if not candidates:

@@ -8,6 +8,7 @@ from typing import Any
 
 from .contracts import RetrievalResult
 from .settings import OpenSearchSettings
+from .conversation_embedding import CONVERSATION_HOP_EMBEDDING_VERSION
 
 
 @dataclass
@@ -37,46 +38,57 @@ class OpenSearchBM25Index:
         for index_name in self._index_names():
             if not self.client.indices.exists(index=index_name):
                 self.client.indices.create(index=index_name, body=self._mapping())
+            else:
+                put_mapping = getattr(self.client.indices, "put_mapping", None)
+                if put_mapping is not None:
+                    put_mapping(
+                        index=index_name,
+                        body={"properties": self._mapping()["mappings"]["properties"]},
+                    )
         self._ensure_aliases()
         self._initialized = True
 
-    def search(self, *, user_id: str, query: str, limit: int) -> list[RetrievalResult]:
+    def search(
+        self, *, user_id: str, query: str, entity_type: str, limit: int
+    ) -> list[RetrievalResult]:
         self._ensure_initialized()
         results: list[RetrievalResult] = []
-        for entity_type, index_name in (
-            ("conversation_hop", self.settings.conversation_index),
-            ("knowledge_chunk", self.settings.knowledge_index),
-        ):
-            response = self.client.search(
-                index=index_name,
-                body={
-                    "size": limit,
-                    "query": {
-                        "bool": {
-                            "filter": [{"term": {"user_id": user_id}}],
-                            "must": [{"match": {"text": query}}],
-                        }
-                    },
-                },
+        index_name = self._index_for_entity(entity_type)
+        filters = [{"term": {"user_id": user_id}}]
+        if entity_type == "conversation_hop":
+            filters.append(
+                {"term": {"embedding_contract": CONVERSATION_HOP_EMBEDDING_VERSION}}
             )
-            for hit in response.get("hits", {}).get("hits", []):
-                source = hit.get("_source", {})
-                score = float(hit.get("_score") or 0.0)
-                confidence = score / (score + 1.0) if score > 0 else 0.0
-                text = str(source.get("text", ""))
-                payload = dict(source)
-                payload["text"] = text
-                results.append(
-                    RetrievalResult(
-                        entity_type=entity_type,
-                        entity_id=str(source.get("entity_id") or hit.get("_id")),
-                        source_store_evidence={"opensearch": text},
-                        rerank_score=confidence,
-                        confidence=confidence,
-                        validation_status="candidate",
-                        payload=payload,
-                    )
+        response = self.client.search(
+            index=index_name,
+            body={
+                "size": limit,
+                "query": {
+                    "bool": {
+                        "filter": filters,
+                        "must": [{"match": {"text": query}}],
+                    }
+                },
+            },
+        )
+        for hit in response.get("hits", {}).get("hits", []):
+            source = hit.get("_source", {})
+            score = float(hit.get("_score") or 0.0)
+            confidence = score / (score + 1.0) if score > 0 else 0.0
+            text = str(source.get("text", ""))
+            payload = dict(source)
+            payload["text"] = text
+            results.append(
+                RetrievalResult(
+                    entity_type=entity_type,
+                    entity_id=str(source.get("entity_id") or hit.get("_id")),
+                    source_store_evidence={"opensearch": text},
+                    rerank_score=confidence,
+                    confidence=confidence,
+                    validation_status="candidate",
+                    payload=payload,
                 )
+            )
         return sorted(results, key=lambda item: item.rerank_score, reverse=True)[:limit]
 
     def upsert(
@@ -204,6 +216,8 @@ class OpenSearchBM25Index:
                     "root_hop_id": {"type": "keyword"},
                     "chunk_id": {"type": "keyword"},
                     "chunk_index": {"type": "integer"},
+                    "chunk_count": {"type": "integer"},
+                    "embedding_contract": {"type": "keyword"},
                     "source_id": {"type": "keyword"},
                     "branch_id": {"type": "keyword"},
                     "intent": {"type": "keyword"},

@@ -57,8 +57,6 @@ class EvaluationRunner:
                 results = method(
                     user_id=str(case.get("user_id", "eval-user")),
                     query=query,
-                    limit=3,
-                    min_confidence=float(case.get("min_confidence", 0.0)),
                 )
             except Exception as exc:
                 return {

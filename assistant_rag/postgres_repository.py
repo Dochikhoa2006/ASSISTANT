@@ -17,6 +17,7 @@ from .reminder_safety import normalize_subject, token_similarity, utc_minute, wi
 from .recurrence import calculate_next_fire_time
 from .lifecycle import is_artifact_downloadable, is_indexable_conversation_hop, is_indexable_knowledge_chunk
 from .metrics import GLOBAL_METRICS
+from .conversation_embedding import conversation_hop_embedding_metadata, serialize_conversation_hop
 from .errors import (
     KnowledgeConflictError,
     ReminderConflictError,
@@ -2043,18 +2044,14 @@ class PostgresRepository(AssistantRepository):
         with self.engine.connect() as conn:
             if entity_type == "conversation_hop":
                 stmt = select(
-                    conversation_hops.c.user_id,
-                    conversation_hops.c.topic_id,
-                    conversation_hops.c.hop_id,
-                    conversation_hops.c.parent_hop_id,
-                    conversation_hops.c.root_hop_id,
-                    conversation_hops.c.branch_id,
-                    conversation_hops.c.intent,
-                    conversation_hops.c.response_type,
-                    conversation_hops.c.created_at,
-                    conversation_hops.c.raw_user_query,
-                    conversation_hops.c.raw_response,
+                    conversation_hops,
                     conversation_topics.c.status.label("topic_status"),
+                    conversation_topics.c.topic_summary.label("topic_summary"),
+                    conversation_topics.c.state_summary.label("topic_state_summary"),
+                    conversation_topics.c.entities_json.label("topic_entities_json"),
+                    conversation_topics.c.last_hop_id.label("topic_last_hop_id"),
+                    conversation_topics.c.updated_at.label("topic_updated_at"),
+                    conversation_topics.c.version.label("topic_version"),
                 ).select_from(
                     conversation_hops.join(
                         conversation_topics,
@@ -2067,26 +2064,15 @@ class PostgresRepository(AssistantRepository):
                 row = conn.execute(stmt).fetchone()
                 if not row:
                     raise ValueError("Conversation hop not found")
-                if not is_indexable_conversation_hop({"topic_status": row[11]}):
+                hop = dict(row._mapping)
+                if not is_indexable_conversation_hop(hop):
                     raise ValueError("Conversation hop is not indexable")
-                text = f"User: {row[9]}\nAssistant: {row[10]}"
-                metadata = {
-                    "user_id": row[0],
-                    "topic_id": row[1],
-                    "hop_id": row[2],
-                    "parent_hop_id": row[3] or "",
-                    "root_hop_id": row[4] or "",
-                    "branch_id": row[5] or "",
-                    "intent": row[6],
-                    "response_type": row[7],
-                    "created_at": row[8],
-                }
                 return OutboxIndexPayload(
-                    user_id=row[0],
+                    user_id=hop["user_id"],
                     entity_type=entity_type,
                     entity_id=entity_id,
-                    text=text,
-                    metadata=metadata,
+                    text=serialize_conversation_hop(hop),
+                    metadata=conversation_hop_embedding_metadata(hop),
                 )
             elif entity_type == "knowledge_chunk":
                 stmt = select(
@@ -2185,49 +2171,38 @@ class PostgresRepository(AssistantRepository):
         with self.engine.connect() as conn:
             rows = conn.execute(
                 select(
-                    conversation_hops.c.hop_id,
-                    conversation_hops.c.user_id,
-                    conversation_hops.c.topic_id,
-                    conversation_hops.c.parent_hop_id,
-                    conversation_hops.c.root_hop_id,
-                    conversation_hops.c.branch_id,
-                    conversation_hops.c.intent,
-                    conversation_hops.c.response_type,
-                    conversation_hops.c.supporting_questions_json,
-                    conversation_hops.c.raw_user_query,
-                    conversation_hops.c.raw_response,
-                    conversation_hops.c.created_at,
+                    conversation_hops,
+                    conversation_topics.c.status.label("topic_status"),
+                    conversation_topics.c.topic_summary.label("topic_summary"),
+                    conversation_topics.c.state_summary.label("topic_state_summary"),
+                    conversation_topics.c.entities_json.label("topic_entities_json"),
+                    conversation_topics.c.last_hop_id.label("topic_last_hop_id"),
+                    conversation_topics.c.updated_at.label("topic_updated_at"),
+                    conversation_topics.c.version.label("topic_version"),
                 ).where(
                     and_(
                         conversation_hops.c.user_id == user_id,
                         conversation_hops.c.hop_id.in_(ids),
                     )
+                ).select_from(
+                    conversation_hops.join(
+                        conversation_topics,
+                        and_(
+                            conversation_topics.c.topic_id == conversation_hops.c.topic_id,
+                            conversation_topics.c.user_id == conversation_hops.c.user_id,
+                        ),
+                    )
                 )
             ).fetchall()
-        hop_map = {str(row[0]): row for row in rows}
+        hop_map = {str(row._mapping["hop_id"]): dict(row._mapping) for row in rows}
         hydrated: list[RetrievalResult] = []
         for result in results:
             hop = hop_map.get(result.entity_id)
             if not hop:
                 continue
             payload = dict(result.payload)
-            payload.update(
-                {
-                    "hop_id": hop[0],
-                    "user_id": hop[1],
-                    "topic_id": hop[2],
-                    "parent_hop_id": hop[3],
-                    "root_hop_id": hop[4],
-                    "branch_id": hop[5],
-                    "intent": hop[6],
-                    "response_type": hop[7],
-                    "supporting_questions_json": hop[8],
-                    "raw_user_query": hop[9],
-                    "raw_response": hop[10],
-                    "created_at": hop[11],
-                    "text": f"User: {hop[9]}\nAssistant: {hop[10]}",
-                }
-            )
+            payload.update(hop)
+            payload["text"] = serialize_conversation_hop(hop)
             hydrated.append(
                 RetrievalResult(
                     entity_type=result.entity_type,

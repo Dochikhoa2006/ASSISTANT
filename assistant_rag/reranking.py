@@ -84,7 +84,10 @@ class HTTPReranker:
         try:
             scores = self._score(body)
         except Exception:
-            return sorted(candidates, key=lambda item: item.rerank_score, reverse=True)
+            # A lexical/vector ordering is not a cross-encoder result.  Do not
+            # let it bypass the canonical final-ranking stage when the remote
+            # cross-encoder is unavailable.
+            return []
         latency_ms = round((time.perf_counter() - started) * 1000, 2)
         reranked = []
         for result, score in zip(candidates, scores, strict=False):

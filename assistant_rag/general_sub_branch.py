@@ -24,7 +24,12 @@ class GeneralSubBranchDetector:
         self.llm = llm
         self.prompt_registry = prompt_registry
 
-    def detect(self, context: PipelineContext, config: GeneralPurposeConfig) -> GeneralSubBranchDecision:
+    def detect(
+        self,
+        context: PipelineContext,
+        config: GeneralPurposeConfig,
+        merged_supporting_detail: str = "",
+    ) -> GeneralSubBranchDecision:
         if not config.general_sub_branch_detector_enabled:
             fallback = GeneralSubBranch(config.general_sub_branch_fallback_mode)
             return GeneralSubBranchDecision(
@@ -64,6 +69,7 @@ class GeneralSubBranchDetector:
                             "human_supporting_questions": human_qs,
                             "reminder_supporting_questions": reminder_qs,
                             "extracted_expected_response_types": extracted_types,
+                            "merged_supporting_detail": merged_supporting_detail,
                         },
                     )
                 ),

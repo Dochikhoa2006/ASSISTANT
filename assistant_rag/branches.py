@@ -61,6 +61,9 @@ from .database import AssistantRepository
 from .llm import LLMClient, LLMTask
 from .prompts import DEFAULT_PROMPT_REGISTRY, PromptContext, PromptRegistry
 from .retrieval import HybridRetriever
+from .canonical_retrieval import retrieve_knowledge
+from .reminder_retrieval import retrieve_reminder_candidates, reminder_candidate_to_context
+from .semantic_chunking import split_semantic_chunks
 from .context_filter import ContextFilter
 from .action_detection import ActionDetector
 from .generation import QuestionGenerationStrategy
@@ -90,39 +93,6 @@ def _mutation_clarification_message_key(domain: str, missing_fields: list[str]) 
     if {"new_reminder_time", "new_subject", "replacement"} & missing:
         return "reminder_missing_update"
     return "reminder_missing_action"
-
-
-def _knowledge_lookup_match(
-    repository: AssistantRepository,
-    *,
-    user_id: str,
-    query: str,
-    minimum_score: float,
-    ambiguity_margin: float,
-) -> tuple[str, str] | None:
-    """Read user-owned SQL facts when derived retrieval has not indexed a recent write."""
-    query_terms = set(re.findall(r"[\w]+", query.casefold()))
-    if not query_terms:
-        return None
-
-    candidates: list[tuple[float, str, str]] = []
-    for fact in repository.list_knowledge_facts(user_id=user_id, include_deleted=False):
-        text = str(fact.get("raw_text") or fact.get("normalized_text") or "").strip()
-        chunk_id = str(fact.get("chunk_id") or "")
-        fact_terms = set(re.findall(r"[\w]+", text.casefold()))
-        if not text or not chunk_id or not fact_terms:
-            continue
-        overlap = len(query_terms & fact_terms) / min(len(query_terms), len(fact_terms))
-        if overlap >= minimum_score:
-            candidates.append((overlap, chunk_id, text))
-
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    top_score, top_chunk_id, top_text = candidates[0]
-    if len(candidates) > 1 and (top_score - candidates[1][0]) < ambiguity_margin:
-        return None
-    return top_chunk_id, top_text
 
 
 def _json_safe(value: Any) -> Any:
@@ -310,39 +280,25 @@ class GeneralResponseBranch:
     general_purpose_config: Any | None = None
 
     def execute(self, context: PipelineContext, repository: AssistantRepository) -> BranchResult:
-        knowledge_results = self.retriever.retrieve_knowledge(
+        knowledge_results = retrieve_knowledge(
+            retriever=self.retriever,
+            repository=repository,
             user_id=context.request.user_id,
             query=context.rewritten_query,
-            limit=self.config.retrieval.max_results,
-            min_confidence=self.config.retrieval.knowledge_min_confidence,
         )
-        knowledge_results = repository.hydrate_knowledge_retrieval_results(
-            user_id=context.request.user_id,
-            results=knowledge_results,
-        )
-        if not knowledge_results:
-            sql_match = _knowledge_lookup_match(
-                repository,
-                user_id=context.request.user_id,
-                query=context.rewritten_query,
-                minimum_score=self.config.mutation_policy.knowledge_relevance_threshold,
-                ambiguity_margin=self.config.mutation_policy.knowledge_ambiguity_margin,
-            )
-            if sql_match:
-                return BranchResult(
-                    response_type=ResponseType.NORMAL,
-                    normal_response_text=sql_match[1],
-                )
 
-        reminder_raw: list[dict[str, Any]] = []
-        if self._should_retrieve_reminder_context(context):
-            allowed = self.config.retrieval.general_response_reminder_statuses
-            for status in allowed:
-                batch = repository.list_reminders(user_id=context.request.user_id, status=status)
-                reminder_raw.extend(batch)
-                if len(reminder_raw) >= self.config.retrieval.general_response_reminder_limit:
-                    break
-            reminder_raw = reminder_raw[:self.config.retrieval.general_response_reminder_limit]
+        reminder_raw = [
+            reminder_candidate_to_context(
+                user_id=context.request.user_id,
+                candidate=candidate,
+            )
+            for candidate in retrieve_reminder_candidates(
+                repository=repository,
+                user_id=context.request.user_id,
+                statuses=self.config.retrieval.general_response_reminder_statuses,
+                candidate_limit=self.config.retrieval.general_response_reminder_limit,
+            )
+        ]
 
         approved_context = self.context_filter.filter(
             user_id=context.request.user_id,
@@ -360,6 +316,7 @@ class GeneralResponseBranch:
                 else []
             ),
         )
+        merged_supporting_detail = self._merge_supporting_detail(approved_context)
 
         from .general_sub_branch import GeneralSubBranchValidator, GeneralPersistencePlanBuilder
         
@@ -368,7 +325,11 @@ class GeneralResponseBranch:
             plan = GeneralPersistencePlanBuilder().build_plan(decision, context, self.general_purpose_config)
             answer_mode = self._general_sub_branch_to_answer_mode(decision.sub_branch)
         elif self.sub_branch_detector and self.general_purpose_config:
-            decision = self.sub_branch_detector.detect(context, self.general_purpose_config)
+            decision = self.sub_branch_detector.detect(
+                context,
+                self.general_purpose_config,
+                merged_supporting_detail,
+            )
             decision = GeneralSubBranchValidator().validate(decision, context, self.general_purpose_config)
             plan = GeneralPersistencePlanBuilder().build_plan(decision, context, self.general_purpose_config)
             answer_mode = self._general_sub_branch_to_answer_mode(decision.sub_branch)
@@ -408,7 +369,7 @@ class GeneralResponseBranch:
             allowed_database_updates=", ".join(prompt_ctx.allowed_database_updates),
             prohibited_database_updates=", ".join(prompt_ctx.prohibited_database_updates),
             expected_response_type=prompt_ctx.expected_response_type.value,
-        )
+        ) + "\nRetrieved supporting detail:\n" + merged_supporting_detail
 
         if self.content_composer and self.general_purpose_config:
             composer_input = ContentComposerInput(
@@ -428,6 +389,7 @@ class GeneralResponseBranch:
                 sub_branch_prompt_context=prompt_ctx,
                 sub_branch_supporting_prompt=sub_branch_supporting_prompt,
                 repository=repository,
+                merged_supporting_detail=merged_supporting_detail,
             )
             composer_result = self.content_composer.compose(composer_input, self.general_purpose_config)
             response = composer_result.final_response_text
@@ -435,25 +397,40 @@ class GeneralResponseBranch:
             composer_result = None
             response = context.request.metadata.get("normal_response_text")
             if not response:
-                response = self._generate_response(context, approved_context, prompt_ctx, sub_branch_supporting_prompt)
+                response = self._generate_response(
+                    context,
+                    approved_context,
+                    prompt_ctx,
+                    sub_branch_supporting_prompt,
+                    merged_supporting_detail,
+                )
 
-        metadata_questions = list(context.request.metadata.get("supporting_questions", []))
-        if self.general_hitl_strategy and composer_result:
-            hitl_decision = self.general_hitl_strategy.evaluate(context, composer_result)
-            hitl_questions = [GeneratedQuestion(
-                text=hitl_decision.question,
-                source=hitl_decision.question_source,
-                purpose="optional_context",
-                confidence=hitl_decision.confidence,
-                should_ask=True,
-            )] if hitl_decision.should_ask else []
-            hitl_result = {"triggered": hitl_decision.should_ask, "confidence": hitl_decision.confidence, "question_count": len(hitl_questions)}
+        if self.general_purpose_config is not None:
+            if self.general_hitl_strategy:
+                hitl_decision = self.general_hitl_strategy.evaluate(
+                    context=context,
+                    response_text=response,
+                    approved_conversation_history=approved_context.approved_conversation_history,
+                    merged_supporting_detail=merged_supporting_detail,
+                )
+                hitl_questions = [GeneratedQuestion(
+                    text=hitl_decision.question,
+                    source=hitl_decision.question_source,
+                    purpose="optional_context",
+                    confidence=hitl_decision.confidence,
+                    should_ask=True,
+                    expected_response_type=hitl_decision.expected_response_type,
+                )] if hitl_decision.should_ask else []
+                hitl_result = {"triggered": hitl_decision.should_ask, "confidence": hitl_decision.confidence, "question_count": len(hitl_questions)}
+            else:
+                hitl_questions = []
+                hitl_result = {"triggered": False, "confidence": 1.0, "question_count": 0, "reason": "disabled_by_general_purpose_config"}
         else:
             hitl_questions, hitl_result = self.hitl_strategy.evaluate(
                 context, response, confidence=1.0
             )
 
-        supporting_questions = metadata_questions + hitl_questions
+        supporting_questions = hitl_questions
         
         topic_title = context.request.metadata.get("topic_title", self.general_purpose_config.general_response_default_topic_title if self.general_purpose_config else "General Conversation")
         
@@ -565,12 +542,16 @@ class GeneralResponseBranch:
             return AnswerMode.FOLLOW_UP_CONVERSATION
         return AnswerMode.NEW_CONVERSATION
 
-    def _should_retrieve_reminder_context(self, context: PipelineContext) -> bool:
-        query_lower = context.rewritten_query.lower()
-        reminder_keywords = ["remind", "schedule", "plan", "upcoming"]
-        if any(kw in query_lower for kw in reminder_keywords):
-            return True
-        return False
+    @staticmethod
+    def _merge_supporting_detail(approved_context: Any) -> str:
+        return json.dumps(
+            {
+                "knowledge_evidence": approved_context.knowledge_evidence,
+                "reminder_context": approved_context.reminder_context,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
     def _detect_answer_mode(self, context: PipelineContext, approved_context: Any) -> AnswerMode:
         if context.last_qa_state and getattr(context.last_qa_state, "supporting_questions", []):
@@ -579,7 +560,14 @@ class GeneralResponseBranch:
             return AnswerMode.NEW_CONVERSATION
         return AnswerMode.FOLLOW_UP_CONVERSATION
 
-    def _generate_response(self, context: PipelineContext, approved_context: Any, prompt_ctx: SubBranchPromptContext, sub_branch_supporting_prompt: str) -> str:
+    def _generate_response(
+        self,
+        context: PipelineContext,
+        approved_context: Any,
+        prompt_ctx: SubBranchPromptContext,
+        sub_branch_supporting_prompt: str,
+        merged_supporting_detail: str,
+    ) -> str:
         evidence = approved_context.knowledge_evidence
         fallback = " ".join(evidence) if evidence else self.prompt_registry.message("answer_model_unavailable")
         if self.llm is None:
@@ -601,6 +589,7 @@ class GeneralResponseBranch:
                             "approved_conversation_history": approved_context.approved_conversation_history,
                             "approved_knowledge_evidence": approved_context.knowledge_evidence,
                             "approved_reminder_context": approved_context.reminder_context,
+                            "merged_supporting_detail": merged_supporting_detail,
                             "sub_branch_supporting_prompt": sub_branch_supporting_prompt,
                             "human_supporting_questions": [q.text for q in context.approved_conversation_context.human_supporting_questions] if context.approved_conversation_context else [],
                             "reminder_supporting_questions": [q.text for q in context.approved_conversation_context.reminder_supporting_questions] if context.approved_conversation_context else [],
@@ -640,6 +629,45 @@ class KnowledgeFactsBranch:
             clarification_question=question,
         )
 
+    def _expand_semantic_knowledge_actions(
+        self, actions: list[ValidatedKnowledgeAction]
+    ) -> list[ValidatedKnowledgeAction]:
+        expanded: list[ValidatedKnowledgeAction] = []
+        for action in actions:
+            text = action.knowledge_text or action.replacement_text or action.new_text
+            if action.action not in {KnowledgeAction.ADD, KnowledgeAction.MODIFY} or not text:
+                expanded.append(action)
+                continue
+            chunks = split_semantic_chunks(
+                text,
+                settings=self.config.knowledge_chunk_settings,
+            )
+            if action.action is KnowledgeAction.MODIFY:
+                expanded.append(
+                    replace(
+                        action,
+                        action=KnowledgeAction.DELETE,
+                        knowledge_text=None,
+                        replacement_text=None,
+                        new_text=None,
+                    )
+                )
+            expanded.extend(
+                replace(
+                    action,
+                    action=KnowledgeAction.ADD,
+                    target_chunk_ids=(),
+                    target_topic_ids=(),
+                    observed_versions={},
+                    observed_is_deleted={},
+                    knowledge_text=chunk,
+                    replacement_text=None,
+                    new_text=chunk,
+                )
+                for chunk in chunks
+            )
+        return expanded
+
     def execute(self, context: PipelineContext, repository: AssistantRepository) -> BranchResult:
         actions = list(context.request.metadata.get("knowledge_actions", []))
         if not actions:
@@ -648,17 +676,24 @@ class KnowledgeFactsBranch:
                     context.request, context.rewritten_query, Intent.KNOWLEDGE_FACTS
                 )
                 if detection.metadata.get("knowledge_lookup"):
-                    stored_text = _knowledge_lookup_match(
-                        repository,
+                    if self.retriever is None:
+                        return self._generate_clarification(
+                            context,
+                            ["target_description"],
+                            "Knowledge retrieval is unavailable.",
+                        )
+                    knowledge_results = retrieve_knowledge(
+                        retriever=self.retriever,
+                        repository=repository,
                         user_id=context.request.user_id,
                         query=context.rewritten_query,
-                        minimum_score=self.config.mutation_policy.knowledge_relevance_threshold,
-                        ambiguity_margin=self.config.mutation_policy.knowledge_ambiguity_margin,
                     )
-                    if stored_text:
+                    if knowledge_results:
                         return BranchResult(
                             response_type=ResponseType.NORMAL,
-                            normal_response_text=stored_text[1],
+                            normal_response_text=str(
+                                knowledge_results[0].payload.get("text", "")
+                            ),
                         )
                     return self._generate_clarification(
                         context,
@@ -754,6 +789,7 @@ class KnowledgeFactsBranch:
         success_text = context.request.metadata.get(
             "operation_response", self.prompt_registry.message("knowledge_updated") if hasattr(self.prompt_registry, "message") else "Knowledge updated successfully."
         )
+        executable_actions = self._expand_semantic_knowledge_actions(executable_actions)
 
         if executable_actions and not context.request.metadata.get("confirmation_approved"):
             for action in executable_actions:

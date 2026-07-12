@@ -19,7 +19,7 @@ from .contracts import (
 )
 from .contracts import Intent
 from .last_qa import InMemoryLastQAStore
-from .platform import PlatformSelector, PostSelectorHITL
+from .platform import PlatformSelector
 from .prompts import DEFAULT_PROMPT_REGISTRY, PromptRegistry
 from .retrieval import HybridRetriever
 from .branches import BranchRouter
@@ -43,25 +43,24 @@ class AssistantPipeline:
     bundler: ResponseBundler
     platform_selector: PlatformSelector
     chat_output: ChatOutput
-    post_selector_hitl: PostSelectorHITL = field(default_factory=PostSelectorHITL)
     prompt_registry: PromptRegistry = field(default_factory=lambda: DEFAULT_PROMPT_REGISTRY)
 
     def handle(self, request: ChatRequest, repository: AssistantRepository) -> BundledResponse:
         with StageTimer("rewrite"):
             rewritten = self.query_rewriter.rewrite(request.raw_query)
 
-        # State mutations own their current request. Resolve their branch before
-        # consulting temporary conversational state so an unrelated stale turn
-        # cannot add model latency, trigger retrieval, or redirect the mutation.
-        with StageTimer("classification_preflight"):
-            preflight_intent = self.classifier.classify(request, rewritten)
+        # Current-state mutations own their request. Establish that ownership
+        # before consulting temporary conversational state so an unrelated stale
+        # turn cannot add model latency, trigger retrieval, or redirect it.
+        with StageTimer("intent_ownership"):
+            current_request_intent = self.classifier.classify(request, rewritten)
 
         reminder_reply = bool((request.metadata or {}).get("reminder_reply_context"))
         # A notification reply carries an exact reminder-to-source-hop mapping.
         # It must restore that Last-QA state before normal routing, even when
         # its text contains a reminder action such as "turn it off".
         state_mutation = (
-            preflight_intent in {Intent.KNOWLEDGE_FACTS, Intent.REMINDER}
+            current_request_intent in {Intent.KNOWLEDGE_FACTS, Intent.REMINDER}
             and not reminder_reply
         )
         with StageTimer("last_qa_resolution", {"state_mutation": state_mutation}) as last_qa_stage:
@@ -103,13 +102,13 @@ class AssistantPipeline:
                     state=None,
                     did_merge_query=False,
                     skip_broad_retrieval=True,
-                    diagnostic_context={"preflight_intent": preflight_intent.value},
+                    diagnostic_context={"current_request_intent": current_request_intent.value},
                     merge_reason="current_state_mutation_bypassed_last_qa",
                     skip_reason="current_state_mutation_bypassed_broad_retrieval",
                     is_authoritative_state=False,
                 )
                 validate_last_qa_resolution(resolution)
-                intent = preflight_intent
+                intent = current_request_intent
             else:
                 last_state = self.last_qa_store.get(request.user_id)
                 resolution = self.last_qa_resolver.resolve(request, rewritten, last_state)
@@ -138,8 +137,6 @@ class AssistantPipeline:
                 conversation_results = self.retriever.retrieve_conversation(
                     user_id=request.user_id,
                     query=retrieval_query,
-                    limit=self.config.retrieval.max_results,
-                    min_confidence=self.config.retrieval.conversation_min_confidence,
                 )
             with StageTimer("sql_validation", {"entity_type": "conversation_hop", "candidate_count": len(conversation_results)}):
                 conversation_results = repository.hydrate_conversation_retrieval_results(
@@ -169,7 +166,7 @@ class AssistantPipeline:
                     approved_conversation_count=0,
                 )
         
-        with StageTimer("classification_final", {"preflight_intent_owned": state_mutation}) as final_classification_stage:
+        with StageTimer("classification_final", {"intent_ownership_owned": state_mutation}) as final_classification_stage:
             if not state_mutation:
                 intent = self.classifier.classify(
                     request,
@@ -215,29 +212,24 @@ class AssistantPipeline:
                 branch_result=branch_result,
             )
         with StageTimer("platform_selector"):
-            platform_state = self.platform_selector.select(bundled, request)
-        # This is the sole user-facing HITL decision point.  The selector only
-        # supplies channel/draft state; it cannot replace a normal HITL question.
-        with StageTimer("post_selector_hitl"):
-            platform_payload = self.post_selector_hitl.apply(bundled, platform_state)
+            platform_payload = self.platform_selector.select(bundled, request)
         from dataclasses import replace
         with StageTimer("response_finalize"):
             delivery = platform_payload.get("delivery", {})
-            hitl = platform_payload.get("hitl", {})
-            if hitl.get("required"):
-                question = str(hitl["question"])
-                if hitl.get("scope") == "general":
-                    final_chat_text = (
-                        f"{bundled.final_chat_text}\n\n{question}".strip()
-                        if hitl.get("append_to_answer", True)
-                        else bundled.final_chat_text
-                    )
-                else:
-                    final_chat_text = question
+            if delivery.get("status") in {"needs_input", "pending_review", "failed", "partial_failure"}:
+                final_chat_text = str(delivery.get("question") or bundled.final_chat_text)
             elif delivery.get("status") == "sent":
                 final_chat_text = f"Sent via {delivery.get('provider', delivery.get('channel', 'platform')).title()} to {delivery.get('recipient', 'the recipient')}."
             elif delivery.get("status") == "draft_ready":
-                final_chat_text = f"{delivery.get('channel', 'Message').title()} draft is ready for review."
+                final_chat_text = (
+                    f"{delivery.get('channel', 'Message').title()} draft is ready for review "
+                    f"for {delivery.get('recipient', 'the recipient')}."
+                )
+            elif delivery.get("status") == "draft_saved":
+                final_chat_text = (
+                    f"Draft saved in {delivery.get('provider', delivery.get('channel', 'the platform')).title()} "
+                    f"for {delivery.get('recipient', 'the recipient')}."
+                )
             else:
                 final_chat_text = bundled.final_chat_text
         bundled = replace(
@@ -259,7 +251,7 @@ class AssistantPipeline:
                         status=str(delivery.get("status", "unknown")),
                         recipient=str(delivery.get("recipient") or bundled.platform_payload.get("draft", {}).get("recipient") or ""),
                         message=bundled.platform_payload.get("draft", {}),
-                        error_message=str(bundled.platform_payload.get("hitl", {}).get("question") or "") if delivery.get("status") in {"failed", "needs_input"} else None,
+                        error_message=str(delivery.get("question") or "") if delivery.get("status") in {"failed", "partial_failure", "needs_input"} else None,
                     )
                 except Exception:
                     # Delivery history must not hide a completed send or response.

@@ -16,7 +16,7 @@ class LocalMemoryIndex:
     def __init__(self) -> None:
         self.docs: dict[str, dict[str, Any]] = {}
 
-    def search(self, *, user_id: str, query: str, limit: int):
+    def search(self, *, user_id: str, query: str, entity_type: str, limit: int):
         return []
 
     def upsert(self, *, user_id: str, entity_type: str, entity_id: str, text: str, metadata: dict[str, str | int | float | bool] | None = None) -> None:

@@ -65,11 +65,18 @@ class ResponseBundler:
             )
         if branch_result.fallback_or_error_message:
             _append_unique_line(parts, seen_parts, branch_result.fallback_or_error_message.strip())
-        # Supporting questions deliberately do not become response text here.
-        # They are persisted in LastQAState and considered exactly once by the
-        # post-selector HITL gate. Only an explicitly mandatory or
-        # safety-critical question may interrupt the user; optional questions
-        # are retained as context but never displayed automatically.
+        for question in branch_result.human_supporting_questions:
+            _append_unique_line(
+                parts,
+                seen_parts,
+                _question_line("Supporting question", question),
+            )
+        if branch_result.reminder_supporting_question:
+            _append_unique_line(
+                parts,
+                seen_parts,
+                _question_line("Reminder supporting question", branch_result.reminder_supporting_question),
+            )
             
         final_text = "\n".join(part.strip() for part in parts if part.strip())
         if not final_text:

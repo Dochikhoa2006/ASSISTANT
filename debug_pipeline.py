@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from getpass import getpass
+import imaplib
 import json
 import logging
+import smtplib
 import sys
 from typing import Any, Callable
+from types import SimpleNamespace
+from pathlib import Path
 
 from assistant_rag.branch_orchestration import (
     KnowledgeTargetResolver,
@@ -26,12 +31,14 @@ from assistant_rag.bundler import ChatOutput, ResponseBundler
 from assistant_rag.classification import LLMLastQAResolver, LastQAResolver, QueryRewriter, can_skip_broad_retrieval
 from assistant_rag.config import GeneralPurposeConfig
 from assistant_rag.context_filter import HardRuleContextFilter, TwoLayerContextFilter
+from assistant_rag.retrieval_policy import RETRIEVAL_PIPELINE_POLICY
 from assistant_rag.content_composer import AnswerGenerationTool, ContentToolRegistry, ReActContentComposer
 from assistant_rag.contracts import (
     BundledResponse,
     ChatRequest,
     ExpectedResponseType,
     GeneratedQuestion,
+    HumanSupportingDecision,
     Intent,
     LastQAInteractionType,
     LastQAState,
@@ -55,11 +62,10 @@ from assistant_rag.llm import (
 )
 from assistant_rag.observability import JsonLogFormatter, current_trace, new_request_id, start_trace
 from assistant_rag.onnx_llm import ONNXLLMClient, _adaptive_max_new_tokens, _sentence_boundary_stop_reason
-from assistant_rag.platform import PlatformSelector
+from assistant_rag.platform import GmailSender, PlatformSelector
 from assistant_rag.production_factory import (
     build_assistant_config,
-    build_production_pipeline,
-    build_production_repository,
+    build_production_runtime,
 )
 from assistant_rag.prompts import CONTENT_COMPOSER_REACT_SCHEMA, DEFAULT_PROMPT_REGISTRY
 from assistant_rag.settings import ProductionSettings
@@ -146,6 +152,14 @@ def _debug_response_lines(response: BundledResponse) -> list[str]:
     persistence = response.persistence_instructions or {}
     if persistence:
         _add_json_field("persistence", persistence)
+    platform_payload = response.platform_payload or {}
+    platform_delivery = {
+        key: platform_payload[key]
+        for key in ("platform_selection", "delivery", "draft")
+        if key in platform_payload
+    }
+    if platform_delivery:
+        _add_json_field("platform_delivery", platform_delivery)
     return lines
 
 
@@ -169,7 +183,7 @@ def print_runtime_architecture(pipeline: Any, repository: Any) -> None:
     components = (
         "query_rewriter", "last_qa_resolver", "retriever", "context_filter",
         "classifier", "router", "bundler", "platform_selector",
-        "post_selector_hitl", "chat_output",
+        "chat_output",
     )
     print("\nLive application architecture (same production factory as Streamlit):")
     print(f"  repository: {type(repository).__name__}")
@@ -291,8 +305,6 @@ def _debug_runtime_settings(settings: ProductionSettings) -> ProductionSettings:
         database=replace(settings.database, path=debug.db_path),
         retrieval=replace(
             settings.retrieval,
-            conversation_min_confidence=debug.conversation_min_confidence,
-            knowledge_min_confidence=debug.knowledge_min_confidence,
             max_results=debug.max_results,
             rrf_k=debug.rrf_k,
             lexical_weight=debug.lexical_weight,
@@ -372,6 +384,32 @@ class OptionalHITLStrategy:
         return [question], {"triggered": True, "confidence": 1.0, "question_count": 1}
 
 
+class DeterministicGeneralHITLStrategy:
+    """Debug-only stand-in for the production general-HITL decision contract."""
+
+    def evaluate(self, *, context: Any, **_: Any) -> HumanSupportingDecision:
+        question_text = context.request.metadata.get("supporting_question")
+        if not question_text:
+            return HumanSupportingDecision(
+                should_ask=False,
+                question="",
+                confidence=1.0,
+                question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+                expected_response_type=ExpectedResponseType.UNKNOWN,
+                reason_summary="No test supporting question supplied.",
+                risk_flags=(),
+            )
+        return HumanSupportingDecision(
+            should_ask=True,
+            question=str(question_text),
+            confidence=1.0,
+            question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+            expected_response_type=ExpectedResponseType.FREE_TEXT_ANSWER,
+            reason_summary="Deterministic debug decision.",
+            risk_flags=(),
+        )
+
+
 class OptionalReminderSupportingStrategy:
     def generate(self, context: Any, **kwargs: Any) -> GeneratedQuestion | None:
         question_text = context.request.metadata.get("reminder_supporting_question")
@@ -393,7 +431,7 @@ class DeterministicRetriever:
         self.knowledge_calls = 0
 
     def retrieve_conversation(
-        self, *, user_id: str, query: str, limit: int, min_confidence: float
+        self, *, user_id: str, query: str
     ) -> list[RetrievalResult]:
         self.conversation_calls += 1
         query_norm = _normalize(query)
@@ -411,8 +449,6 @@ class DeterministicRetriever:
         for row in rows:
             text = f"User: {row['raw_user_query']}\nAssistant: {row['raw_response']}"
             score = _token_overlap(query_norm, _normalize(text))
-            if score < min_confidence:
-                continue
             payload = {
                 "hop_id": row["hop_id"],
                 "topic_id": row["topic_id"],
@@ -433,10 +469,10 @@ class DeterministicRetriever:
                 )
             )
         results.sort(key=lambda item: item.confidence, reverse=True)
-        return results[:limit]
+        return results[: RETRIEVAL_PIPELINE_POLICY.final_top_k]
 
     def retrieve_knowledge(
-        self, *, user_id: str, query: str, limit: int, min_confidence: float
+        self, *, user_id: str, query: str
     ) -> list[RetrievalResult]:
         self.knowledge_calls += 1
         query_norm = _normalize(query)
@@ -454,8 +490,6 @@ class DeterministicRetriever:
         for row in rows:
             text = str(row["raw_text"])
             score = _token_overlap(query_norm, _normalize(text))
-            if score < min_confidence:
-                continue
             payload = {
                 "chunk_id": row["chunk_id"],
                 "topic_id": row["knowledge_topic_id"],
@@ -477,7 +511,7 @@ class DeterministicRetriever:
                 )
             )
         results.sort(key=lambda item: item.confidence, reverse=True)
-        return results[:limit]
+        return results[: RETRIEVAL_PIPELINE_POLICY.final_top_k]
 
 
 class ScenarioLLM:
@@ -532,17 +566,9 @@ def build_scenario_state(settings: ProductionSettings) -> ScenarioState:
     repository.initialize_schema()
     retriever = DeterministicRetriever(repository)
     hard_filter = HardRuleContextFilter(
-        knowledge_min_confidence=debug_settings.prompt_policy.context_filter_knowledge_min_confidence,
         allowed_reminder_statuses=debug_settings.prompt_policy.context_filter_allowed_reminder_statuses,
-        conversation_min_confidence=debug_settings.context_filter.conversation_min_confidence,
-        conversation_approved_max_items=debug_settings.context_filter.conversation_approved_max_items,
-        conversation_duplicate_threshold=debug_settings.context_filter.conversation_duplicate_threshold,
-        knowledge_approved_max_items=debug_settings.context_filter.knowledge_approved_max_items,
-        knowledge_duplicate_threshold=debug_settings.context_filter.knowledge_duplicate_threshold,
-        low_information_text_patterns=debug_settings.context_filter.low_information_text_patterns,
         reminder_approved_max_items=debug_settings.context_filter.reminder_approved_max_items,
         reminder_min_confidence=debug_settings.context_filter.reminder_min_confidence,
-        low_information_min_chars=debug_settings.context_filter.low_information_min_chars,
     )
     context_filter = TwoLayerContextFilter(hard_rule_filter=hard_filter)
     clarification_strategy = DeterministicQuestionStrategy()
@@ -556,7 +582,7 @@ def build_scenario_state(settings: ProductionSettings) -> ScenarioState:
     gp_config = GeneralPurposeConfig(
         general_sub_branch_detector_enabled=False,
         content_composer_enabled=False,
-        hitl_supporting_question_enabled=False,
+        hitl_supporting_question_enabled=True,
     )
     router = BranchRouter(
         {
@@ -571,6 +597,7 @@ def build_scenario_state(settings: ProductionSettings) -> ScenarioState:
                 context_filter=context_filter,
                 prompt_registry=DEFAULT_PROMPT_REGISTRY,
                 hitl_strategy=OptionalHITLStrategy(),
+                general_hitl_strategy=DeterministicGeneralHITLStrategy(),
                 general_purpose_config=gp_config,
             ),
             Intent.KNOWLEDGE_FACTS: KnowledgeFactsBranch(
@@ -787,6 +814,281 @@ def scenario_general_hitl_supporting_question_printed(settings: ProductionSettin
     )
 
 
+def scenario_general_hitl_disabled_does_not_fallback(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    branch = state.pipeline.router.branches[Intent.GENERAL_RESPONSE]
+
+    class FailingLegacyHITL:
+        def evaluate(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("disabled general HITL must not invoke the legacy generic strategy")
+
+    branch.general_purpose_config = replace(
+        branch.general_purpose_config,
+        hitl_supporting_question_enabled=False,
+    )
+    branch.general_hitl_strategy = None
+    branch.hitl_strategy = FailingLegacyHITL()
+    response = run_request(
+        state,
+        "Explain the migration plan",
+        metadata={
+            "intent": Intent.GENERAL_RESPONSE.value,
+            "normal_response_text": "Start with schema compatibility, then migrate traffic gradually.",
+            "supporting_question": "This must never be injected while general HITL is disabled.",
+        },
+    )
+    assert_response(response, ResponseType.NORMAL, "schema compatibility")
+    if "Supporting question:" in response.final_chat_text:
+        raise AssertionError("disabled general HITL emitted a supporting question")
+    return ScenarioResult(
+        "general_hitl_disabled_does_not_fallback",
+        True,
+        "disabled general HITL does not invoke or fall back to the legacy strategy",
+    )
+
+
+def scenario_user_entrypoint_runtime_parity(settings: ProductionSettings) -> ScenarioResult:
+    """Both user-facing entrypoints must use the identical production runtime."""
+    root = Path(__file__).resolve().parent
+    for entrypoint in (root / "streamlit_app.py", root / "debug_pipeline.py"):
+        source = entrypoint.read_text(encoding="utf-8")
+        calls = {
+            node.func.id
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        if "build_production_runtime" not in calls:
+            raise AssertionError(f"{entrypoint.name} does not build the shared production runtime")
+        if {"build_production_pipeline", "build_production_repository"} & calls:
+            raise AssertionError(f"{entrypoint.name} bypasses the shared production runtime")
+
+    from assistant_rag import production_factory as factory
+
+    shared_llm = object()
+    pipeline = SimpleNamespace(platform_selector=SimpleNamespace(llm=shared_llm))
+    repository = object()
+    received_llm: list[Any] = []
+    original_pipeline = factory.build_production_pipeline
+    original_repository = factory.build_production_repository
+    original_planner = factory.build_reminder_timing_planner
+    try:
+        factory.build_production_pipeline = lambda _settings: pipeline
+        factory.build_production_repository = lambda _settings: repository
+
+        def build_planner(_settings: Any, *, llm: Any = None) -> Any:
+            received_llm.append(llm)
+            return SimpleNamespace()
+
+        factory.build_reminder_timing_planner = build_planner
+        runtime = factory.build_production_runtime(settings)
+    finally:
+        factory.build_production_pipeline = original_pipeline
+        factory.build_production_repository = original_repository
+        factory.build_reminder_timing_planner = original_planner
+
+    if runtime.pipeline is not pipeline or runtime.repository is not repository or received_llm != [shared_llm]:
+        raise AssertionError("production runtime did not preserve the single shared pipeline, repository, and LLM")
+    try:
+        factory.build_production_pipeline(
+            replace(settings, model_warmup=replace(settings.model_warmup, enabled=False))
+        )
+    except ValueError as exc:
+        if "MODEL_WARMUP" not in str(exc):
+            raise AssertionError(f"model-warmup guard reported the wrong failure: {exc}") from exc
+    else:
+        raise AssertionError("production pipeline accepted a startup configuration with model warm-up disabled")
+    return ScenarioResult(
+        "user_entrypoint_runtime_parity",
+        True,
+        "Streamlit and interactive debug share one fully warmed production runtime contract",
+    )
+
+
+def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSettings) -> ScenarioResult:
+    class ScriptedPlatformLLM:
+        def __init__(self, mode: str) -> None:
+            self.mode = mode
+            self.calls = 0
+
+        def generate_json(self, **_kwargs: Any) -> dict[str, Any]:
+            self.calls += 1
+            if self.calls == 1:
+                return {"channel": "gmail", "confidence": 1.0}
+            return {
+                "recipients": ["alice@example.com", "bob@example.com", "alice@example.com"],
+                "subject": "Migration update",
+                "body": "The migration is ready.",
+                "mode": self.mode,
+            }
+
+    class FakeSMTP:
+        instances: list[Any] = []
+
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.login_args: tuple[str, str] | None = None
+            self.message: Any | None = None
+            self.__class__.instances.append(self)
+
+        def __enter__(self) -> "FakeSMTP":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def login(self, username: str, password: str) -> None:
+            self.login_args = (username, password)
+
+        def send_message(self, message: Any) -> dict[str, Any]:
+            self.message = message
+            return {}
+
+    class FakeIMAP:
+        instances: list[Any] = []
+
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.login_args: tuple[str, str] | None = None
+            self.append_args: tuple[Any, ...] | None = None
+            self.__class__.instances.append(self)
+
+        def login(self, username: str, password: str) -> tuple[str, list[bytes]]:
+            self.login_args = (username, password)
+            return "OK", []
+
+        def list(self) -> tuple[str, list[bytes]]:
+            return "OK", [b'(\\HasNoChildren \\Drafts) "/" "[Gmail]/Drafts"']
+
+        def append(self, *args: Any) -> tuple[str, list[bytes]]:
+            self.append_args = args
+            return "OK", []
+
+        def logout(self) -> tuple[str, list[bytes]]:
+            return "BYE", []
+
+    bundled = BundledResponse(
+        final_chat_text="The migration is ready.",
+        response_type=ResponseType.NORMAL,
+        last_qa_state=LastQAState(
+            last_user_query="",
+            last_response="",
+            response_type=ResponseType.NORMAL,
+        ),
+    )
+    original_smtp_ssl = smtplib.SMTP_SSL
+    try:
+        smtplib.SMTP_SSL = FakeSMTP  # type: ignore[assignment]
+        send_selector = PlatformSelector(llm=ScriptedPlatformLLM("send"), senders={"gmail": GmailSender()})
+        sent = send_selector.select(
+            bundled,
+            ChatRequest(
+                user_id="platform-test",
+                raw_query="Send this by Gmail to alice@example.com and bob@example.com.",
+                platform_context={
+                    "gmail_username": "sender@example.com",
+                    "gmail_app_password": "app-password-for-test",
+                },
+            ),
+        )
+        state = build_scenario_state(settings)
+        state.pipeline.platform_selector = PlatformSelector(
+            llm=ScriptedPlatformLLM("send"),
+            senders={"gmail": GmailSender()},
+        )
+        pipeline_response = run_request(
+            state,
+            "Send this by Gmail to alice@example.com and bob@example.com.",
+            metadata={
+                "intent": Intent.GENERAL_RESPONSE.value,
+                "normal_response_text": "The migration is ready.",
+            },
+            platform_context={
+                "gmail_username": "sender@example.com",
+                "gmail_app_password": "app-password-for-test",
+            },
+        )
+    finally:
+        smtplib.SMTP_SSL = original_smtp_ssl  # type: ignore[assignment]
+
+    if sent["delivery"]["status"] != "sent" or sent["delivery"]["recipients"] != ["alice@example.com", "bob@example.com"]:
+        raise AssertionError(f"multi-recipient Gmail send failed: {sent!r}")
+    if len(FakeSMTP.instances) != 2:
+        raise AssertionError("selector and full pipeline did not each create exactly one SMTP delivery")
+    smtp_client = FakeSMTP.instances[0]
+    if smtp_client.login_args != ("sender@example.com", "app-password-for-test"):
+        raise AssertionError("Gmail sender did not use the supplied UI/debug credentials")
+    if str(smtp_client.message["To"]) != "alice@example.com, bob@example.com":
+        raise AssertionError("Gmail sender did not address every extracted recipient")
+    if "app-password-for-test" in json.dumps(sent):
+        raise AssertionError("Gmail app password leaked into the public delivery payload")
+    if pipeline_response.final_chat_text != "Sent via Gmail to alice@example.com, bob@example.com.":
+        raise AssertionError(f"full pipeline did not report all Gmail recipients: {pipeline_response.final_chat_text!r}")
+    delivery_count = state.repository.connection.execute(
+        "SELECT COUNT(*) AS total FROM platform_deliveries"
+    ).fetchone()["total"]
+    if int(delivery_count) != 1:
+        raise AssertionError("full pipeline did not audit the Gmail delivery exactly once")
+    if "app-password-for-test" in json.dumps(pipeline_response.platform_payload):
+        raise AssertionError("Gmail app password leaked through the full pipeline payload")
+    debug_output = "\n".join(_debug_response_lines(pipeline_response))
+    if "platform_delivery" not in debug_output or "alice@example.com, bob@example.com" not in debug_output:
+        raise AssertionError("debug_pipeline did not expose the safe Gmail delivery envelope")
+    if "app-password-for-test" in debug_output:
+        raise AssertionError("Gmail app password leaked through debug_pipeline output")
+
+    # Even a bad extractor response cannot turn an explicit do-not-send request
+    # into an SMTP side effect; raw user intent remains authoritative.
+    original_imap_ssl = imaplib.IMAP4_SSL
+    try:
+        imaplib.IMAP4_SSL = FakeIMAP  # type: ignore[assignment]
+        draft_selector = PlatformSelector(llm=ScriptedPlatformLLM("send"), senders={"gmail": GmailSender()})
+        drafted = draft_selector.select(
+            bundled,
+            ChatRequest(
+                user_id="platform-test",
+                raw_query="Draft a Gmail update to alice@example.com and bob@example.com; do not send.",
+                platform_context={
+                    "gmail_username": "sender@example.com",
+                    "gmail_app_password": "app-password-for-test",
+                },
+            ),
+        )
+    finally:
+        imaplib.IMAP4_SSL = original_imap_ssl  # type: ignore[assignment]
+    if drafted["delivery"]["status"] != "draft_saved" or drafted["draft"]["recipients"] != ["alice@example.com", "bob@example.com"]:
+        raise AssertionError(f"multi-recipient Gmail draft failed: {drafted!r}")
+    if len(FakeSMTP.instances) != 2:
+        raise AssertionError("draft mode unexpectedly invoked Gmail SMTP sending")
+    if len(FakeIMAP.instances) != 1 or FakeIMAP.instances[0].login_args != ("sender@example.com", "app-password-for-test"):
+        raise AssertionError("Gmail draft did not use the supplied UI/debug credentials")
+    if not FakeIMAP.instances[0].append_args or FakeIMAP.instances[0].append_args[0] != "[Gmail]/Drafts":
+        raise AssertionError("Gmail draft was not appended to the provider draft mailbox")
+    if FakeIMAP.instances[0].append_args[1] != "(\\Draft)":
+        raise AssertionError("Gmail draft append did not use the IMAP draft flag")
+    draft_bytes = FakeIMAP.instances[0].append_args[3]
+    if b"alice@example.com, bob@example.com" not in draft_bytes:
+        raise AssertionError("saved Gmail draft did not include every extracted recipient")
+
+    missing_credentials_selector = PlatformSelector(
+        llm=ScriptedPlatformLLM("send"),
+        senders={"gmail": GmailSender()},
+    )
+    missing_credentials = missing_credentials_selector.select(
+        bundled,
+        ChatRequest(
+            user_id="platform-test",
+            raw_query="Send this by Gmail to alice@example.com and bob@example.com.",
+        ),
+    )
+    if missing_credentials["delivery"]["status"] != "needs_input":
+        raise AssertionError("Gmail send without credentials was not safely blocked")
+    if len(FakeSMTP.instances) != 2:
+        raise AssertionError("missing Gmail credentials unexpectedly invoked SMTP sending")
+    return ScenarioResult(
+        "platform_gmail_multi_recipient_delivery",
+        True,
+        "Gmail send uses SMTP for all recipients and Gmail draft uses IMAP without sending",
+    )
+
+
 def scenario_general_new_conversation_skips_sub_branch_llm(settings: ProductionSettings) -> ScenarioResult:
     state = build_scenario_state(settings)
 
@@ -955,7 +1257,7 @@ def scenario_mutation_clarification_fast_path(settings: ProductionSettings) -> S
     return ScenarioResult("mutation_clarification_fast_path", True, "predictable mutation gaps skip unused action planning and LLM question generation")
 
 
-def scenario_state_mutation_preflight_bypass(settings: ProductionSettings) -> ScenarioResult:
+def scenario_state_mutation_intent_ownership_bypass(settings: ProductionSettings) -> ScenarioResult:
     """Current state mutations must not consult stale Last-QA or broad conversation retrieval."""
     class MustNotResolveLastQA:
         def resolve(self, *_: Any, **__: Any) -> Any:
@@ -963,6 +1265,7 @@ def scenario_state_mutation_preflight_bypass(settings: ProductionSettings) -> Sc
 
     state = build_scenario_state(settings)
     state.pipeline.last_qa_resolver = MustNotResolveLastQA()
+    start_trace(new_request_id())
     response = run_request(
         state,
         "Store the current project retention policy.",
@@ -976,7 +1279,10 @@ def scenario_state_mutation_preflight_bypass(settings: ProductionSettings) -> Sc
         raise AssertionError("state mutation invoked broad conversation retrieval")
     if response.last_qa_state.response_type is not ResponseType.KNOWLEDGE_ACTION:
         raise AssertionError("state mutation did not preserve its knowledge branch")
-    return ScenarioResult("state_mutation_preflight_bypass", True, "state mutations bypass stale Last-QA and conversation retrieval")
+    stage_names = [stage.stage for stage in response.trace_summary.stages] if response.trace_summary else []
+    if "intent_ownership" not in stage_names:
+        raise AssertionError(f"intent ownership stage contract regressed: {stage_names}")
+    return ScenarioResult("state_mutation_intent_ownership_bypass", True, "state mutations bypass stale Last-QA and conversation retrieval")
 
 
 def scenario_model_backed_action_extraction(settings: ProductionSettings) -> ScenarioResult:
@@ -1076,7 +1382,7 @@ def scenario_knowledge_action_recovery(settings: ProductionSettings) -> Scenario
 
 
 def scenario_sql_backed_knowledge_lookup(settings: ProductionSettings) -> ScenarioResult:
-    """Explicit lookups must see active user-owned SQL facts before derived indexes catch up."""
+    """Explicit knowledge reads must use the canonical derived retrieval exactly once."""
     class LookupDetector:
         def detect(self, *_: Any, **__: Any) -> Any:
             return type(
@@ -1100,24 +1406,26 @@ def scenario_sql_backed_knowledge_lookup(settings: ProductionSettings) -> Scenar
     )
     if response.response_type is not ResponseType.NORMAL or response.final_chat_text != fact:
         raise AssertionError(f"SQL-backed lookup did not return the exact stored fact: {response}")
-    if state.retriever.knowledge_calls:
-        raise AssertionError("explicit SQL-backed lookup incorrectly required derived knowledge retrieval")
-    return ScenarioResult("sql_backed_knowledge_lookup", True, "active user-owned SQL knowledge is returned exactly before index catch-up")
+    if state.retriever.knowledge_calls != 1:
+        raise AssertionError("explicit knowledge lookup did not use exactly one canonical retrieval")
+    return ScenarioResult("sql_backed_knowledge_lookup", True, "explicit knowledge lookup used the canonical retrieval")
 
 
 def scenario_general_sql_knowledge_fallback(settings: ProductionSettings) -> ScenarioResult:
-    """General factual questions must fall back to SQL when derived knowledge retrieval is empty."""
+    """General responses must use one canonical knowledge retrieval without a SQL bypass."""
     state = build_scenario_state(settings)
     fact = "The deployment preference for the assistant backend is Tokyo."
     seed_knowledge(state, title="Deployment preference", text=fact)
-    state.retriever.retrieve_knowledge = lambda **_: []  # type: ignore[method-assign]
     response = run_request(
         state,
         "What is the deployment preference for the assistant backend?",
+        metadata={"normal_response_text": fact},
     )
     if response.response_type is not ResponseType.NORMAL or response.final_chat_text != fact:
-        raise AssertionError(f"general SQL fallback did not return the exact stored fact: {response}")
-    return ScenarioResult("general_sql_knowledge_fallback", True, "general factual lookup falls back to active user-owned SQL knowledge")
+        raise AssertionError(f"general canonical retrieval response did not preserve the provided answer: {response}")
+    if state.retriever.knowledge_calls != 1:
+        raise AssertionError("general response did not use exactly one canonical knowledge retrieval")
+    return ScenarioResult("general_sql_knowledge_fallback", True, "general response used one canonical knowledge retrieval")
 
 
 def scenario_model_backed_knowledge_update(settings: ProductionSettings) -> ScenarioResult:
@@ -1378,9 +1686,6 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         "reranker_min_score": default_settings.reranker.min_score,
         "reranker_batch_size": default_settings.reranker.batch_size,
         "final_context_top_k": default_settings.retrieval.max_results,
-        "retrieval_min_confidence": default_settings.retrieval.min_confidence,
-        "knowledge_context_min_confidence": default_settings.retrieval.knowledge_min_confidence,
-        "conversation_context_min_confidence": default_settings.retrieval.conversation_min_confidence,
         "last_qa_min_confidence": default_settings.prompt_policy.last_qa_min_confidence,
         "last_qa_clarification_merge_min_confidence": default_settings.prompt_policy.clarification_merge_min_confidence,
         "last_qa_skip_broad_retrieval_min_confidence": default_settings.prompt_policy.last_qa_skip_broad_retrieval_min_confidence,
@@ -1405,16 +1710,13 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         "reminder_autoscan_interval_seconds": default_settings.worker.autoscan_interval_seconds,
     }
     expected_policy_values = {
-        "bm25_top_k": 24,
-        "chroma_top_k": 24,
+        "bm25_top_k": RETRIEVAL_PIPELINE_POLICY.source_top_k,
+        "chroma_top_k": RETRIEVAL_PIPELINE_POLICY.source_top_k,
         "rrf_k": 40,
-        "reranker_top_k": 16,
+        "reranker_top_k": RETRIEVAL_PIPELINE_POLICY.rrf_top_k,
         "reranker_min_score": 0.30,
         "reranker_batch_size": 24,
-        "final_context_top_k": 6,
-        "retrieval_min_confidence": 0.30,
-        "knowledge_context_min_confidence": 0.38,
-        "conversation_context_min_confidence": 0.42,
+        "final_context_top_k": RETRIEVAL_PIPELINE_POLICY.final_top_k,
         "last_qa_min_confidence": 0.80,
         "last_qa_clarification_merge_min_confidence": 0.84,
         "last_qa_skip_broad_retrieval_min_confidence": 0.90,
@@ -2257,11 +2559,14 @@ SCENARIOS: tuple[ScenarioFn, ...] = (
     scenario_clarification_direct,
     scenario_general_new_conversation,
     scenario_general_hitl_supporting_question_printed,
+    scenario_general_hitl_disabled_does_not_fallback,
+    scenario_user_entrypoint_runtime_parity,
+    scenario_platform_gmail_multi_recipient_delivery,
     scenario_general_new_conversation_skips_sub_branch_llm,
     scenario_answer_adaptive_token_budget,
     scenario_structured_clarification_fallback_policy,
     scenario_mutation_clarification_fast_path,
-    scenario_state_mutation_preflight_bypass,
+    scenario_state_mutation_intent_ownership_bypass,
     scenario_model_backed_action_extraction,
     scenario_knowledge_action_recovery,
     scenario_sql_backed_knowledge_lookup,
@@ -2328,19 +2633,13 @@ def run_scenario_suite(settings: ProductionSettings, names: set[str] | None = No
 
 
 def run_llm_smoke_test(settings: ProductionSettings) -> int:
-    """Exercise the configured answer model without initializing retrieval services."""
+    """Exercise the configured answer model from the fully warmed production runtime."""
 
-    smoke_ollama = replace(
-        settings.ollama,
-        num_ctx_answer=min(settings.ollama.num_ctx_answer, 512),
-        num_predict_answer=32,
-        temperature_answer=0.0,
-    )
-    router = OllamaModelRouter(smoke_ollama)
-    llm = HybridLLMClient(
-        OllamaLLMClient(smoke_ollama, router),
-        ONNXLLMClient(router),
-    )
+    runtime = build_production_runtime(settings)
+    llm = _debug_llm_from_pipeline(runtime.pipeline)
+    if llm is None:
+        print("LLM smoke test failed: production runtime has no routed LLM", file=sys.stderr)
+        return 1
 
     request_id = new_request_id()
     start_trace(request_id)
@@ -2373,10 +2672,21 @@ def interactive_main(settings: ProductionSettings) -> None:
     # Do not apply settings.debug here: interactive debug must construct the
     # identical production architecture and use the same configured stores as
     # Streamlit.  Debug-only deterministic scenarios remain opt-in below.
-    pipeline = build_production_pipeline(settings)
-    repository = build_production_repository(settings)
+    runtime = build_production_runtime(settings)
+    pipeline = runtime.pipeline
+    repository = runtime.repository
     llm = _debug_llm_from_pipeline(pipeline)
     print_runtime_architecture(pipeline, repository)
+
+    try:
+        catch_up = runtime.reminder_autoscan.catch_up_due(
+            now_value=datetime.now(timezone.utc).isoformat(),
+            batch_size=100,
+        )
+        print(f"Startup reminder catch-up: {catch_up}")
+    except Exception as exc:
+        logger.exception("debug reminder autoscan catch-up failed")
+        print(f"Startup reminder catch-up unavailable: {type(exc).__name__}", file=sys.stderr)
 
     user_id = input("User ID [default: default_user]: ").strip() or "default_user"
     gmail_username = input("Gmail username [default: '']: ").strip()

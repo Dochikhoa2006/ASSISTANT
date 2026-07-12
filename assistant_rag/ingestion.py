@@ -22,6 +22,7 @@ from .database import now_iso
 from .metrics import GLOBAL_METRICS
 from .repository import AssistantRepository
 from .settings import KnowledgeChunkSettings
+from .semantic_chunking import split_semantic_chunks
 
 
 def _content_sha256(data: bytes) -> str:
@@ -33,24 +34,15 @@ def _normalize_text(text: str) -> str:
 
 
 def _chunk_text(text: str, *, chunk_size: int, overlap: int, min_size: int, max_size: int) -> list[str]:
-    words = text.split()
-    if not words:
-        return []
-    chunk_size = max(1, min(chunk_size, max_size))
-    overlap = max(0, min(overlap, chunk_size - 1)) if chunk_size > 1 else 0
-    chunks: list[str] = []
-    start = 0
-    while start < len(words):
-        end = min(start + chunk_size, len(words))
-        chunk = " ".join(words[start:end]).strip()
-        if len(chunk.split()) >= min_size or not chunks:
-            chunks.append(chunk)
-        else:
-            chunks[-1] = f"{chunks[-1]} {chunk}".strip()
-        if end == len(words):
-            break
-        start = max(end - overlap, start + 1)
-    return chunks
+    return split_semantic_chunks(
+        text,
+        settings=KnowledgeChunkSettings(
+            chunk_size_tokens=chunk_size,
+            chunk_overlap_tokens=overlap,
+            min_chunk_tokens=min_size,
+            max_chunk_tokens=max_size,
+        ),
+    )
 
 
 def _extract_csv(data: bytes) -> str:
@@ -170,9 +162,8 @@ class KnowledgeIngestionService:
                 )
 
             extracted = self.extract_text(data, resolved_type)
-            normalized = _normalize_text(extracted)
             chunks = _chunk_text(
-                normalized,
+                extracted,
                 chunk_size=self.chunk_settings.chunk_size_tokens,
                 overlap=self.chunk_settings.chunk_overlap_tokens,
                 min_size=self.chunk_settings.min_chunk_tokens,
@@ -196,6 +187,8 @@ class KnowledgeIngestionService:
                             "source_filename": filename,
                             "source_file_type": resolved_type,
                             "chunk_index": index,
+                            "chunking_strategy": "semantic_sentence_paragraph",
+                            "semantic_chunk": True,
                         },
                     )
                     chunk_ids.append(chunk_id)

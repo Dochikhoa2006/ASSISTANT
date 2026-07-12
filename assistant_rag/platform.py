@@ -1,24 +1,15 @@
-"""Post-bundling delivery routing and the single post-selector HITL gate.
-
-Every completed turn passes through :class:`PlatformSelector`.  Its LLM receives
-the user's query and final bundled response and chooses exactly one of
-``gmail``, ``zalo``, ``telegram`` or ``none``.  The selector only prepares
-delivery state; it never decides which user-facing HITL question is displayed.
-
-:class:`PostSelectorHITL` is the only component that turns that state into a
-question.  It asks either one normal, high-value supporting question on the
-``none`` route, or one delivery-specific question on a selected-platform route.
-The two scopes never overwrite or combine with one another.
-"""
+"""Post-bundling platform delivery routing."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from pathlib import Path
+import imaplib
 import json
 import re
 import smtplib
+import time
 from typing import Any, Protocol
 from urllib import request as urlrequest
 
@@ -29,6 +20,8 @@ from .llm import LLMClient, LLMTask
 _CHANNELS = ("gmail", "zalo", "telegram")
 _EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w.+-])")
 _SEND_WORDS = re.compile(r"\b(send|deliver|email|mail|message|nhắn|gửi)\b", re.I)
+_DIRECT_SEND_WORDS = re.compile(r"\b(send|deliver|gửi)\b", re.I)
+_DO_NOT_SEND = re.compile(r"\b(?:do\s+not|don't|not\s+to|without)\s+(?:send|deliver|gửi)\b", re.I)
 _DRAFT_WORDS = re.compile(r"\b(compose|draft|write|prepare|soạn)\b", re.I)
 
 
@@ -44,6 +37,49 @@ class DeliverySender(Protocol):
 
 def _clean(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _recipient_emails(value: Any) -> list[str]:
+    """Return unique, syntactically valid email recipients in supplied order."""
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    recipients: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        for email in _EMAIL.findall(_clean(item)):
+            key = email.casefold()
+            if key not in seen:
+                seen.add(key)
+                recipients.append(email)
+    return recipients
+
+
+def _message_recipients(payload: dict[str, Any]) -> list[str]:
+    return _recipient_emails(payload.get("recipients") or payload.get("recipient"))
+
+
+def _gmail_recipient_candidates(text: str) -> list[str]:
+    """Extract addresses only from explicit recipient clauses in the request."""
+    recipients: list[str] = []
+    seen: set[str] = set()
+    clause_pattern = re.compile(
+        r"\b(?:to|cc|bcc|recipient(?:s)?\s*(?:are|:)?|email(?:s)?(?:\s+to|\s*:|\s+))\s+"
+        r"(.+?)(?=\b(?:to|cc|bcc|using|via|with|from|subject|body|username|app\s+password|credential)\b|\.(?:\s|$)|;|\n|$)",
+        re.I | re.S,
+    )
+    for match in clause_pattern.finditer(text):
+        for email in _recipient_emails(match.group(1)):
+            key = email.casefold()
+            if key not in seen:
+                seen.add(key)
+                recipients.append(email)
+    if recipients:
+        return recipients
+    # With no credential language, email addresses in an explicit Gmail
+    # delivery request are safe fallback recipient candidates. The selector
+    # has already established that this is a delivery operation.
+    if not re.search(r"\b(?:username|app\s+password|credential)\b", text, re.I):
+        return _recipient_emails(text)
+    return []
 
 
 def _public_artifacts(payload: dict[str, Any]) -> list[dict[str, str]]:
@@ -69,9 +105,14 @@ def _public_artifacts(payload: dict[str, Any]) -> list[dict[str, str]]:
 class GmailSender:
     host: str = "smtp.gmail.com"
     port: int = 465
+    imap_host: str = "imap.gmail.com"
+    imap_port: int = 993
+    draft_mailbox: str = "[Gmail]/Drafts"
     timeout_seconds: float = 20.0
 
     def validate_credentials(self, username: str, app_password: str) -> tuple[bool, str]:
+        username = _clean(username)
+        app_password = "".join(_clean(app_password).split())
         if not username or not app_password:
             return False, "Enter both a Gmail username and an app password."
         try:
@@ -83,23 +124,102 @@ class GmailSender:
 
     def send(self, payload: dict[str, Any], platform_context: dict[str, Any]) -> dict[str, Any]:
         username = _clean(platform_context.get("gmail_username"))
-        app_password = _clean(platform_context.get("gmail_app_password"))
+        app_password = "".join(_clean(platform_context.get("gmail_app_password")).split())
         if not username or not app_password:
             raise ValueError("Gmail username and app password are required before sending.")
-        message = EmailMessage()
-        message["From"] = username
-        message["To"] = payload["recipient"]
-        message["Subject"] = payload["subject"]
-        message.set_content(payload["body"])
-        for artifact in payload.get("attachments", []):
-            path = Path(artifact["storage_path"])
-            message.add_attachment(path.read_bytes(), maintype="application", subtype="octet-stream", filename=artifact["filename"])
+        recipients = _message_recipients(payload)
+        if not recipients:
+            raise ValueError("At least one valid Gmail recipient is required before sending.")
+        message = self._email_message(payload, username, recipients)
         with smtplib.SMTP_SSL(self.host, self.port, timeout=self.timeout_seconds) as client:
             client.login(username, app_password)
             refused = client.send_message(message)
         if refused:
-            raise RuntimeError(f"Gmail refused recipient(s): {', '.join(refused)}")
-        return {"status": "sent", "provider": "gmail", "recipient": payload["recipient"]}
+            refused_keys = {str(item).casefold() for item in refused}
+            delivered = [item for item in recipients if item.casefold() not in refused_keys]
+            return {
+                "status": "partial_failure",
+                "provider": "gmail",
+                "recipient": ", ".join(recipients),
+                "recipients": recipients,
+                "delivered_recipients": delivered,
+                "refused_recipients": [item for item in recipients if item.casefold() in refused_keys],
+            }
+        return {
+            "status": "sent",
+            "provider": "gmail",
+            "recipient": ", ".join(recipients),
+            "recipients": recipients,
+        }
+
+    def create_draft(self, payload: dict[str, Any], platform_context: dict[str, Any]) -> dict[str, Any]:
+        username = _clean(platform_context.get("gmail_username"))
+        app_password = "".join(_clean(platform_context.get("gmail_app_password")).split())
+        if not username or not app_password:
+            raise ValueError("Gmail username and app password are required before saving a Gmail draft.")
+        recipients = _message_recipients(payload)
+        if not recipients:
+            raise ValueError("At least one valid Gmail recipient is required before saving a draft.")
+        message = self._email_message(payload, username, recipients)
+        client = imaplib.IMAP4_SSL(
+            self.imap_host,
+            self.imap_port,
+            timeout=self.timeout_seconds,
+        )
+        try:
+            client.login(username, app_password)
+            mailbox = self._resolve_draft_mailbox(client)
+            status, _ = client.append(
+                mailbox,
+                "(\\Draft)",
+                imaplib.Time2Internaldate(time.time()),
+                message.as_bytes(),
+            )
+            if _clean(status).upper() != "OK":
+                raise RuntimeError("Gmail rejected the draft append operation.")
+        finally:
+            try:
+                client.logout()
+            except Exception:
+                pass
+        return {
+            "status": "draft_saved",
+            "provider": "gmail",
+            "recipient": ", ".join(recipients),
+            "recipients": recipients,
+        }
+
+    def _email_message(self, payload: dict[str, Any], username: str, recipients: list[str]) -> EmailMessage:
+        message = EmailMessage()
+        message["From"] = username
+        message["To"] = ", ".join(recipients)
+        message["Subject"] = payload["subject"]
+        message.set_content(payload["body"])
+        for artifact in payload.get("attachments", []):
+            path = Path(artifact["storage_path"])
+            message.add_attachment(
+                path.read_bytes(),
+                maintype="application",
+                subtype="octet-stream",
+                filename=artifact["filename"],
+            )
+        return message
+
+    def _resolve_draft_mailbox(self, client: Any) -> str:
+        try:
+            status, rows = client.list()
+            if _clean(status).upper() == "OK":
+                for raw_row in rows or []:
+                    row = raw_row.decode("utf-8", errors="replace") if isinstance(raw_row, bytes) else _clean(raw_row)
+                    if "\\Drafts" not in row:
+                        continue
+                    quoted = re.search(r'"([^"]+)"\s*$', row)
+                    if quoted:
+                        return quoted.group(1)
+                    return row.rsplit(" ", 1)[-1].strip('"')
+        except Exception:
+            pass
+        return self.draft_mailbox
 
 
 @dataclass
@@ -181,15 +301,81 @@ class PlatformSelector:
                 draft=message,
             )
 
-        # The platform tool has now extracted a complete message.  It must
-        # always be reviewed before delivery; sender invocation belongs to a
-        # subsequent, explicitly approved action.
-        return self._delivery_hold(
+        if message["mode"] == "draft":
+            creator = getattr(self.senders.get(channel), "create_draft", None)
+            has_credentials = bool(
+                _clean(context.get("gmail_username"))
+                and _clean(context.get("gmail_app_password"))
+            )
+            if channel == "gmail" and callable(creator) and has_credentials:
+                try:
+                    draft_dispatch = creator(message, context)
+                except Exception:
+                    return self._delivery_result(
+                        base,
+                        channel=channel,
+                        status="failed",
+                        message=message,
+                        question=(
+                            "The Gmail draft could not be saved. Check the Gmail credentials "
+                            "and account IMAP access, then try again."
+                        ),
+                    )
+                return self._delivery_result(
+                    base,
+                    channel=channel,
+                    status="draft_saved",
+                    message=message,
+                    provider=_clean(draft_dispatch.get("provider")) or channel,
+                    dispatch=draft_dispatch,
+                )
+            return self._delivery_result(
+                base,
+                channel=channel,
+                status="draft_ready",
+                message=message,
+            )
+
+        # A send is authorized only by an explicit send-mode extraction and a
+        # complete, channel-specific credential set. The sender receives the
+        # credentials from platform_context; they are never placed in the
+        # delivery payload, drafts, history, or audit message.
+        try:
+            dispatch = self._send(channel, message, context)
+        except Exception:
+            return self._delivery_result(
+                base,
+                channel=channel,
+                status="failed",
+                message=message,
+                question=(
+                    f"The {channel.title()} message could not be sent. "
+                    "Check the delivery credentials and recipient details, then try again."
+                ),
+            )
+        if dispatch.get("status") != "sent":
+            refused = list(dispatch.get("refused_recipients") or [])
+            delivered = list(dispatch.get("delivered_recipients") or [])
+            return self._delivery_result(
+                base,
+                channel=channel,
+                status="partial_failure",
+                message=message,
+                provider=_clean(dispatch.get("provider")) or channel,
+                question=(
+                    f"The {channel.title()} message was delivered to "
+                    f"{', '.join(delivered) or 'no recipients'}, but was refused for "
+                    f"{', '.join(refused) or 'one or more recipients'}."
+                ),
+                dispatch=dispatch,
+            )
+        return self._delivery_result(
             base,
-            f"Please review the {channel.title()} message below and confirm before it is sent.",
             channel=channel,
-            draft=message,
-            status="pending_review",
+            status="sent",
+            message=message,
+            provider=_clean(dispatch.get("provider")) or channel,
+            dispatch=dispatch,
         )
 
     def _choose_channel(self, response: BundledResponse, request: ChatRequest) -> dict[str, Any]:
@@ -241,20 +427,31 @@ class PlatformSelector:
         text = request.raw_query
         extracted: dict[str, Any] = {}
         if self.llm is not None:
-            schema = {"type": "object", "required": ["recipient", "subject", "body", "mode"], "properties": {"recipient": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}, "mode": {"type": "string", "enum": ["send", "draft"]}}}
+            schema = {"type": "object", "required": ["subject", "body", "mode"], "properties": {"recipient": {"type": "string"}, "recipients": {"type": "array", "items": {"type": "string"}}, "subject": {"type": "string"}, "body": {"type": "string"}, "mode": {"type": "string", "enum": ["send", "draft"]}}}
             try:
                 extracted = self.llm.generate_json(
                     task=LLMTask.ACTION_PLANNING,
-                    system_prompt=f"You extract a {channel} message only from explicit user-provided facts. Do not invent recipient, subject, body, or attachments. Mode is send only for an explicit request to send now; otherwise draft.",
+                    system_prompt=(
+                        f"You extract a {channel} message only from explicit user-provided facts. "
+                        "Do not invent recipients, subject, body, or attachments. Return every explicitly "
+                        "requested recipient in recipients. Mode is send only for an explicit request to "
+                        "send now; otherwise draft."
+                    ),
                     user_prompt=json.dumps({"user_query": text, "bundled_response": response.final_chat_text, "available_artifacts": [{"artifact_id": a.get("artifact_id"), "filename": a.get("filename")} for a in _public_artifacts(base)]}),
                     schema=schema,
                 )
             except Exception:
                 extracted = {}
-        recipient = _clean(extracted.get("recipient"))
-        if not recipient and channel == "gmail":
-            found = _EMAIL.findall(text)
-            recipient = found[0] if found else ""
+        allowed_gmail_recipients = _gmail_recipient_candidates(text) if channel == "gmail" else []
+        allowed_gmail_keys = {item.casefold() for item in allowed_gmail_recipients}
+        recipients = _recipient_emails(extracted.get("recipients"))
+        for recipient in _recipient_emails(extracted.get("recipient")):
+            if recipient.casefold() not in {item.casefold() for item in recipients}:
+                recipients.append(recipient)
+        if channel == "gmail":
+            recipients = [item for item in recipients if item.casefold() in allowed_gmail_keys]
+            if not recipients:
+                recipients = allowed_gmail_recipients
         # The bundled answer is the canonical body unless a platform-specific
         # extractor safely supplied a body. This makes artifact/general answers
         # usable by all delivery platforms without a second answer generator.
@@ -264,17 +461,31 @@ class PlatformSelector:
             subject_match = re.search(r"\bsubject\s*[:=-]\s*([^\n.;]+)", text, re.I)
             subject = subject_match.group(1).strip(" '\"") if subject_match else ""
         mode = _clean(extracted.get("mode"))
-        if mode not in {"send", "draft"}:
+        if _DO_NOT_SEND.search(text):
+            mode = "draft"
+        elif _DIRECT_SEND_WORDS.search(text):
+            mode = "send"
+        elif _DRAFT_WORDS.search(text):
+            mode = "draft"
+        elif mode not in {"send", "draft"}:
             mode = "send" if _SEND_WORDS.search(text) and not _DRAFT_WORDS.search(text) else "draft"
         attachments = _public_artifacts(base) if re.search(r"\b(attach|attachment|file|document|đính kèm)\b", text, re.I) else []
-        return {"channel": channel, "recipient": recipient, "subject": subject, "body": body, "mode": mode, "attachments": attachments}
+        return {
+            "channel": channel,
+            "recipient": ", ".join(recipients),
+            "recipients": recipients,
+            "subject": subject,
+            "body": body,
+            "mode": mode,
+            "attachments": attachments,
+        }
 
     @staticmethod
     def _missing_fields(channel: str, message: dict[str, Any], context: dict[str, Any]) -> list[str]:
-        missing = [field for field in ("recipient", "body") if not _clean(message.get(field))]
+        missing = [field for field in ("recipient", "body") if not (_message_recipients(message) if field == "recipient" else _clean(message.get(field)))]
         if channel == "gmail":
-            if not _EMAIL.fullmatch(_clean(message.get("recipient"))):
-                missing = [item for item in missing if item != "recipient"] + ["a valid recipient email address"]
+            if not _message_recipients(message):
+                missing = [item for item in missing if item != "recipient"] + ["at least one valid recipient email address"]
             if not _clean(message.get("subject")):
                 missing.append("subject")
             if message.get("mode") == "send" and not _clean(context.get("gmail_username")):
@@ -289,6 +500,49 @@ class PlatformSelector:
                 missing.append(credential)
         return list(dict.fromkeys(missing))
 
+    def _send(self, channel: str, message: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        sender = self.senders.get(channel)
+        if sender is None:
+            raise ValueError(f"No sender is configured for {channel}.")
+        recipients = _message_recipients(message)
+        if channel == "gmail":
+            return sender.send(message, context)
+
+        # Non-email channels conventionally accept one recipient per request.
+        # Keep the selector contract uniform by dispatching each extracted
+        # recipient in order and failing the operation if any dispatch fails.
+        for recipient in recipients:
+            sender.send({**message, "recipient": recipient, "recipients": [recipient]}, context)
+        return {"status": "sent", "provider": channel, "recipient": ", ".join(recipients), "recipients": recipients}
+
+    def _delivery_result(
+        self,
+        base: dict[str, Any],
+        *,
+        channel: str,
+        status: str,
+        message: dict[str, Any],
+        provider: str | None = None,
+        question: str | None = None,
+        dispatch: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        base["delivery"] = {
+            "channel": channel,
+            "status": status,
+            "recipient": message["recipient"],
+            "recipients": list(message["recipients"]),
+        }
+        if provider:
+            base["delivery"]["provider"] = provider
+        if question:
+            base["delivery"]["question"] = question
+        if dispatch:
+            for key in ("delivered_recipients", "refused_recipients"):
+                if key in dispatch:
+                    base["delivery"][key] = list(dispatch[key])
+        base["draft"] = self._public_message(message)
+        return base
+
     @staticmethod
     def _public_message(message: dict[str, Any]) -> dict[str, Any]:
         public = {key: value for key, value in message.items() if key != "storage_path"}
@@ -299,7 +553,7 @@ class PlatformSelector:
         return public
 
     def _delivery_hold(self, base: dict[str, Any], question: str, *, channel: str | None = None, draft: dict[str, Any] | None = None, status: str = "needs_input") -> dict[str, Any]:
-        """Return delivery state only; PostSelectorHITL owns user-facing HITL."""
+        """Return a platform-specific delivery requirement."""
         base.update({
             "delivery": {
                 "channel": channel or "none",
@@ -313,141 +567,12 @@ class PlatformSelector:
 
     @staticmethod
     def _hitl_passthrough(base: dict[str, Any], response: BundledResponse) -> dict[str, Any]:
-        """The ``none`` route carries no delivery question into the HITL gate."""
+        """The ``none`` route carries no platform delivery requirement."""
         base.update({
             "text": response.final_chat_text,
             "delivery": {"channel": "none", "status": "not_requested"},
         })
         return base
-
-
-@dataclass
-class PostSelectorHITL:
-    """Choose one user-facing HITL scope after platform selection.
-
-    Optional supporting questions never interrupt the user.  The only normal
-    questions admitted are action-blocking or safety-critical ones.  Such a
-    question has priority over a delivery prompt because a routing choice must
-    never hide a required clarification.  Otherwise a selected platform may
-    ask only about that draft's state (recipient, credentials, or review).
-    """
-
-    def apply(self, response: BundledResponse, platform_payload: dict[str, Any]) -> dict[str, Any]:
-        payload = dict(platform_payload)
-        delivery = dict(payload.get("delivery") or {})
-        channel = _clean(delivery.get("channel")).casefold() or "none"
-        critical = self._critical_normal_question(response)
-
-        # A required clarification is the one exception to delivery-first
-        # routing: it blocks the underlying task, so no delivery review can be
-        # meaningful until the user resolves it.
-        if critical:
-            question, source = critical
-            already_in_answer = self._contains_question(response.final_chat_text, question)
-            if channel in _CHANNELS:
-                delivery.pop("question", None)
-                delivery["deferred_by"] = "critical_normal_hitl"
-                payload["delivery"] = delivery
-            else:
-                payload["delivery"] = {"channel": "none", "status": "not_requested"}
-            payload.update({
-                "text": response.final_chat_text if already_in_answer else question,
-                "hitl": {
-                    "required": True,
-                    "scope": "general",
-                    "stage": "after_platform_selector",
-                    "question": question,
-                    "source": source,
-                    "append_to_answer": not already_in_answer,
-                    "reason": "blocking_or_safety_critical_question",
-                },
-            })
-            return payload
-
-        if channel in _CHANNELS:
-            question = _clean(delivery.pop("question", ""))
-            if not question:
-                # A selected route must never silently send or appear complete.
-                question = f"Please review the {channel.title()} delivery details before sending."
-            payload["delivery"] = delivery
-            payload.update({
-                "text": question,
-                "hitl": {
-                    "required": True,
-                    "scope": "delivery",
-                    "stage": "after_platform_selector",
-                    "question": question,
-                },
-            })
-            return payload
-
-        # The general HITL component has still evaluated this turn, but no
-        # optional question is surfaced.  This avoids low-value interruptions.
-        hitl: dict[str, Any] = {
-            "required": False,
-            "scope": "general",
-            "stage": "after_platform_selector",
-            "reason": "no_blocking_or_safety_critical_question",
-        }
-        payload.update({
-            "delivery": {"channel": "none", "status": "not_requested"},
-            "text": response.final_chat_text,
-            "hitl": hitl,
-        })
-        return payload
-
-    @staticmethod
-    def _critical_normal_question(response: BundledResponse) -> tuple[str, str] | None:
-        """Return one explicitly mandatory normal question, if any.
-
-        Normal supporting questions use ``optional_context`` by default and
-        are intentionally suppressed.  A caller can opt in only with a
-        ``must_ask`` flag or an action-blocking/safety-critical purpose.
-        """
-        clarification = response.last_qa_state.clarification_question
-        clarification_text = PostSelectorHITL._candidate_text(clarification)
-        if clarification_text:
-            return clarification_text, "clarification"
-
-        candidates = [
-            *list(response.last_qa_state.supporting_questions or []),
-            response.last_qa_state.reminder_supporting_question,
-        ]
-        ranked: list[tuple[float, str]] = []
-        for candidate in candidates:
-            text, _purpose, mandatory, raw_confidence = PostSelectorHITL._candidate_details(candidate)
-            if not text or not mandatory:
-                continue
-            try:
-                confidence = float(raw_confidence)
-            except (TypeError, ValueError):
-                confidence = 0.0
-            ranked.append((confidence, text))
-        if not ranked:
-            return None
-        return max(ranked, key=lambda item: item[0])[1], "mandatory_supporting_question"
-
-    @staticmethod
-    def _candidate_text(candidate: Any) -> str:
-        return PostSelectorHITL._candidate_details(candidate)[0]
-
-    @staticmethod
-    def _candidate_details(candidate: Any) -> tuple[str, str, bool, Any]:
-        critical_purposes = {"action_blocking", "required_clarification", "safety_critical"}
-        if isinstance(candidate, dict):
-            text = _clean(candidate.get("text") or candidate.get("question_text"))
-            purpose = _clean(candidate.get("purpose")).casefold()
-            mandatory = bool(candidate.get("must_ask") or candidate.get("required")) or purpose in critical_purposes
-            return text, purpose, mandatory, candidate.get("confidence", 0.0)
-        text = _clean(getattr(candidate, "text", candidate if isinstance(candidate, str) else ""))
-        purpose = _clean(getattr(candidate, "purpose", "")).casefold()
-        mandatory = bool(getattr(candidate, "must_ask", False) or getattr(candidate, "required", False)) or purpose in critical_purposes
-        return text, purpose, mandatory, getattr(candidate, "confidence", 0.0)
-
-    @staticmethod
-    def _contains_question(answer: str, question: str) -> bool:
-        normalize = lambda value: " ".join(str(value).casefold().split())
-        return normalize(question) in normalize(answer)
 
 
 class PlainTextFormatter:

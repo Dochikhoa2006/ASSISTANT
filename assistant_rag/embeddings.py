@@ -31,12 +31,34 @@ class SentenceTransformerEmbeddingClient:
             self.model.max_seq_length = self.settings.max_length
 
     def embed(self, texts: list[str]) -> list[list[float]]:
+        self.ensure_full_documents(texts)
         vectors = self.model.encode(
             texts,
             batch_size=self.settings.batch_size,
             normalize_embeddings=self.settings.normalize_embeddings,
         )
         return [list(map(float, vector)) for vector in vectors]
+
+    def ensure_full_documents(self, texts: list[str]) -> None:
+        """Fail closed instead of silently truncating a whole-hop document."""
+        if not texts or not self.settings.max_length:
+            return
+        tokenized = self.model.tokenizer(
+            texts,
+            add_special_tokens=True,
+            truncation=False,
+            padding=False,
+        )
+        token_ids = tokenized.get("input_ids", [])
+        oversized = [
+            index
+            for index, ids in enumerate(token_ids)
+            if len(ids) > self.settings.max_length
+        ]
+        if oversized:
+            raise ValueError(
+                "Embedding input exceeds the configured model capacity; refusing to truncate a whole document"
+            )
 
     def warmup(self) -> None:
         """Execute one encode so runtime kernels are ready before a user query."""

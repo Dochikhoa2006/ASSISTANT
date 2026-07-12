@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from .contracts import RetrievalResult
 from .embeddings import EmbeddingClient
 from .settings import ChromaSettings
+from .conversation_embedding import CONVERSATION_HOP_EMBEDDING_VERSION
 
 
 @dataclass
@@ -32,35 +33,45 @@ class ChromaPersistentVectorIndex:
             ),
         }
 
-    def search(self, *, user_id: str, query: str, limit: int) -> list[RetrievalResult]:
+    def search(
+        self, *, user_id: str, query: str, entity_type: str, limit: int
+    ) -> list[RetrievalResult]:
         query_embedding = self.embedding_client.embed([query])[0]
         results: list[RetrievalResult] = []
-        for entity_type, collection in self.collections.items():
-            payload = collection.query(
-                query_embeddings=[query_embedding],
-                n_results=limit,
-                where={"user_id": user_id},
-                include=["documents", "metadatas", "distances"],
-            )
-            ids = payload.get("ids", [[]])[0]
-            docs = payload.get("documents", [[]])[0]
-            metadatas = payload.get("metadatas", [[]])[0]
-            distances = payload.get("distances", [[]])[0]
-            for entity_id, document, metadata, distance in zip(ids, docs, metadatas, distances, strict=False):
-                confidence = 1.0 / (1.0 + float(distance))
-                result_payload = dict(metadata or {})
-                result_payload["text"] = document
-                results.append(
-                    RetrievalResult(
-                        entity_type=entity_type,
-                        entity_id=str(entity_id),
-                        source_store_evidence={"chroma": document},
-                        rerank_score=confidence,
-                        confidence=confidence,
-                        validation_status="candidate",
-                        payload=result_payload,
-                    )
+        collection = self.collections[entity_type]
+        where: dict[str, object] = {"user_id": user_id}
+        if entity_type == "conversation_hop":
+            where = {
+                "$and": [
+                    {"user_id": user_id},
+                    {"embedding_contract": CONVERSATION_HOP_EMBEDDING_VERSION},
+                ]
+            }
+        payload = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=limit,
+            where=where,
+            include=["documents", "metadatas", "distances"],
+        )
+        ids = payload.get("ids", [[]])[0]
+        docs = payload.get("documents", [[]])[0]
+        metadatas = payload.get("metadatas", [[]])[0]
+        distances = payload.get("distances", [[]])[0]
+        for entity_id, document, metadata, distance in zip(ids, docs, metadatas, distances, strict=False):
+            confidence = 1.0 / (1.0 + float(distance))
+            result_payload = dict(metadata or {})
+            result_payload["text"] = document
+            results.append(
+                RetrievalResult(
+                    entity_type=entity_type,
+                    entity_id=str(entity_id),
+                    source_store_evidence={"chroma": document},
+                    rerank_score=confidence,
+                    confidence=confidence,
+                    validation_status="candidate",
+                    payload=result_payload,
                 )
+            )
         return sorted(results, key=lambda item: item.confidence, reverse=True)[:limit]
 
     def upsert(
@@ -74,6 +85,9 @@ class ChromaPersistentVectorIndex:
     ) -> None:
         if entity_type not in self.collections:
             raise ValueError("Reminder entities must not be indexed in ChromaDB")
+        ensure_full_documents = getattr(self.embedding_client, "ensure_full_documents", None)
+        if callable(ensure_full_documents):
+            ensure_full_documents([text])
         embedding = self.embedding_client.embed([text])[0]
         chroma_metadata = {
             "user_id": user_id,

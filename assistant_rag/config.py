@@ -10,7 +10,8 @@ from dataclasses import dataclass, field
 from typing import Mapping
 
 from .contracts import Intent, ResponseType
-from .settings import MutationPartialExecutionPolicy, TargetNotFoundPolicy, UnsupportedActionPolicy
+from .settings import KnowledgeChunkSettings, MutationPartialExecutionPolicy, TargetNotFoundPolicy, UnsupportedActionPolicy
+from .retrieval_policy import RETRIEVAL_PIPELINE_POLICY, RetrievalPipelinePolicy
 
 
 RESPONSE_TYPE_INTENT_MAPPING: dict[ResponseType, Intent] = {
@@ -23,24 +24,24 @@ RESPONSE_TYPE_INTENT_MAPPING: dict[ResponseType, Intent] = {
 
 @dataclass(frozen=True)
 class RetrievalConfig:
-    conversation_min_confidence: float
-    knowledge_min_confidence: float
-    max_results: int
-    bm25_top_k: int = 24
-    chroma_top_k: int = 24
-    min_confidence: float = 0.30
+    max_results: int = RETRIEVAL_PIPELINE_POLICY.final_top_k
+    bm25_top_k: int = RETRIEVAL_PIPELINE_POLICY.source_top_k
+    chroma_top_k: int = RETRIEVAL_PIPELINE_POLICY.source_top_k
     rrf_k: int = 40
     lexical_weight: float = 1.10
     semantic_weight: float = 1.0
-    rerank_candidate_limit: int = 16
+    rerank_candidate_limit: int = RETRIEVAL_PIPELINE_POLICY.rrf_top_k
     general_response_reminder_limit: int = 4
     general_response_reminder_statuses: tuple[str, ...] = ("scheduled", "notified")
 
     def __post_init__(self) -> None:
-        if not (0 <= self.conversation_min_confidence <= 1):
-            raise ValueError("conversation_min_confidence must be between 0 and 1")
-        if not (0 <= self.knowledge_min_confidence <= 1):
-            raise ValueError("knowledge_min_confidence must be between 0 and 1")
+        RetrievalPipelinePolicy(
+            source_top_k=self.bm25_top_k,
+            rrf_top_k=self.rerank_candidate_limit,
+            final_top_k=self.max_results,
+        ).validate()
+        if self.chroma_top_k != self.bm25_top_k:
+            raise ValueError("OpenSearch and ChromaDB candidate limits must be identical")
 
 
 @dataclass(frozen=True)
@@ -186,19 +187,10 @@ class LastQAConfig:
 
 @dataclass(frozen=True)
 class ContextFilterConfig:
-    conversation_min_confidence: float = 0.42
-    conversation_approved_max_items: int = 6
-    conversation_duplicate_threshold: float = 0.90
-    knowledge_approved_max_items: int = 6
-    knowledge_duplicate_threshold: float = 0.93
-    low_information_text_patterns: tuple[str, ...] = (
-        "done", "saved", "updated successfully", "ok", "noted", "sure"
-    )
     reminder_approved_max_items: int = 5
     semantic_context_judge_enabled: bool = False
     semantic_context_judge_failure_policy: str = "use_hard_rule_approved"
     context_filter_debug_diagnostics_enabled: bool = False
-    low_information_min_chars: int = 12
     conversation_retrieval_after_last_qa_enabled: bool = True
     conversation_retrieval_before_intent_enabled: bool = True
     expected_response_type_required: bool = True
@@ -206,12 +198,6 @@ class ContextFilterConfig:
     clarification_expected_response_type_required: bool = True
 
     def __post_init__(self) -> None:
-        if not (0 <= self.conversation_min_confidence <= 1):
-            raise ValueError("conversation_min_confidence must be between 0 and 1")
-        if not (0 <= self.conversation_duplicate_threshold <= 1):
-            raise ValueError("conversation_duplicate_threshold must be between 0 and 1")
-        if not (0 <= self.knowledge_duplicate_threshold <= 1):
-            raise ValueError("knowledge_duplicate_threshold must be between 0 and 1")
         if self.expected_response_type_fallback_policy not in {"unknown", "reject"}:
             raise ValueError("expected_response_type_fallback_policy must be 'unknown' or 'reject'")
 
@@ -311,6 +297,7 @@ class AssistantConfig:
     classification: ClassificationConfig
     reminder_resolver: ReminderTargetResolverConfig
     retrieval_validation: RetrievalValidationConfig
+    knowledge_chunk_settings: KnowledgeChunkSettings = field(default_factory=KnowledgeChunkSettings)
     mutation_policy: MutationPolicyConfig = field(default_factory=MutationPolicyConfig)
     question_generation: QuestionGenerationConfig = field(default_factory=QuestionGenerationConfig)
     last_qa: LastQAConfig = field(default_factory=LastQAConfig)

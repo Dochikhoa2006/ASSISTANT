@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 import os
 
+from .retrieval_policy import RETRIEVAL_PIPELINE_POLICY, RetrievalPipelinePolicy
+
 
 def _get_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -171,16 +173,22 @@ class OllamaSettings:
 
 @dataclass(frozen=True)
 class RetrievalSettings:
-    max_results: int = 6
-    bm25_top_k: int = 24
-    chroma_top_k: int = 24
-    min_confidence: float = 0.30
-    conversation_min_confidence: float = 0.42
-    knowledge_min_confidence: float = 0.38
+    max_results: int = RETRIEVAL_PIPELINE_POLICY.final_top_k
+    bm25_top_k: int = RETRIEVAL_PIPELINE_POLICY.source_top_k
+    chroma_top_k: int = RETRIEVAL_PIPELINE_POLICY.source_top_k
     rrf_k: int = 40
     lexical_weight: float = 1.10
     semantic_weight: float = 1.0
-    rerank_candidate_limit: int = 16
+    rerank_candidate_limit: int = RETRIEVAL_PIPELINE_POLICY.rrf_top_k
+
+    def __post_init__(self) -> None:
+        RetrievalPipelinePolicy(
+            source_top_k=self.bm25_top_k,
+            rrf_top_k=self.rerank_candidate_limit,
+            final_top_k=self.max_results,
+        ).validate()
+        if self.chroma_top_k != self.bm25_top_k:
+            raise ValueError("OpenSearch and ChromaDB candidate limits must be identical")
 
 
 @dataclass(frozen=True)
@@ -230,7 +238,7 @@ class RerankerSettings:
 
 @dataclass(frozen=True)
 class ModelWarmupSettings:
-    """Controls eager model execution before the assistant accepts requests."""
+    """Required eager model execution before the assistant accepts requests."""
 
     enabled: bool = True
 
@@ -317,7 +325,6 @@ class PromptPolicySettings:
     risky_action_operations: tuple[str, ...] = ("delete", "turn_off")
     risky_action_confidence_threshold: float = 0.90
     knowledge_modify_requires_replacement_text: bool = True
-    context_filter_knowledge_min_confidence: float = 0.38
     context_filter_allowed_reminder_statuses: tuple[str, ...] = ("scheduled", "notified")
     question_generation_enabled: bool = True
     reminder_supporting_question_enabled: bool = True
@@ -489,13 +496,11 @@ class OperationsSettings:
 class DebugSettings:
     db_path: str = "assistant_data/debug_pipeline.sqlite3"
     user_id: str = "debug-user"
-    conversation_min_confidence: float = 0.08
-    knowledge_min_confidence: float = 0.10
-    max_results: int = 4
+    max_results: int = RETRIEVAL_PIPELINE_POLICY.final_top_k
     rrf_k: int = 40
     lexical_weight: float = 1.10
     semantic_weight: float = 1.0
-    rerank_candidate_limit: int = 8
+    rerank_candidate_limit: int = RETRIEVAL_PIPELINE_POLICY.rrf_top_k
     outbox_max_attempts: int = 2
     outbox_batch_size: int = 32
     outbox_retry_backoff_seconds: int = 0
@@ -513,19 +518,10 @@ class DebugSettings:
 
 @dataclass(frozen=True)
 class ContextFilterSettings:
-    conversation_min_confidence: float = 0.42
-    conversation_approved_max_items: int = 6
-    conversation_duplicate_threshold: float = 0.90
-    knowledge_approved_max_items: int = 6
-    knowledge_duplicate_threshold: float = 0.93
-    low_information_text_patterns: tuple[str, ...] = (
-        "done", "saved", "updated successfully", "ok", "noted", "sure"
-    )
     reminder_approved_max_items: int = 5
     reminder_min_confidence: float = 0.58
     semantic_context_judge_enabled: bool = False
     context_filter_debug_diagnostics_enabled: bool = False
-    low_information_min_chars: int = 12
 
 
 @dataclass(frozen=True)
@@ -708,15 +704,6 @@ class ProductionSettings:
                 max_results=_get_int("FINAL_CONTEXT_TOP_K", _get_int("ASSISTANT_MAX_RESULTS", RetrievalSettings.max_results)),
                 bm25_top_k=_get_int("BM25_TOP_K", RetrievalSettings.bm25_top_k),
                 chroma_top_k=_get_int("CHROMA_TOP_K", RetrievalSettings.chroma_top_k),
-                min_confidence=_get_float("RETRIEVAL_MIN_CONFIDENCE", RetrievalSettings.min_confidence),
-                conversation_min_confidence=_get_float(
-                    "CONVERSATION_CONTEXT_MIN_CONFIDENCE",
-                    _get_float("ASSISTANT_CONVERSATION_MIN_CONFIDENCE", RetrievalSettings.conversation_min_confidence),
-                ),
-                knowledge_min_confidence=_get_float(
-                    "KNOWLEDGE_CONTEXT_MIN_CONFIDENCE",
-                    _get_float("ASSISTANT_KNOWLEDGE_MIN_CONFIDENCE", RetrievalSettings.knowledge_min_confidence),
-                ),
                 rrf_k=_get_int("RRF_K", _get_int("ASSISTANT_RRF_K", RetrievalSettings.rrf_k)),
                 lexical_weight=_get_float(
                     "ASSISTANT_RRF_LEXICAL_WEIGHT", RetrievalSettings.lexical_weight
@@ -946,10 +933,6 @@ class ProductionSettings:
                     "PROMPT_KNOWLEDGE_MODIFY_REQUIRES_REPLACEMENT_TEXT",
                     PromptPolicySettings.knowledge_modify_requires_replacement_text,
                 ),
-                context_filter_knowledge_min_confidence=_get_float(
-                    "KNOWLEDGE_CONTEXT_MIN_CONFIDENCE",
-                    _get_float("PROMPT_CONTEXT_FILTER_KNOWLEDGE_MIN_CONFIDENCE", PromptPolicySettings.context_filter_knowledge_min_confidence),
-                ),
                 context_filter_allowed_reminder_statuses=_get_tuple(
                     "PROMPT_CONTEXT_FILTER_ALLOWED_REMINDER_STATUSES",
                     PromptPolicySettings.context_filter_allowed_reminder_statuses,
@@ -1089,14 +1072,6 @@ class ProductionSettings:
             debug=DebugSettings(
                 db_path=os.getenv("ASSISTANT_DEBUG_DB_PATH", DebugSettings.db_path),
                 user_id=os.getenv("ASSISTANT_DEBUG_USER_ID", DebugSettings.user_id),
-                conversation_min_confidence=_get_float(
-                    "ASSISTANT_DEBUG_CONVERSATION_MIN_CONFIDENCE",
-                    DebugSettings.conversation_min_confidence,
-                ),
-                knowledge_min_confidence=_get_float(
-                    "ASSISTANT_DEBUG_KNOWLEDGE_MIN_CONFIDENCE",
-                    DebugSettings.knowledge_min_confidence,
-                ),
                 max_results=_get_int("ASSISTANT_DEBUG_MAX_RESULTS", DebugSettings.max_results),
                 rrf_k=_get_int("ASSISTANT_DEBUG_RRF_K", DebugSettings.rrf_k),
                 lexical_weight=_get_float(
@@ -1160,17 +1135,10 @@ class ProductionSettings:
                 ),
             ),
             context_filter=ContextFilterSettings(
-                conversation_min_confidence=_get_float("CONVERSATION_CONTEXT_MIN_CONFIDENCE", _get_float("CONTEXT_FILTER_CONVERSATION_MIN_CONFIDENCE", ContextFilterSettings.conversation_min_confidence)),
-                conversation_approved_max_items=_get_int("FINAL_CONTEXT_TOP_K", _get_int("CONTEXT_FILTER_CONVERSATION_MAX_ITEMS", ContextFilterSettings.conversation_approved_max_items)),
-                conversation_duplicate_threshold=_get_float("CONTEXT_FILTER_CONVERSATION_DEDUP_THRESHOLD", ContextFilterSettings.conversation_duplicate_threshold),
-                knowledge_approved_max_items=_get_int("FINAL_CONTEXT_TOP_K", _get_int("CONTEXT_FILTER_KNOWLEDGE_MAX_ITEMS", ContextFilterSettings.knowledge_approved_max_items)),
-                knowledge_duplicate_threshold=_get_float("CONTEXT_FILTER_KNOWLEDGE_DEDUP_THRESHOLD", ContextFilterSettings.knowledge_duplicate_threshold),
-                low_information_text_patterns=_get_tuple("CONTEXT_FILTER_LOW_INFO_PATTERNS", ContextFilterSettings.low_information_text_patterns),
                 reminder_approved_max_items=_get_int("FINAL_CONTEXT_TOP_K", _get_int("CONTEXT_FILTER_REMINDER_MAX_ITEMS", ContextFilterSettings.reminder_approved_max_items)),
                 reminder_min_confidence=_get_float("REMINDER_CONTEXT_MIN_CONFIDENCE", ContextFilterSettings.reminder_min_confidence),
                 semantic_context_judge_enabled=_get_bool("CONTEXT_FILTER_SEMANTIC_JUDGE_ENABLED", ContextFilterSettings.semantic_context_judge_enabled),
                 context_filter_debug_diagnostics_enabled=_get_bool("CONTEXT_FILTER_DEBUG_DIAGNOSTICS", ContextFilterSettings.context_filter_debug_diagnostics_enabled),
-                low_information_min_chars=_get_int("CONTEXT_FILTER_LOW_INFO_MIN_CHARS", ContextFilterSettings.low_information_min_chars),
             ),
             general_purpose=GeneralPurposeSettings(
                 general_sub_branch_detector_enabled=_get_bool("GENERAL_SUB_BRANCH_DETECTOR_ENABLED", GeneralPurposeSettings.general_sub_branch_detector_enabled),

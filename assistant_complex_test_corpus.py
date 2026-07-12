@@ -2369,11 +2369,11 @@ expectations = [{'index': 0,
   'expected_route_and_components': 'GeneralResponseBranch answer/writing -> ResponseBundler -> PlatformSelector gmail '
                                    '-> extraction mode=draft.',
   'expected_component_work': 'Recipient extracted exactly, body grounded in bundled answer, mode draft because '
-                             "explicit 'do not send'. PostSelectorHITL asks review/confirmation or returns draft "
-                             'payload.',
+                             "explicit 'do not send'. PlatformSelector returns a safe draft_ready payload without "
+                             'invoking SMTP.',
   'expected_response': 'A polished draft and clear statement that it was not sent.',
-  'expected_supporting_question': 'Delivery-specific review question only, not unrelated general supporting question.',
-  'expected_persistence': 'Conversation hop and platform delivery audit/pending-review state if designed.',
+  'expected_supporting_question': 'No delivery confirmation question is required for a non-sending draft.',
+  'expected_persistence': 'Conversation hop and platform delivery audit with draft_ready status.',
   'expected_side_effects': 'No SMTP call.',
   'expected_observability_and_performance': 'Platform channel gmail, confidence, recipient, mode draft; credentials '
                                             'not logged.',
@@ -2400,13 +2400,13 @@ expectations = [{'index': 0,
   'expected_last_qa_behavior': 'Follow-up to artifact creation.',
   'expected_retrieval_behavior': 'Use prior artifact metadata from bundled/persisted context; do not accept arbitrary '
                                  'paths.',
-  'expected_route_and_components': 'PlatformSelector gmail -> action planning -> pending_review; sender invoked only '
-                                   'after explicit approved delivery path.',
+  'expected_route_and_components': 'PlatformSelector gmail -> action planning -> explicit send-mode validation -> '
+                                   'Gmail SMTP sender.',
   'expected_component_work': 'Attach only verified file from artifact system; recipient and subject exact; body two '
                              'sentences. Secret redacted.',
-  'expected_response': 'Present send-ready review including filename; no success claim before SMTP result.',
-  'expected_supporting_question': 'One confirmation question to send.',
-  'expected_persistence': 'Platform delivery pending-review audit; after approval, sent/failed status.',
+  'expected_response': 'Report sent only after SMTP success; otherwise report a safe failed or partial-failure status.',
+  'expected_supporting_question': 'No confirmation question when the current request explicitly authorizes sending.',
+  'expected_persistence': 'Platform delivery audit with the actual sent, failed, or partial-failure status.',
   'expected_side_effects': 'Attachment bytes read only from verified user-owned path.',
   'expected_observability_and_performance': 'No storage path in public response.',
   'failure_signals': 'Attaches foreign/arbitrary file; sends before review; omits attachment.'},
@@ -2460,8 +2460,8 @@ expectations = [{'index': 0,
   'expected_preflight_intent': 'general_response',
   'expected_last_qa_behavior': 'Could be follow-up for body content but delivery details incomplete.',
   'expected_retrieval_behavior': 'Use approved migration update context only.',
-  'expected_route_and_components': 'PlatformSelector cannot safely select gmail/zalo/telegram; PostSelectorHITL '
-                                   'clarification.',
+  'expected_route_and_components': 'PlatformSelector cannot safely select gmail/zalo/telegram and returns a '
+                                   'delivery clarification without a post-selector HITL stage.',
   'expected_component_work': 'Ask which channel and exact address/handle; do not infer from prior unrelated contacts.',
   'expected_response': 'One concise delivery clarification.',
   'expected_supporting_question': 'Mandatory delivery question.',

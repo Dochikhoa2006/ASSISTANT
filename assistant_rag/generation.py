@@ -240,7 +240,14 @@ class LLMGeneralHITLStrategy:
     prompt_registry: PromptRegistry
     config: GeneralPurposeConfig
 
-    def evaluate(self, context: PipelineContext, composer_result: ContentComposerResult) -> HumanSupportingDecision:
+    def evaluate(
+        self,
+        *,
+        context: PipelineContext,
+        response_text: str,
+        approved_conversation_history: list[dict[str, Any]],
+        merged_supporting_detail: str,
+    ) -> HumanSupportingDecision:
         if not self.config.hitl_supporting_question_enabled:
             return HumanSupportingDecision(
                 should_ask=False, question="", confidence=1.0,
@@ -249,14 +256,6 @@ class LLMGeneralHITLStrategy:
                 reason_summary="Disabled by config", risk_flags=()
             )
             
-        if composer_result.confidence >= self.config.hitl_supporting_question_confidence_threshold:
-            return HumanSupportingDecision(
-                should_ask=False, question="", confidence=composer_result.confidence,
-                question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
-                expected_response_type=ExpectedResponseType.UNKNOWN,
-                reason_summary="Confidence high enough", risk_flags=()
-            )
-
         schema = {
             "type": "object",
             "properties": {
@@ -290,25 +289,54 @@ class LLMGeneralHITLStrategy:
                 user_prompt=self.prompt_registry.user(
                     PromptContext(
                         stage="general_hitl_evaluation",
+                        user_id=context.request.user_id,
+                        raw_query=context.request.raw_query,
                         rewritten_query=context.rewritten_query,
                         extra={
-                            "composer_result": composer_result.final_response_text,
-                            "confidence": composer_result.confidence,
+                            "draft_response": response_text,
+                            "approved_conversation_history": approved_conversation_history,
+                            "merged_supporting_detail": merged_supporting_detail,
+                            "task_type": "general_supporting_question_decision",
+                            "decision_rule": (
+                                "Ask only when one specific next-turn answer would materially improve "
+                                "the drafted response. Otherwise set should_ask=false."
+                            ),
                         },
                     )
                 ),
                 schema=schema,
             )
 
-            questions = payload.get("questions", [])
+            questions = payload.get("questions", [])[:1]
             for q in questions:
-                if q.get("should_ask"):
+                question = str(q.get("question_text") or "").strip()
+                confidence = float(q.get("confidence", 0.0))
+                if (
+                    q.get("should_ask")
+                    and question
+                    and len(question) <= self.config.hitl_supporting_question_max_length
+                    and confidence >= self.config.hitl_supporting_question_confidence_threshold
+                    and self._is_novel_question(
+                        question,
+                        response_text=response_text,
+                        approved_conversation_history=approved_conversation_history,
+                    )
+                ):
+                    try:
+                        expected_response_type = ExpectedResponseType(
+                            q.get(
+                                "expected_response_type",
+                                ExpectedResponseType.UNKNOWN.value,
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        expected_response_type = ExpectedResponseType.UNKNOWN
                     return HumanSupportingDecision(
                         should_ask=True,
-                        question=str(q["question_text"]),
-                        confidence=float(q.get("confidence", 1.0)),
+                        question=question,
+                        confidence=confidence,
                         question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
-                        expected_response_type=ExpectedResponseType(q.get("expected_response_type", ExpectedResponseType.UNKNOWN.value)),
+                        expected_response_type=expected_response_type,
                         reason_summary=str(q.get("reason_summary", "")),
                         risk_flags=(),
                     )
@@ -321,3 +349,19 @@ class LLMGeneralHITLStrategy:
             expected_response_type=ExpectedResponseType.UNKNOWN,
             reason_summary="HITL generation failed", risk_flags=()
         )
+
+    @staticmethod
+    def _is_novel_question(
+        question: str,
+        *,
+        response_text: str,
+        approved_conversation_history: list[dict[str, Any]],
+    ) -> bool:
+        normalized_question = " ".join(question.casefold().split())
+        if normalized_question in " ".join(response_text.casefold().split()):
+            return False
+        for hop in approved_conversation_history:
+            prior_text = " ".join(str(hop.get("text") or "").casefold().split())
+            if normalized_question and normalized_question in prior_text:
+                return False
+        return True

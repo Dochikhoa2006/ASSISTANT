@@ -801,6 +801,7 @@ class ContentComposerInput:
     sub_branch_prompt_context: SubBranchPromptContext
     sub_branch_supporting_prompt: str
     repository: Any | None = None
+    merged_supporting_detail: str = ""
 
 
 @dataclass(frozen=True)

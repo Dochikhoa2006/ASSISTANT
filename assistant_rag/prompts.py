@@ -211,6 +211,7 @@ FAST_EXTRA_KEYS = (
     "human_supporting_questions",
     "reminder_supporting_questions",
     "extracted_expected_response_types",
+    "merged_supporting_detail",
 )
 
 
@@ -1025,6 +1026,7 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "approved_conversation_history",
                 "approved_knowledge_evidence",
                 "approved_reminder_context",
+                "merged_supporting_detail",
                 "expected response type and supporting-question context",
             ),
             output_contract="Return plain user-facing text only.",

@@ -51,6 +51,7 @@ from .reminder_safety import normalize_subject, token_similarity, utc_minute, wi
 from .recurrence import calculate_next_fire_time
 from .lifecycle import is_artifact_downloadable, is_indexable_conversation_hop, is_indexable_knowledge_chunk
 from .metrics import GLOBAL_METRICS
+from .conversation_embedding import conversation_hop_embedding_metadata, serialize_conversation_hop
 
 
 def now_iso() -> str:
@@ -897,10 +898,13 @@ class SQLiteRepository(AssistantRepository):
         if entity_type == "conversation_hop":
             row = cursor.execute(
                 """
-                SELECT h.user_id, h.topic_id, h.hop_id, h.parent_hop_id,
-                       h.root_hop_id, h.branch_id, h.intent, h.response_type,
-                       h.created_at, h.raw_user_query, h.raw_response,
-                       t.status AS topic_status
+                SELECT h.*, t.status AS topic_status,
+                       t.topic_summary AS topic_summary,
+                       t.state_summary AS topic_state_summary,
+                       t.entities_json AS topic_entities_json,
+                       t.last_hop_id AS topic_last_hop_id,
+                       t.updated_at AS topic_updated_at,
+                       t.version AS topic_version
                 FROM conversation_hops h
                 JOIN conversation_topics t ON t.topic_id = h.topic_id AND t.user_id = h.user_id
                 WHERE h.hop_id = ?
@@ -909,26 +913,15 @@ class SQLiteRepository(AssistantRepository):
             ).fetchone()
             if not row:
                 raise ValueError(f"Conversation hop not found: {entity_id}")
-            if not is_indexable_conversation_hop(dict(row)):
+            hop = dict(row)
+            if not is_indexable_conversation_hop(hop):
                 raise ValueError(f"Conversation hop is not indexable: {entity_id}")
-            text = f"User: {row['raw_user_query']}\nAssistant: {row['raw_response']}"
-            metadata = {
-                "user_id": row["user_id"],
-                "topic_id": row["topic_id"],
-                "hop_id": row["hop_id"],
-                "parent_hop_id": row["parent_hop_id"] or "",
-                "root_hop_id": row["root_hop_id"] or "",
-                "branch_id": row["branch_id"] or "",
-                "intent": row["intent"],
-                "response_type": row["response_type"],
-                "created_at": row["created_at"],
-            }
             return OutboxIndexPayload(
-                user_id=row["user_id"],
+                user_id=hop["user_id"],
                 entity_type=entity_type,
                 entity_id=entity_id,
-                text=text,
-                metadata=metadata,
+                text=serialize_conversation_hop(hop),
+                metadata=conversation_hop_embedding_metadata(hop),
             )
         elif entity_type == "knowledge_chunk":
             row = cursor.execute(
@@ -1017,11 +1010,16 @@ class SQLiteRepository(AssistantRepository):
         placeholders = ",".join("?" for _ in ids)
         rows = self.connection.execute(
             f"""
-            SELECT hop_id, user_id, topic_id, parent_hop_id, root_hop_id, branch_id,
-                   intent, response_type, supporting_questions_json, raw_user_query,
-                   raw_response, created_at
-            FROM conversation_hops
-            WHERE user_id = ? AND hop_id IN ({placeholders})
+            SELECT h.*, t.status AS topic_status,
+                   t.topic_summary AS topic_summary,
+                   t.state_summary AS topic_state_summary,
+                   t.entities_json AS topic_entities_json,
+                   t.last_hop_id AS topic_last_hop_id,
+                   t.updated_at AS topic_updated_at,
+                   t.version AS topic_version
+            FROM conversation_hops h
+            JOIN conversation_topics t ON t.topic_id = h.topic_id AND t.user_id = h.user_id
+            WHERE h.user_id = ? AND h.hop_id IN ({placeholders})
             """,
             [user_id, *ids],
         ).fetchall()
@@ -1033,7 +1031,7 @@ class SQLiteRepository(AssistantRepository):
                 continue
             payload = dict(result.payload)
             payload.update(hop)
-            payload["text"] = f"User: {hop['raw_user_query']}\nAssistant: {hop['raw_response']}"
+            payload["text"] = serialize_conversation_hop(hop)
             hydrated.append(
                 RetrievalResult(
                     entity_type=result.entity_type,

@@ -8,7 +8,6 @@ from uuid import uuid4
 
 from assistant_rag.contracts import ChatRequest
 from assistant_rag.llm import LLMTask
-from assistant_rag.autoscan import ReminderAutoscan
 from assistant_rag.platform import GmailSender
 from assistant_rag.observability import new_request_id, start_trace, trace_summary_asdict
 from assistant_rag.reminder_reply import (
@@ -18,9 +17,7 @@ from assistant_rag.reminder_reply import (
     reminder_notification_key,
 )
 from assistant_rag.production_factory import (
-    build_production_pipeline,
-    build_production_repository,
-    build_reminder_timing_planner,
+    build_production_runtime,
 )
 from assistant_rag.settings import ProductionSettings
 
@@ -78,15 +75,10 @@ def _summarize_chat_session(pipeline: object, messages: list[dict[str, str]]) ->
     return "Chat closed. The LLM summary was unavailable for this session."
 
 
-def _catch_up_reminders(st: object, settings: ProductionSettings) -> dict[str, int] | None:
+def _catch_up_reminders(st: object) -> dict[str, int] | None:
     """Create durable UI notifications for all due users after a UI start."""
-    if "reminder_autoscan" not in st.session_state:
-        st.session_state.reminder_autoscan = ReminderAutoscan(
-            st.session_state.repository,
-            timing_planner=build_reminder_timing_planner(settings),
-        )
     try:
-        summary = st.session_state.reminder_autoscan.catch_up_due(
+        summary = st.session_state.runtime.reminder_autoscan.catch_up_due(
             now_value=datetime.now(timezone.utc).isoformat(), batch_size=100
         )
         st.session_state.last_reminder_autoscan = summary
@@ -302,18 +294,17 @@ def main() -> None:
     st.set_page_config(page_title="SQL-First RAG Assistant", layout="wide")
     st.title("SQL-First RAG Assistant")
     settings = ProductionSettings.from_env()
-    if "pipeline" not in st.session_state:
-        st.session_state.pipeline = build_production_pipeline(settings)
-    
-    if "repository" not in st.session_state:
-        st.session_state.repository = build_production_repository(settings)
+    if "runtime" not in st.session_state:
+        st.session_state.runtime = build_production_runtime(settings)
+    st.session_state.pipeline = st.session_state.runtime.pipeline
+    st.session_state.repository = st.session_state.runtime.repository
 
     _initialise_chat_state(st)
     # A Streamlit process/session can start after reminders became due. Drain
     # the global durable backlog once immediately; duplicate database rows are
     # prevented by the reminder/fire-time uniqueness contract.
     if "startup_reminder_catchup_done" not in st.session_state:
-        _catch_up_reminders(st, settings)
+        _catch_up_reminders(st)
         st.session_state.startup_reminder_catchup_done = True
 
     with st.sidebar:
@@ -327,7 +318,7 @@ def main() -> None:
         user_id = entered_user_id.strip() or "default_user"
 
         if st.button("Refresh reminder notifications"):
-            _catch_up_reminders(st, settings)
+            _catch_up_reminders(st)
             st.rerun()
         autoscan_summary = st.session_state.get("last_reminder_autoscan")
         if autoscan_summary and any(autoscan_summary.get(key, 0) for key in ("planned", "needs_review", "notified")):
@@ -437,6 +428,23 @@ def main() -> None:
         delivery = response.platform_payload.get("delivery", {})
         if delivery.get("channel") not in (None, "none"):
             st.caption(f"Delivery: {delivery.get('channel')} — {delivery.get('status')}")
+            message = response.platform_payload.get("draft", {})
+            if message:
+                with st.expander(
+                    f"{str(delivery.get('channel')).title()} delivery details",
+                    expanded=delivery.get("status") in {"draft_ready", "draft_saved", "failed", "partial_failure", "needs_input"},
+                ):
+                    recipients = message.get("recipients") or [message.get("recipient")]
+                    st.write(f"To: {', '.join(str(item) for item in recipients if item)}")
+                    st.write(f"Subject: {message.get('subject') or '(none)'}")
+                    st.write(f"Mode: {message.get('mode') or 'unknown'}")
+                    st.text(message.get("body") or "")
+                    attachments = message.get("attachments") or []
+                    if attachments:
+                        st.write(
+                            "Attachments: "
+                            + ", ".join(str(item.get("filename")) for item in attachments if item.get("filename"))
+                        )
 
 
 if __name__ == "__main__":

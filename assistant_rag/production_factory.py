@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 
 from .bm25_opensearch import OpenSearchBM25Index
@@ -21,7 +22,7 @@ from .contracts import Intent
 from .database import AssistantRepository
 from .embeddings import SentenceTransformerEmbeddingClient
 from .last_qa import DiskCacheLastQAStore
-from .llm import OllamaIntentClassifier, OllamaLLMClient, OllamaModelRouter
+from .llm import LLMClient, OllamaIntentClassifier, OllamaLLMClient, OllamaModelRouter
 from .onnx_llm import ONNXLLMClient
 from .hybrid_llm import HybridLLMClient
 from .pipeline import AssistantPipeline
@@ -43,17 +44,27 @@ from .content_composer import (
     ContentToolRegistry,
     ReActContentComposer,
 )
+from .autoscan import ReminderAutoscan
+from .reminder_timing import ReminderTimingPlanner
+
+
+@dataclass(frozen=True)
+class ProductionRuntime:
+    """The complete online runtime shared by every user-facing entrypoint."""
+
+    pipeline: AssistantPipeline
+    repository: AssistantRepository
+    reminder_autoscan: ReminderAutoscan
 
 
 def build_assistant_config(settings: ProductionSettings) -> AssistantConfig:
+    if settings.reranker.max_candidates < settings.retrieval.rerank_candidate_limit:
+        raise ValueError("Cross-encoder capacity must include every RRF candidate")
     return AssistantConfig(
         retrieval=RetrievalConfig(
-            conversation_min_confidence=settings.retrieval.conversation_min_confidence,
-            knowledge_min_confidence=settings.retrieval.knowledge_min_confidence,
             max_results=settings.retrieval.max_results,
             bm25_top_k=settings.retrieval.bm25_top_k,
             chroma_top_k=settings.retrieval.chroma_top_k,
-            min_confidence=settings.retrieval.min_confidence,
             rrf_k=settings.retrieval.rrf_k,
             lexical_weight=settings.retrieval.lexical_weight,
             semantic_weight=settings.retrieval.semantic_weight,
@@ -76,6 +87,7 @@ def build_assistant_config(settings: ProductionSettings) -> AssistantConfig:
         ),
         reminder_resolver=settings.reminder_resolver,
         retrieval_validation=settings.retrieval_validation,
+        knowledge_chunk_settings=settings.knowledge_chunks,
         question_generation=QuestionGenerationConfig(
             enabled=settings.prompt_policy.question_generation_enabled,
             clarification_model=settings.ollama.model_generate_clarification,
@@ -110,16 +122,9 @@ def build_assistant_config(settings: ProductionSettings) -> AssistantConfig:
             clarification_merge_enabled=settings.prompt_policy.clarification_merge_enabled,
         ),
         context_filter=ContextFilterConfig(
-            conversation_min_confidence=settings.context_filter.conversation_min_confidence,
-            conversation_approved_max_items=settings.context_filter.conversation_approved_max_items,
-            conversation_duplicate_threshold=settings.context_filter.conversation_duplicate_threshold,
-            knowledge_approved_max_items=settings.context_filter.knowledge_approved_max_items,
-            knowledge_duplicate_threshold=settings.context_filter.knowledge_duplicate_threshold,
-            low_information_text_patterns=settings.context_filter.low_information_text_patterns,
             reminder_approved_max_items=settings.context_filter.reminder_approved_max_items,
             semantic_context_judge_enabled=settings.context_filter.semantic_context_judge_enabled,
             context_filter_debug_diagnostics_enabled=settings.context_filter.context_filter_debug_diagnostics_enabled,
-            low_information_min_chars=settings.context_filter.low_information_min_chars,
             conversation_retrieval_after_last_qa_enabled=settings.prompt_policy.conversation_retrieval_after_last_qa_enabled,
             conversation_retrieval_before_intent_enabled=settings.prompt_policy.conversation_retrieval_before_intent_enabled,
             expected_response_type_required=settings.prompt_policy.expected_response_type_required,
@@ -161,22 +166,48 @@ def build_production_repository(settings: ProductionSettings) -> AssistantReposi
     return repository
 
 
-def build_reminder_timing_planner(settings: ProductionSettings) -> ReminderTimingPlanner:
+def build_reminder_timing_planner(
+    settings: ProductionSettings,
+    *,
+    llm: LLMClient | None = None,
+) -> ReminderTimingPlanner:
     """Build the same routed LLM client used by the online pipeline.
 
     Workers should receive this planner so timing occurs in autoscan, without
     making the chat request wait for a model call.
     """
-    model_router = OllamaModelRouter(settings.ollama)
-    ollama_llm = OllamaLLMClient(settings.ollama, model_router)
-    onnx_llm = ONNXLLMClient(
-        model_router,
-        preload=settings.ollama.preload_onnx_models,
+    if llm is None:
+        model_router = OllamaModelRouter(settings.ollama)
+        ollama_llm = OllamaLLMClient(settings.ollama, model_router)
+        onnx_llm = ONNXLLMClient(model_router)
+        _warm_llm_models(ollama_llm, onnx_llm)
+        llm = HybridLLMClient(ollama_llm, onnx_llm)
+    return ReminderTimingPlanner(llm=llm)
+
+
+def build_production_runtime(settings: ProductionSettings) -> ProductionRuntime:
+    """Build and fully warm the exact runtime used for every user query."""
+    pipeline = build_production_pipeline(settings)
+    repository = build_production_repository(settings)
+    llm = getattr(pipeline.platform_selector, "llm", None)
+    if llm is None:
+        raise RuntimeError("Production runtime requires the shared routed LLM client.")
+    return ProductionRuntime(
+        pipeline=pipeline,
+        repository=repository,
+        reminder_autoscan=ReminderAutoscan(
+            repository,
+            timing_planner=build_reminder_timing_planner(settings, llm=llm),
+        ),
     )
-    return ReminderTimingPlanner(llm=HybridLLMClient(ollama_llm, onnx_llm))
 
 
 def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline:
+    if not settings.model_warmup.enabled:
+        raise ValueError(
+            "ASSISTANT_MODEL_WARMUP must remain enabled: production entrypoints "
+            "must load every configured model before accepting a user query."
+        )
     assistant_config = build_assistant_config(settings)
     bm25 = OpenSearchBM25Index(settings.opensearch)
     bm25.initialize()
@@ -191,8 +222,7 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
     )
     llm = HybridLLMClient(ollama_llm, onnx_llm)
     reranker = SentenceTransformerCrossEncoderReranker(settings.reranker)
-    if settings.model_warmup.enabled:
-        _warm_production_models(embeddings, reranker, ollama_llm, onnx_llm)
+    _warm_production_models(embeddings, reranker, ollama_llm, onnx_llm)
     retriever = HybridRetriever(
         bm25=bm25,
         chroma=chroma,
@@ -214,17 +244,9 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
     )
     
     hard_rule_filter = HardRuleContextFilter(
-        knowledge_min_confidence=settings.prompt_policy.context_filter_knowledge_min_confidence,
         allowed_reminder_statuses=settings.prompt_policy.context_filter_allowed_reminder_statuses,
-        conversation_min_confidence=settings.context_filter.conversation_min_confidence,
-        conversation_approved_max_items=settings.context_filter.conversation_approved_max_items,
-        conversation_duplicate_threshold=settings.context_filter.conversation_duplicate_threshold,
-        knowledge_approved_max_items=settings.context_filter.knowledge_approved_max_items,
-        knowledge_duplicate_threshold=settings.context_filter.knowledge_duplicate_threshold,
-        low_information_text_patterns=settings.context_filter.low_information_text_patterns,
         reminder_approved_max_items=settings.context_filter.reminder_approved_max_items,
         reminder_min_confidence=settings.context_filter.reminder_min_confidence,
-        low_information_min_chars=settings.context_filter.low_information_min_chars,
     )
     context_filter = TwoLayerContextFilter(
         hard_rule_filter=hard_rule_filter,
@@ -385,8 +407,15 @@ def _warm_production_models(
     logger.info("Warming embedding, reranking, and configured LLM models before accepting requests")
     embeddings.warmup()
     reranker.warmup()
-    warmed_ollama_models = ollama_llm.warmup_models()
-    warmed_onnx_models = onnx_llm.preload_models()
+    warmed_ollama_models, warmed_onnx_models = _warm_llm_models(ollama_llm, onnx_llm)
     if warmed_onnx_models:
         logger.info("ONNX models warmed: %s", ", ".join(warmed_onnx_models))
     logger.info("Ollama models warmed: %s", ", ".join(warmed_ollama_models))
+
+
+def _warm_llm_models(
+    ollama_llm: OllamaLLMClient,
+    onnx_llm: ONNXLLMClient,
+) -> tuple[list[str], list[str]]:
+    """Load every routed Ollama and ONNX model before accepting work."""
+    return ollama_llm.warmup_models(), onnx_llm.preload_models()
