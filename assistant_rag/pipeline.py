@@ -11,11 +11,6 @@ from .contracts import (
     ChatRequest,
     PipelineContext,
     ApprovedConversationContext,
-    LastQAPath,
-    LastQAResolution,
-    LastQAInteractionType,
-    QuestionSource,
-    validate_last_qa_resolution,
 )
 from .contracts import Intent
 from .last_qa import InMemoryLastQAStore
@@ -49,69 +44,12 @@ class AssistantPipeline:
         with StageTimer("rewrite"):
             rewritten = self.query_rewriter.rewrite(request.raw_query)
 
-        # Current-state mutations own their request. Establish that ownership
-        # before consulting temporary conversational state so an unrelated stale
-        # turn cannot add model latency, trigger retrieval, or redirect it.
-        with StageTimer("intent_ownership"):
-            current_request_intent = self.classifier.classify(request, rewritten)
-
-        reminder_reply = bool((request.metadata or {}).get("reminder_reply_context"))
-        # A notification reply carries an exact reminder-to-source-hop mapping.
-        # It must restore that Last-QA state before normal routing, even when
-        # its text contains a reminder action such as "turn it off".
-        state_mutation = (
-            current_request_intent in {Intent.KNOWLEDGE_FACTS, Intent.REMINDER}
-            and not reminder_reply
-        )
-        with StageTimer("last_qa_resolution", {"state_mutation": state_mutation}) as last_qa_stage:
-            if reminder_reply:
-                last_state = self.last_qa_store.get(request.user_id)
-                metadata = request.metadata or {}
-                source_topic_id = metadata.get("source_topic_id")
-                source_hop_id = metadata.get("source_hop_id")
-                if (
-                    last_state is not None
-                    and source_topic_id == last_state.linked_topic_id
-                    and source_hop_id == last_state.linked_hop_id
-                ):
-                    resolution = LastQAResolution(
-                        path=LastQAPath.LATEST_CONTEXT_INTERACTION,
-                        rewritten_query=rewritten,
-                        state=last_state,
-                        did_merge_query=False,
-                        skip_broad_retrieval=True,
-                        interaction_type=LastQAInteractionType.REMINDER_NOTIFICATION_REPLY,
-                        question_source=QuestionSource.NONE,
-                        linked_topic_id=last_state.linked_topic_id,
-                        linked_hop_id=last_state.linked_hop_id,
-                        reminder_id=metadata.get("reminder_id"),
-                        notification_id=metadata.get("notification_id"),
-                        source_topic_id=source_topic_id,
-                        source_hop_id=source_hop_id,
-                        merge_reason="exact_reminder_notification_context",
-                        skip_reason="reminder_reply_context_hash_matched_source_hop",
-                        is_authoritative_state=True,
-                    )
-                    validate_last_qa_resolution(resolution)
-                else:
-                    resolution = self.last_qa_resolver.resolve(request, rewritten, last_state)
-            elif state_mutation:
-                resolution = LastQAResolution(
-                    path=LastQAPath.CURRENT_STATE_MUTATION,
-                    rewritten_query=rewritten,
-                    state=None,
-                    did_merge_query=False,
-                    skip_broad_retrieval=True,
-                    diagnostic_context={"current_request_intent": current_request_intent.value},
-                    merge_reason="current_state_mutation_bypassed_last_qa",
-                    skip_reason="current_state_mutation_bypassed_broad_retrieval",
-                    is_authoritative_state=False,
-                )
-                validate_last_qa_resolution(resolution)
-                intent = current_request_intent
-            else:
-                last_state = self.last_qa_store.get(request.user_id)
-                resolution = self.last_qa_resolver.resolve(request, rewritten, last_state)
+        # Last-QA is a compulsory stage for every request. Intent classification
+        # happens only after the resolver has accepted, merged, or rejected the
+        # latest state.
+        with StageTimer("last_qa_resolution") as last_qa_stage:
+            last_state = self.last_qa_store.get(request.user_id)
+            resolution = self.last_qa_resolver.resolve(request, rewritten, last_state)
             last_qa_stage.metadata["path"] = resolution.path.value
         
         retrieval_query = resolution.rewritten_query
@@ -166,15 +104,13 @@ class AssistantPipeline:
                     approved_conversation_count=0,
                 )
         
-        with StageTimer("classification_final", {"intent_ownership_owned": state_mutation}) as final_classification_stage:
-            if not state_mutation:
-                intent = self.classifier.classify(
-                    request,
-                    intent_classifier_query,
-                    last_qa_resolution=resolution,
-                    approved_conversation_context=approved_conversation_context,
-                )
-            final_classification_stage.metadata["ran"] = not state_mutation
+        with StageTimer("classification"):
+            intent = self.classifier.classify(
+                request,
+                intent_classifier_query,
+                last_qa_resolution=resolution,
+                approved_conversation_context=approved_conversation_context,
+            )
 
         last_qa_trace = {
             "input_rewritten_query": rewritten,

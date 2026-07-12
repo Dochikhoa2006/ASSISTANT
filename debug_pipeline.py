@@ -1257,14 +1257,43 @@ def scenario_mutation_clarification_fast_path(settings: ProductionSettings) -> S
     return ScenarioResult("mutation_clarification_fast_path", True, "predictable mutation gaps skip unused action planning and LLM question generation")
 
 
-def scenario_state_mutation_intent_ownership_bypass(settings: ProductionSettings) -> ScenarioResult:
-    """Current state mutations must not consult stale Last-QA or broad conversation retrieval."""
-    class MustNotResolveLastQA:
-        def resolve(self, *_: Any, **__: Any) -> Any:
-            raise AssertionError("state mutation invoked Last-QA resolution")
-
+def scenario_last_qa_mandatory_before_classification(settings: ProductionSettings) -> ScenarioResult:
+    """Every request must load and resolve Last-QA before its only classification."""
     state = build_scenario_state(settings)
-    state.pipeline.last_qa_resolver = MustNotResolveLastQA()
+    events: list[str] = []
+
+    class RecordingRewriter:
+        def rewrite(self, query: str) -> str:
+            events.append("rewrite")
+            return QueryRewriter().rewrite(query)
+
+    class RecordingLastQAStore:
+        def __init__(self, delegate: Any) -> None:
+            self.delegate = delegate
+
+        def get(self, user_id: str) -> LastQAState | None:
+            events.append("last_qa_state")
+            return self.delegate.get(user_id)
+
+        def save(self, user_id: str, value: LastQAState) -> None:
+            self.delegate.save(user_id, value)
+
+    class RecordingLastQAResolver:
+        def resolve(
+            self, request: ChatRequest, rewritten_query: str, last_state: LastQAState | None
+        ) -> Any:
+            events.append("last_qa_resolver")
+            return LastQAResolver().resolve(request, rewritten_query, last_state)
+
+    class RecordingClassifier:
+        def classify(self, request: ChatRequest, *_: Any, **__: Any) -> Intent:
+            events.append("classification")
+            return Intent(request.metadata["intent"])
+
+    state.pipeline.query_rewriter = RecordingRewriter()
+    state.pipeline.last_qa_store = RecordingLastQAStore(state.pipeline.last_qa_store)
+    state.pipeline.last_qa_resolver = RecordingLastQAResolver()
+    state.pipeline.classifier = RecordingClassifier()
     start_trace(new_request_id())
     response = run_request(
         state,
@@ -1275,14 +1304,21 @@ def scenario_state_mutation_intent_ownership_bypass(settings: ProductionSettings
         },
     )
     assert_response(response, ResponseType.KNOWLEDGE_ACTION, "Added new knowledge")
-    if state.retriever.conversation_calls:
-        raise AssertionError("state mutation invoked broad conversation retrieval")
-    if response.last_qa_state.response_type is not ResponseType.KNOWLEDGE_ACTION:
-        raise AssertionError("state mutation did not preserve its knowledge branch")
+    expected_prefix = ["rewrite", "last_qa_state", "last_qa_resolver", "classification"]
+    if events[:4] != expected_prefix:
+        raise AssertionError(f"mandatory Last-QA ordering regressed: {events}")
+    if events.count("last_qa_resolver") != 1 or events.count("classification") != 1:
+        raise AssertionError(f"resolver and classifier must each run exactly once: {events}")
     stage_names = [stage.stage for stage in response.trace_summary.stages] if response.trace_summary else []
-    if "intent_ownership" not in stage_names:
-        raise AssertionError(f"intent ownership stage contract regressed: {stage_names}")
-    return ScenarioResult("state_mutation_intent_ownership_bypass", True, "state mutations bypass stale Last-QA and conversation retrieval")
+    required_order = ["rewrite", "last_qa_resolution", "classification"]
+    positions = [stage_names.index(name) for name in required_order]
+    if positions != sorted(positions):
+        raise AssertionError(f"pipeline stage contract regressed: {stage_names}")
+    return ScenarioResult(
+        "last_qa_mandatory_before_classification",
+        True,
+        "rewrite, Last-QA state load, Last-QA resolution, and one classification ran in order",
+    )
 
 
 def scenario_model_backed_action_extraction(settings: ProductionSettings) -> ScenarioResult:
@@ -2566,7 +2602,7 @@ SCENARIOS: tuple[ScenarioFn, ...] = (
     scenario_answer_adaptive_token_budget,
     scenario_structured_clarification_fallback_policy,
     scenario_mutation_clarification_fast_path,
-    scenario_state_mutation_intent_ownership_bypass,
+    scenario_last_qa_mandatory_before_classification,
     scenario_model_backed_action_extraction,
     scenario_knowledge_action_recovery,
     scenario_sql_backed_knowledge_lookup,

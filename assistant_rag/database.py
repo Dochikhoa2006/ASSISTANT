@@ -90,7 +90,12 @@ class SQLiteRepository(AssistantRepository):
         enable_wal: bool,
         busy_timeout_ms: int,
     ) -> "SQLiteRepository":
-        connection = sqlite3.connect(database_path)
+        # Streamlit preserves ``session_state`` across reruns, but can execute
+        # a later rerun on a different script-runner thread.  The repository
+        # stored in that state must therefore be usable by the new thread.
+        # Each Streamlit session owns its runtime, while independent processes
+        # use their own SQLite connections.
+        connection = sqlite3.connect(database_path, check_same_thread=False)
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
         if enable_wal:

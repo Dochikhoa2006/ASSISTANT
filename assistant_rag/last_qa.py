@@ -33,7 +33,11 @@ class DiskCacheLastQAStore:
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        self.connection = sqlite3.connect(path)
+        # A Streamlit session keeps its production runtime in session_state,
+        # while a rerun may be executed by a different script-runner thread.
+        # Let the retained Last-QA cache connection follow that session across
+        # reruns, matching the production repository connection.
+        self.connection = sqlite3.connect(path, check_same_thread=False)
         self.connection.execute(
             """
             CREATE TABLE IF NOT EXISTS last_qa_state (

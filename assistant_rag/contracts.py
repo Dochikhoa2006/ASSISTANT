@@ -19,7 +19,6 @@ class LastQAPath(str, Enum):
     CLARIFICATION_CHECK = "clarification_check"
     LATEST_CONTEXT_INTERACTION = "latest_context_interaction"
     BROAD_RETRIEVAL_REQUIRED = "broad_retrieval_required"
-    CURRENT_STATE_MUTATION = "current_state_mutation"
 
 
 class LastQAInteractionType(str, Enum):
@@ -695,10 +694,7 @@ def validate_last_qa_resolution(resolution: LastQAResolution) -> None:
         assert resolution.skip_broad_retrieval is False
 
     if resolution.skip_broad_retrieval:
-        assert resolution.path in {
-            LastQAPath.LATEST_CONTEXT_INTERACTION,
-            LastQAPath.CURRENT_STATE_MUTATION,
-        }
+        assert resolution.path == LastQAPath.LATEST_CONTEXT_INTERACTION
         assert resolution.did_merge_query is False
 
     if resolution.path == LastQAPath.BROAD_RETRIEVAL_REQUIRED:
@@ -708,13 +704,6 @@ def validate_last_qa_resolution(resolution: LastQAResolution) -> None:
         assert resolution.state is None
         assert resolution.did_merge_query is False
         assert resolution.skip_broad_retrieval is False
-
-    if resolution.path == LastQAPath.CURRENT_STATE_MUTATION:
-        assert resolution.state is None
-        assert resolution.did_merge_query is False
-        assert resolution.skip_broad_retrieval is True
-        assert resolution.is_authoritative_state is False
-
 
 @dataclass(frozen=True)
 class PipelineContext:

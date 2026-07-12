@@ -87,6 +87,48 @@ class T5CanardQueryRewriter:
 # LastQAResolution moved to contracts.py
 
 
+def _resolve_exact_reminder_notification_reply(
+    request: ChatRequest,
+    rewritten_query: str,
+    state: LastQAState | None,
+) -> LastQAResolution | None:
+    """Resolve a source-matched notification reply inside the mandatory resolver."""
+    metadata = request.metadata or {}
+    if not metadata.get("reminder_reply_context") or state is None:
+        return None
+
+    source_topic_id = metadata.get("source_topic_id")
+    source_hop_id = metadata.get("source_hop_id")
+    if (
+        not source_topic_id
+        or not source_hop_id
+        or source_topic_id != state.linked_topic_id
+        or source_hop_id != state.linked_hop_id
+    ):
+        return None
+
+    resolution = LastQAResolution(
+        path=LastQAPath.LATEST_CONTEXT_INTERACTION,
+        rewritten_query=rewritten_query,
+        state=state,
+        did_merge_query=False,
+        skip_broad_retrieval=True,
+        interaction_type=LastQAInteractionType.REMINDER_NOTIFICATION_REPLY,
+        question_source=QuestionSource.NONE,
+        linked_topic_id=state.linked_topic_id,
+        linked_hop_id=state.linked_hop_id,
+        reminder_id=metadata.get("reminder_id"),
+        notification_id=metadata.get("notification_id"),
+        source_topic_id=source_topic_id,
+        source_hop_id=source_hop_id,
+        merge_reason="exact_reminder_notification_context",
+        skip_reason="reminder_reply_context_hash_matched_source_hop",
+        is_authoritative_state=True,
+    )
+    validate_last_qa_resolution(resolution)
+    return resolution
+
+
 class SupportingQuestionMatcher:
     def __init__(self, match_threshold: float = 0.7) -> None:
         self.match_threshold = match_threshold
@@ -180,6 +222,12 @@ class LastQAResolver:
         self.matcher = matcher or SupportingQuestionMatcher()
 
     def resolve(self, request: ChatRequest, rewritten_query: str, state: LastQAState | None) -> LastQAResolution:
+        reminder_resolution = _resolve_exact_reminder_notification_reply(
+            request, rewritten_query, state
+        )
+        if reminder_resolution is not None:
+            return reminder_resolution
+
         if state is None:
             resolution = LastQAResolution(
                 rewritten_query=rewritten_query, 
@@ -297,6 +345,12 @@ class LLMLastQAResolver:
     def resolve(
         self, request: ChatRequest, rewritten_query: str, state: LastQAState | None
     ) -> LastQAResolution:
+        reminder_resolution = _resolve_exact_reminder_notification_reply(
+            request, rewritten_query, state
+        )
+        if reminder_resolution is not None:
+            return reminder_resolution
+
         if state is None:
             res = LastQAResolution(
                 path=LastQAPath.NO_LAST_QA,
