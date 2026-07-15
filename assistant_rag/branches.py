@@ -63,9 +63,13 @@ from .prompts import DEFAULT_PROMPT_REGISTRY, PromptContext, PromptRegistry
 from .retrieval import HybridRetriever
 from .canonical_retrieval import retrieve_knowledge
 from .reminder_retrieval import retrieve_reminder_candidates, reminder_candidate_to_context
-from .semantic_chunking import split_semantic_chunks
 from .context_filter import ContextFilter
-from .action_detection import ActionDetector
+from .action_detection import (
+    ActionDetector,
+    DeterministicActionDetector,
+    action_payload_is_authorized,
+    classify_action_request,
+)
 from .generation import QuestionGenerationStrategy
 from .branch_orchestration import ValidatedActionBuilder
 from .settings import MutationPartialExecutionPolicy
@@ -107,6 +111,28 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     return value
+
+
+def _action_authorization(
+    context: PipelineContext,
+    intent: Intent,
+    action_name: str,
+) -> dict[str, Any]:
+    existing = context.request.metadata.get("action_authorization") or {}
+    if (
+        existing.get("intent") == intent.value
+        and str(existing.get("action") or "").casefold() == action_name.casefold()
+    ):
+        return dict(existing)
+    decision = classify_action_request(context.request.raw_query, intent)
+    if decision.selected_action != action_name.casefold():
+        return {}
+    return {
+        "intent": intent.value,
+        "action": action_name.casefold(),
+        "matched_keywords": list(decision.matched_keywords),
+        "reason_summary": decision.reason_summary,
+    }
 
 
 def _expires_at(config: AssistantConfig) -> str:
@@ -310,11 +336,7 @@ class GeneralResponseBranch:
         )
         approved_context = replace(
             approved_context,
-            approved_conversation_history=(
-                context.approved_conversation_context.approved_conversation_history
-                if context.approved_conversation_context
-                else []
-            ),
+            approved_conversation_history=list(context.chat_history),
         )
         merged_supporting_detail = self._merge_supporting_detail(approved_context)
 
@@ -629,90 +651,56 @@ class KnowledgeFactsBranch:
             clarification_question=question,
         )
 
-    def _expand_semantic_knowledge_actions(
-        self, actions: list[ValidatedKnowledgeAction]
-    ) -> list[ValidatedKnowledgeAction]:
-        expanded: list[ValidatedKnowledgeAction] = []
-        for action in actions:
-            text = action.knowledge_text or action.replacement_text or action.new_text
-            if action.action not in {KnowledgeAction.ADD, KnowledgeAction.MODIFY} or not text:
-                expanded.append(action)
-                continue
-            chunks = split_semantic_chunks(
-                text,
-                settings=self.config.knowledge_chunk_settings,
-            )
-            if action.action is KnowledgeAction.MODIFY:
-                expanded.append(
-                    replace(
-                        action,
-                        action=KnowledgeAction.DELETE,
-                        knowledge_text=None,
-                        replacement_text=None,
-                        new_text=None,
-                    )
-                )
-            expanded.extend(
-                replace(
-                    action,
-                    action=KnowledgeAction.ADD,
-                    target_chunk_ids=(),
-                    target_topic_ids=(),
-                    observed_versions={},
-                    observed_is_deleted={},
-                    knowledge_text=chunk,
-                    replacement_text=None,
-                    new_text=chunk,
-                )
-                for chunk in chunks
-            )
-        return expanded
-
     def execute(self, context: PipelineContext, repository: AssistantRepository) -> BranchResult:
         actions = list(context.request.metadata.get("knowledge_actions", []))
-        if not actions:
-            if self.action_detector:
-                detection = self.action_detector.detect(
-                    context.request, context.rewritten_query, Intent.KNOWLEDGE_FACTS
+        detector = self.action_detector or DeterministicActionDetector()
+        detection = detector.detect(
+            context.request, context.rewritten_query, Intent.KNOWLEDGE_FACTS
+        )
+        if detection.metadata.get("knowledge_lookup"):
+            if self.retriever is None:
+                return self._generate_clarification(
+                    context,
+                    ["target_description"],
+                    "Knowledge retrieval is unavailable.",
                 )
-                if detection.metadata.get("knowledge_lookup"):
-                    if self.retriever is None:
-                        return self._generate_clarification(
-                            context,
-                            ["target_description"],
-                            "Knowledge retrieval is unavailable.",
-                        )
-                    knowledge_results = retrieve_knowledge(
-                        retriever=self.retriever,
-                        repository=repository,
-                        user_id=context.request.user_id,
-                        query=context.rewritten_query,
-                    )
-                    if knowledge_results:
-                        return BranchResult(
-                            response_type=ResponseType.NORMAL,
-                            normal_response_text=str(
-                                knowledge_results[0].payload.get("text", "")
-                            ),
-                        )
-                    return self._generate_clarification(
-                        context,
-                        ["target_description"],
-                        "No single stored knowledge item matched the lookup.",
-                    )
-                if detection.requires_clarification:
-                    return self._generate_clarification(context, getattr(detection, "missing_fields", []), "Missing fields for knowledge action.")
-                if detection.metadata:
-                    actions = detection.metadata.get("knowledge_actions", [])
-                    context.request.metadata.update(detection.metadata)
+            knowledge_results = retrieve_knowledge(
+                retriever=self.retriever,
+                repository=repository,
+                user_id=context.request.user_id,
+                query=context.rewritten_query,
+            )
+            if knowledge_results:
+                return BranchResult(
+                    response_type=ResponseType.NORMAL,
+                    normal_response_text=str(knowledge_results[0].payload.get("text", "")),
+                )
+            return self._generate_clarification(
+                context,
+                ["target_description"],
+                "No single stored knowledge item matched the lookup.",
+            )
+        if detection.requires_clarification:
+            return self._generate_clarification(
+                context,
+                getattr(detection, "missing_fields", []),
+                "Missing fields for knowledge action.",
+            )
+        if "knowledge_actions" in detection.metadata:
+            actions = list(detection.metadata.get("knowledge_actions") or [])
+            context.request.metadata.update(detection.metadata)
                     
         if not actions:
             return self._generate_clarification(context, [], "No valid knowledge action detected.")
+        authorized, authorization_reason = action_payload_is_authorized(
+            context.request,
+            Intent.KNOWLEDGE_FACTS,
+            actions,
+        )
+        if not authorized:
+            missing = ["single_action"] if "count" in authorization_reason or "ambiguous" in authorization_reason else ["action_keyword"]
+            return self._generate_clarification(context, missing, authorization_reason)
             
-        approved_conv_history: list[dict[str, Any]] = []
-        if context.approved_conversation_context:
-            approved_conv_history = context.approved_conversation_context.approved_conversation_history
-
         executable_actions = []
         pre_repo_results = []
         prevalidated_actions = [
@@ -729,6 +717,23 @@ class KnowledgeFactsBranch:
                     context.request.raw_query,
                     context.rewritten_query,
                     repository,
+                )
+            if len(validated_actions) != 1:
+                return self._generate_clarification(
+                    context,
+                    ["single_action"],
+                    "Exactly one knowledge action is required.",
+                )
+            validated_authorized, validated_reason = action_payload_is_authorized(
+                context.request,
+                Intent.KNOWLEDGE_FACTS,
+                validated_actions,
+            )
+            if not validated_authorized:
+                return self._generate_clarification(
+                    context,
+                    ["action_keyword"],
+                    validated_reason,
                 )
             clarification_needed = False
             clarification_missing_fields: list[str] = []
@@ -789,7 +794,23 @@ class KnowledgeFactsBranch:
         success_text = context.request.metadata.get(
             "operation_response", self.prompt_registry.message("knowledge_updated") if hasattr(self.prompt_registry, "message") else "Knowledge updated successfully."
         )
-        executable_actions = self._expand_semantic_knowledge_actions(executable_actions)
+        if len(executable_actions) != 1:
+            return self._generate_clarification(
+                context,
+                ["single_action"],
+                "Exactly one executable knowledge action is required.",
+            )
+        executable_authorized, executable_reason = action_payload_is_authorized(
+            context.request,
+            Intent.KNOWLEDGE_FACTS,
+            executable_actions,
+        )
+        if not executable_authorized:
+            return self._generate_clarification(
+                context,
+                ["action_keyword"],
+                executable_reason,
+            )
 
         if executable_actions and not context.request.metadata.get("confirmation_approved"):
             for action in executable_actions:
@@ -803,39 +824,18 @@ class KnowledgeFactsBranch:
                 )
                 if not conflict:
                     continue
-                replacement = replace(
-                    action,
-                    action=KnowledgeAction.MODIFY,
-                    target_chunk_ids=(conflict["chunk_id"],),
-                    observed_versions={conflict["chunk_id"]: conflict["version"]},
-                    replacement_text=new_text,
-                    new_text=new_text,
-                    target_description=conflict.get("summary") or conflict.get("normalized_text"),
-                    reason_summary="conflicting_fact_replace",
+                question = GeneratedQuestion(
+                    text=(
+                        "I found conflicting stored knowledge. Please explicitly ask me to "
+                        "modify or replace the existing fact if that is what you want."
+                    ),
+                    source=QuestionSource.CLARIFICATION_QUESTION,
+                    purpose="require_explicit_modify_action",
+                    confidence=1.0,
                 )
-                confirmation = repository.create_pending_confirmation(
-                    user_id=context.request.user_id,
-                    action_type="knowledge_conflict_replace",
-                    target_entity_type="knowledge_chunk",
-                    target_entity_id=conflict["chunk_id"],
-                    proposed_action={
-                        "domain": "knowledge",
-                        "actions": _json_safe([replacement]),
-                        "operation_response": "Updated the conflicting knowledge.",
-                        "topic_title": action.topic_title or context.request.metadata.get("topic_title", "Knowledge"),
-                    },
-                    target_snapshot={
-                        "chunk_id": conflict["chunk_id"],
-                        "version": conflict["version"],
-                        "old_text": conflict.get("normalized_text"),
-                        "new_text": new_text,
-                    },
-                    expires_at=_expires_at(self.config),
-                )
-                return _pending_confirmation_result(
-                    response_type=ResponseType.KNOWLEDGE_ACTION,
-                    text="I found an existing fact that appears to conflict. Please confirm whether I should replace the old fact.",
-                    confirmation=confirmation,
+                return BranchResult(
+                    response_type=ResponseType.CLARIFICATION,
+                    clarification_question=question,
                 )
 
         if (
@@ -863,6 +863,11 @@ class KnowledgeFactsBranch:
                 proposed_action={
                     "domain": "knowledge",
                     "actions": _json_safe(executable_actions),
+                    "action_authorization": _action_authorization(
+                        context,
+                        Intent.KNOWLEDGE_FACTS,
+                        getattr(getattr(first_action, "action", None), "value", ""),
+                    ),
                     "operation_response": success_text,
                     "topic_title": context.request.metadata.get("topic_title", "Knowledge"),
                 },
@@ -927,24 +932,31 @@ class ReminderBranch:
 
     def execute(self, context: PipelineContext, repository: AssistantRepository) -> BranchResult:
         actions = list(context.request.metadata.get("reminder_actions", []))
-        if not actions:
-            if self.action_detector:
-                detection = self.action_detector.detect(
-                    context.request, context.rewritten_query, Intent.REMINDER
-                )
-                if detection.requires_clarification:
-                    return self._generate_clarification(context, getattr(detection, "missing_fields", []), "Missing fields for reminder action.")
-                if detection.metadata:
-                    actions = detection.metadata.get("reminder_actions", [])
-                    context.request.metadata.update(detection.metadata)
+        detector = self.action_detector or DeterministicActionDetector()
+        detection = detector.detect(
+            context.request, context.rewritten_query, Intent.REMINDER
+        )
+        if detection.requires_clarification:
+            return self._generate_clarification(
+                context,
+                getattr(detection, "missing_fields", []),
+                "Missing fields for reminder action.",
+            )
+        if "reminder_actions" in detection.metadata:
+            actions = list(detection.metadata.get("reminder_actions") or [])
+            context.request.metadata.update(detection.metadata)
                     
         if not actions:
             return self._generate_clarification(context, [], "No valid reminder action detected.")
+        authorized, authorization_reason = action_payload_is_authorized(
+            context.request,
+            Intent.REMINDER,
+            actions,
+        )
+        if not authorized:
+            missing = ["single_action"] if "count" in authorization_reason or "ambiguous" in authorization_reason else ["action_keyword"]
+            return self._generate_clarification(context, missing, authorization_reason)
             
-        approved_conv_history: list[dict[str, Any]] = []
-        if context.approved_conversation_context:
-            approved_conv_history = context.approved_conversation_context.approved_conversation_history
-
         executable_actions = []
         pre_repo_results = []
         prevalidated_actions = [
@@ -961,6 +973,23 @@ class ReminderBranch:
                     context.request.raw_query, 
                     context.rewritten_query,
                     repository,
+                )
+            if len(validated_actions) != 1:
+                return self._generate_clarification(
+                    context,
+                    ["single_action"],
+                    "Exactly one reminder action is required.",
+                )
+            validated_authorized, validated_reason = action_payload_is_authorized(
+                context.request,
+                Intent.REMINDER,
+                validated_actions,
+            )
+            if not validated_authorized:
+                return self._generate_clarification(
+                    context,
+                    ["action_keyword"],
+                    validated_reason,
                 )
             clarification_needed = False
             clarification_missing_fields: list[str] = []
@@ -1030,6 +1059,23 @@ class ReminderBranch:
         success_text = context.request.metadata.get(
             "operation_response", self.prompt_registry.message("reminder_updated") if hasattr(self.prompt_registry, "message") else "Reminder updated successfully."
         )
+        if len(executable_actions) != 1:
+            return self._generate_clarification(
+                context,
+                ["single_action"],
+                "Exactly one executable reminder action is required.",
+            )
+        executable_authorized, executable_reason = action_payload_is_authorized(
+            context.request,
+            Intent.REMINDER,
+            executable_actions,
+        )
+        if not executable_authorized:
+            return self._generate_clarification(
+                context,
+                ["action_keyword"],
+                executable_reason,
+            )
         warnings: list[str] = []
         normalized_actions: list[ValidatedReminderAction] = []
         normalizer = ReminderTimeNormalizer(default_timezone=self.config.default_timezone)
@@ -1158,6 +1204,11 @@ class ReminderBranch:
                 proposed_action={
                     "domain": "reminder",
                     "actions": _json_safe(executable_actions),
+                    "action_authorization": _action_authorization(
+                        context,
+                        Intent.REMINDER,
+                        getattr(getattr(first_action, "action", None), "value", ""),
+                    ),
                     "operation_response": success_text,
                     "topic_title": context.request.metadata.get("topic_title", "Reminders"),
                 },

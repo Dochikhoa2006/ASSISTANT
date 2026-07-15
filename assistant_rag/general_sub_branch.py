@@ -44,11 +44,14 @@ class GeneralSubBranchDetector:
         reminder_qs = []
         extracted_types = []
         
-        if context.approved_conversation_context:
-            for idx, hop in enumerate(context.approved_conversation_context.approved_conversation_history):
+        if context.chat_history:
+            for idx, hop in enumerate(context.chat_history):
                 history_map[f"conversation_candidate_{idx}"] = {
                     "role": "conversation_hop",
-                    "text": hop.get("text"),
+                    "text": hop.get("text") or (
+                        f"User: {hop.get('raw_user_query', '')}\n"
+                        f"Assistant: {hop.get('raw_response', '')}"
+                    ).strip(),
                     "topic_id": hop.get("topic_id"),
                     "hop_id": hop.get("hop_id"),
                 }

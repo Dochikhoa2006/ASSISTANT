@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any, Literal
 from .bundler import ChatOutput, ResponseBundler
 from .classification import IntentClassifier, LastQAResolver, QueryRewriter
 from .config import AssistantConfig
@@ -11,8 +12,9 @@ from .contracts import (
     ChatRequest,
     PipelineContext,
     ApprovedConversationContext,
+    LastQAResolution,
+    RetrievalResult,
 )
-from .contracts import Intent
 from .last_qa import InMemoryLastQAStore
 from .platform import PlatformSelector
 from .prompts import DEFAULT_PROMPT_REGISTRY, PromptRegistry
@@ -22,8 +24,7 @@ from .database import AssistantRepository
 from .context_filter import TwoLayerContextFilter
 from .metrics import GLOBAL_METRICS
 from .observability import StageTimer, current_trace
-
-from .settings import PromptPolicySettings
+from .chat_history import canonical_chat_history_scope, select_chat_history
 
 @dataclass
 class AssistantPipeline:
@@ -104,6 +105,47 @@ class AssistantPipeline:
                     approved_conversation_count=0,
                 )
         
+        chat_history = select_chat_history(
+            conversation_retrieval=should_run_broad_retrieval,
+            approved_conversation_context=approved_conversation_context,
+            last_qa_state=resolution.state,
+        )
+        chat_history_source = (
+            "conversation_retrieval" if should_run_broad_retrieval else "last_qa"
+        )
+
+        # Classification is the first consumer. The same immutable request-scoped
+        # value remains active through branches, bundling, and platform selection.
+        with canonical_chat_history_scope(chat_history):
+            return self._handle_with_chat_history(
+                request=request,
+                repository=repository,
+                initially_rewritten_query=rewritten,
+                retrieval_query=retrieval_query,
+                intent_classifier_query=intent_classifier_query,
+                resolution=resolution,
+                conversation_results=conversation_results,
+                approved_conversation_context=approved_conversation_context,
+                conversation_retrieval=should_run_broad_retrieval,
+                chat_history=chat_history,
+                chat_history_source=chat_history_source,
+            )
+
+    def _handle_with_chat_history(
+        self,
+        *,
+        request: ChatRequest,
+        repository: AssistantRepository,
+        initially_rewritten_query: str,
+        retrieval_query: str,
+        intent_classifier_query: str,
+        resolution: LastQAResolution,
+        conversation_results: list[RetrievalResult],
+        approved_conversation_context: ApprovedConversationContext | None,
+        conversation_retrieval: bool,
+        chat_history: list[dict[str, Any]],
+        chat_history_source: Literal["conversation_retrieval", "last_qa"],
+    ) -> BundledResponse:
         with StageTimer("classification"):
             intent = self.classifier.classify(
                 request,
@@ -113,7 +155,7 @@ class AssistantPipeline:
             )
 
         last_qa_trace = {
-            "input_rewritten_query": rewritten,
+            "input_rewritten_query": initially_rewritten_query,
             "output_rewritten_query": resolution.rewritten_query,
             "did_merge_query": resolution.did_merge_query,
             "skip_broad_retrieval": resolution.skip_broad_retrieval,
@@ -124,8 +166,11 @@ class AssistantPipeline:
             "is_authoritative_state": resolution.is_authoritative_state,
             "merge_reason": resolution.merge_reason,
             "skip_reason": resolution.skip_reason,
-            "broad_retrieval_ran": should_run_broad_retrieval,
-            "query_sent_to_retrieval": retrieval_query if should_run_broad_retrieval else None,
+            "broad_retrieval_ran": conversation_retrieval,
+            "conversation_retrieval": conversation_retrieval,
+            "chat_history_source": chat_history_source,
+            "chat_history_count": len(chat_history),
+            "query_sent_to_retrieval": retrieval_query if conversation_retrieval else None,
             "query_sent_to_intent_classifier": intent_classifier_query,
             "approved_conversation_history_count": len(approved_conversation_context.approved_conversation_history) if approved_conversation_context else 0,
         }
@@ -136,6 +181,9 @@ class AssistantPipeline:
             last_qa_state=resolution.state,
             conversation_results=conversation_results,
             intent=intent,
+            chat_history=chat_history,
+            conversation_retrieval=conversation_retrieval,
+            chat_history_source=chat_history_source,
             last_qa_trace=last_qa_trace,
             approved_conversation_context=approved_conversation_context,
         )

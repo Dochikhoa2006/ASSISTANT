@@ -9,6 +9,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 import os
 
+from .content_keywords import (
+    DOCUMENT_FILE_KEYWORDS,
+    EXCEL_FILE_KEYWORDS,
+    FILE_CREATION_VERB_KEYWORDS,
+    POWERPOINT_FILE_KEYWORDS,
+)
 from .retrieval_policy import RETRIEVAL_PIPELINE_POLICY, RetrievalPipelinePolicy
 
 
@@ -530,30 +536,18 @@ class GeneralPurposeSettings:
     general_sub_branch_confidence_threshold: float = 0.65
     general_sub_branch_fallback_mode: str = "new_conversation_topic"
     general_sub_branch_detector_json_retry_count: int = 1
+    # Controls optional Microsoft file creation; answer_generation always runs.
     content_composer_enabled: bool = True
-    content_composer_max_iterations: int = 2
     content_composer_tool_timeout_seconds: float = 35.0
     content_composer_allowed_tools: tuple[str, ...] = (
         "answer_generation", "generate_excel", "generate_pdf", "generate_pptx",
     )
     content_composer_default_tool: str = "answer_generation"
     content_composer_fallback_tool: str = "answer_generation"
-    content_composer_react_enabled: bool = True
-    content_composer_short_circuit_single_tool: bool = True
-    content_composer_debug_trace_enabled: bool = False
-    excel_tool_signal_keywords: tuple[str, ...] = (
-        "excel", "spreadsheet", "workbook", "xlsx", "data table",
-        "tracker", "kpi dashboard", "financial model", "data grid",
-        "rows and columns",
-    )
-    pdf_tool_signal_keywords: tuple[str, ...] = (
-        "pdf", "report", "formal document", "business report", "proposal",
-        "memo", "white paper", "executive summary", "structured document",
-    )
-    pptx_tool_signal_keywords: tuple[str, ...] = (
-        "powerpoint", "pptx", "presentation", "slide deck", "slides",
-        "pitch deck", "slideshow", "deck", "make slides",
-    )
+    file_creation_verb_keywords: tuple[str, ...] = FILE_CREATION_VERB_KEYWORDS
+    document_tool_signal_keywords: tuple[str, ...] = DOCUMENT_FILE_KEYWORDS
+    excel_tool_signal_keywords: tuple[str, ...] = EXCEL_FILE_KEYWORDS
+    pptx_tool_signal_keywords: tuple[str, ...] = POWERPOINT_FILE_KEYWORDS
     hitl_supporting_question_enabled: bool = True
     hitl_supporting_question_confidence_threshold: float = 0.72
     hitl_supporting_question_recent_question_window: int = 2
@@ -1146,15 +1140,16 @@ class ProductionSettings:
                 general_sub_branch_fallback_mode=os.getenv("GENERAL_SUB_BRANCH_FALLBACK_MODE", GeneralPurposeSettings.general_sub_branch_fallback_mode),
                 general_sub_branch_detector_json_retry_count=_get_int("GENERAL_SUB_BRANCH_DETECTOR_JSON_RETRY_COUNT", GeneralPurposeSettings.general_sub_branch_detector_json_retry_count),
                 content_composer_enabled=_get_bool("CONTENT_COMPOSER_ENABLED", GeneralPurposeSettings.content_composer_enabled),
-                content_composer_max_iterations=_get_int("CONTENT_COMPOSER_MAX_ITERATIONS", GeneralPurposeSettings.content_composer_max_iterations),
                 content_composer_tool_timeout_seconds=_get_float("CONTENT_COMPOSER_TOOL_TIMEOUT_SECONDS", GeneralPurposeSettings.content_composer_tool_timeout_seconds),
                 content_composer_allowed_tools=_get_tuple("CONTENT_COMPOSER_ALLOWED_TOOLS", GeneralPurposeSettings.content_composer_allowed_tools),
                 content_composer_default_tool=os.getenv("CONTENT_COMPOSER_DEFAULT_TOOL", GeneralPurposeSettings.content_composer_default_tool),
                 content_composer_fallback_tool=os.getenv("CONTENT_COMPOSER_FALLBACK_TOOL", GeneralPurposeSettings.content_composer_fallback_tool),
-                content_composer_react_enabled=_get_bool("CONTENT_COMPOSER_REACT_ENABLED", GeneralPurposeSettings.content_composer_react_enabled),
-                content_composer_debug_trace_enabled=_get_bool("CONTENT_COMPOSER_DEBUG_TRACE_ENABLED", GeneralPurposeSettings.content_composer_debug_trace_enabled),
+                file_creation_verb_keywords=_get_tuple("CONTENT_COMPOSER_VERB_KEYWORDS", GeneralPurposeSettings.file_creation_verb_keywords),
+                document_tool_signal_keywords=_get_tuple(
+                    "CONTENT_COMPOSER_DOCUMENT_KEYWORDS",
+                    _get_tuple("CONTENT_COMPOSER_PDF_KEYWORDS", GeneralPurposeSettings.document_tool_signal_keywords),
+                ),
                 excel_tool_signal_keywords=_get_tuple("CONTENT_COMPOSER_EXCEL_KEYWORDS", GeneralPurposeSettings.excel_tool_signal_keywords),
-                pdf_tool_signal_keywords=_get_tuple("CONTENT_COMPOSER_PDF_KEYWORDS", GeneralPurposeSettings.pdf_tool_signal_keywords),
                 pptx_tool_signal_keywords=_get_tuple("CONTENT_COMPOSER_PPTX_KEYWORDS", GeneralPurposeSettings.pptx_tool_signal_keywords),
                 hitl_supporting_question_enabled=_get_bool("HITL_SUPPORTING_QUESTION_ENABLED", GeneralPurposeSettings.hitl_supporting_question_enabled),
                 hitl_supporting_question_confidence_threshold=_get_float("HITL_SUPPORTING_QUESTION_CONFIDENCE_THRESHOLD", GeneralPurposeSettings.hitl_supporting_question_confidence_threshold),

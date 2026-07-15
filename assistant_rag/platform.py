@@ -16,6 +16,7 @@ from urllib import request as urlrequest
 
 from .contracts import BundledResponse, ChatRequest
 from .llm import LLMClient, LLMTask
+from .chat_history import CHAT_HISTORY_PROMPT_RULE, inject_chat_history
 
 
 logger = logging.getLogger(__name__)
@@ -522,13 +523,15 @@ class PlatformSelector:
                     "to prepare or send the bundled answer to a recipient through that channel. "
                     "Choose none for ordinary questions, explanations, drafts without a delivery channel, "
                     "or questions about how a platform works. Never choose a channel only because the "
-                    "answer mentions it."
+                    f"answer mentions it.\n\n{CHAT_HISTORY_PROMPT_RULE}"
                 ),
-                user_prompt=json.dumps({
-                    "user_query": request.raw_query,
-                    "bundled_response": response.final_chat_text,
-                    "available_platforms": list(_CHANNELS),
-                }),
+                user_prompt=json.dumps(
+                    inject_chat_history({
+                        "user_query": request.raw_query,
+                        "bundled_response": response.final_chat_text,
+                        "available_platforms": list(_CHANNELS),
+                    })
+                ),
                 schema=schema,
             )
             candidate = _clean(plan.get("channel")).casefold()
@@ -557,9 +560,21 @@ class PlatformSelector:
                         f"You extract a {channel} message only from explicit user-provided facts. "
                         "Do not invent recipients, subject, body, or attachments. Return every explicitly "
                         "requested recipient in recipients. Mode is send only for an explicit request to "
-                        "send now; otherwise draft."
+                        f"send now; otherwise draft.\n\n{CHAT_HISTORY_PROMPT_RULE}"
                     ),
-                    user_prompt=json.dumps({"user_query": text, "bundled_response": response.final_chat_text, "available_artifacts": [{"artifact_id": a.get("artifact_id"), "filename": a.get("filename")} for a in _public_artifacts(base)]}),
+                    user_prompt=json.dumps(
+                        inject_chat_history({
+                            "user_query": text,
+                            "bundled_response": response.final_chat_text,
+                            "available_artifacts": [
+                                {
+                                    "artifact_id": artifact.get("artifact_id"),
+                                    "filename": artifact.get("filename"),
+                                }
+                                for artifact in _public_artifacts(base)
+                            ],
+                        })
+                    ),
                     schema=schema,
                 )
             except Exception:

@@ -712,6 +712,9 @@ class PipelineContext:
     last_qa_state: LastQAState | None
     conversation_results: list[RetrievalResult]
     intent: Intent
+    chat_history: list[dict[str, Any]] = field(default_factory=list)
+    conversation_retrieval: bool = False
+    chat_history_source: Literal["conversation_retrieval", "last_qa"] = "last_qa"
     last_qa_trace: dict[str, Any] = field(default_factory=dict)
     approved_conversation_context: ApprovedConversationContext | None = None
 

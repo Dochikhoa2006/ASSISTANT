@@ -190,6 +190,7 @@ def build_api_app(
             elif domain == "knowledge":
                 metadata["validated_knowledge_actions"] = proposed.get("actions", [])
                 metadata["knowledge_actions"] = proposed.get("actions", [])
+            metadata["action_authorization"] = proposed.get("action_authorization", {})
             metadata["operation_response"] = proposed.get("operation_response", metadata.get("operation_response"))
             metadata["topic_title"] = proposed.get("topic_title", metadata.get("topic_title"))
             metadata["confirmation_approved"] = True

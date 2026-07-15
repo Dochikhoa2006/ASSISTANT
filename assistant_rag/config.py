@@ -9,6 +9,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping
 
+from .content_keywords import (
+    DOCUMENT_FILE_KEYWORDS,
+    EXCEL_FILE_KEYWORDS,
+    FILE_CREATION_VERB_KEYWORDS,
+    POWERPOINT_FILE_KEYWORDS,
+)
 from .contracts import Intent, ResponseType
 from .settings import KnowledgeChunkSettings, MutationPartialExecutionPolicy, TargetNotFoundPolicy, UnsupportedActionPolicy
 from .retrieval_policy import RETRIEVAL_PIPELINE_POLICY, RetrievalPipelinePolicy
@@ -213,8 +219,9 @@ class GeneralPurposeConfig:
     general_sub_branch_detector_json_retry_count: int = 1
 
     # Content composer
+    # Controls the optional Microsoft file stage. The answer_generation stage is
+    # unconditional for every general-purpose response.
     content_composer_enabled: bool = True
-    content_composer_max_iterations: int = 2
     content_composer_tool_timeout_seconds: float = 35.0
     content_composer_allowed_tools: tuple[str, ...] = (
         "answer_generation",
@@ -224,24 +231,13 @@ class GeneralPurposeConfig:
     )
     content_composer_default_tool: str = "answer_generation"
     content_composer_fallback_tool: str = "answer_generation"
-    content_composer_react_enabled: bool = True
-    content_composer_short_circuit_single_tool: bool = True
-    content_composer_debug_trace_enabled: bool = False
 
-    # config-driven keyword signals
-    excel_tool_signal_keywords: tuple[str, ...] = (
-        "excel", "spreadsheet", "workbook", "xlsx", "data table",
-        "tracker", "kpi dashboard", "financial model", "data grid",
-        "rows and columns",
-    )
-    pdf_tool_signal_keywords: tuple[str, ...] = (
-        "pdf", "report", "formal document", "business report", "proposal",
-        "memo", "white paper", "executive summary", "structured document",
-    )
-    pptx_tool_signal_keywords: tuple[str, ...] = (
-        "powerpoint", "pptx", "presentation", "slide deck", "slides",
-        "pitch deck", "slideshow", "deck", "make slides",
-    )
+    # Deterministic file-intent signals. A file tool requires at least one raw-query
+    # match from the verb list and exactly one matching file-type group.
+    file_creation_verb_keywords: tuple[str, ...] = FILE_CREATION_VERB_KEYWORDS
+    document_tool_signal_keywords: tuple[str, ...] = DOCUMENT_FILE_KEYWORDS
+    excel_tool_signal_keywords: tuple[str, ...] = EXCEL_FILE_KEYWORDS
+    pptx_tool_signal_keywords: tuple[str, ...] = POWERPOINT_FILE_KEYWORDS
 
     # HITL
     hitl_supporting_question_enabled: bool = True
@@ -262,8 +258,6 @@ class GeneralPurposeConfig:
     def __post_init__(self) -> None:
         if not (0.0 <= self.general_sub_branch_confidence_threshold <= 1.0):
             raise ValueError("general_sub_branch_confidence_threshold must be in [0.0, 1.0]")
-        if self.content_composer_max_iterations < 1:
-            raise ValueError("content_composer_max_iterations must be >= 1")
         if self.content_composer_tool_timeout_seconds <= 0:
             raise ValueError("content_composer_tool_timeout_seconds must be > 0")
         if self.content_composer_default_tool not in self.content_composer_allowed_tools:

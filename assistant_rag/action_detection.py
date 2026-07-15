@@ -1,15 +1,43 @@
-"""Schema-validated action detection before branch execution."""
+"""Deterministic action authorization before knowledge/reminder execution."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from functools import lru_cache
+import re
+import unicodedata
 from typing import Any, Protocol
 
+from .action_keywords import (
+    ADD_ACTION_KEYWORDS,
+    DELETE_ACTION_KEYWORDS,
+    MODIFY_ACTION_KEYWORDS,
+    TURN_OFF_ACTION_KEYWORDS,
+    TURN_ON_ACTION_KEYWORDS,
+)
 from .contracts import ChatRequest, Intent
-from .llm import LLMClient, LLMTask, validate_json_schema
-from .prompts import DEFAULT_PROMPT_REGISTRY, PromptContext, PromptRegistry
-from .settings import PromptPolicySettings
+
+
+_ACTION_METADATA_KEYS = {
+    Intent.KNOWLEDGE_FACTS: "knowledge_actions",
+    Intent.REMINDER: "reminder_actions",
+}
+
+
+@dataclass(frozen=True)
+class ActionKeywordMatch:
+    action: str
+    keyword: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class ActionKeywordDecision:
+    selected_action: str | None
+    matched_actions: tuple[str, ...]
+    matched_keywords: tuple[str, ...]
+    reason_summary: str
 
 
 @dataclass(frozen=True)
@@ -35,297 +63,265 @@ class NoOpActionDetector:
         return ActionDetectionResult(intent=intent, confidence=1.0, metadata={})
 
 
+def _normalize(text: str) -> str:
+    return unicodedata.normalize("NFKC", text).casefold()
+
+
+@lru_cache(maxsize=512)
+def _keyword_pattern(keyword: str) -> re.Pattern[str]:
+    normalized = " ".join(_normalize(keyword).split())
+    if not normalized:
+        return re.compile(r"(?!x)x")
+    body = re.escape(normalized).replace(r"\ ", r"\s+")
+    prefix = r"(?<![\w-])" if normalized[0].isalnum() or normalized[0] == "_" else ""
+    suffix = r"(?![\w-])" if normalized[-1].isalnum() or normalized[-1] == "_" else ""
+    return re.compile(f"{prefix}{body}{suffix}")
+
+
+def _action_groups(intent: Intent) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    common = (
+        ("delete", DELETE_ACTION_KEYWORDS),
+        ("modify", MODIFY_ACTION_KEYWORDS),
+        ("add", ADD_ACTION_KEYWORDS),
+    )
+    if intent is Intent.REMINDER:
+        return common + (
+            ("turn_on", TURN_ON_ACTION_KEYWORDS),
+            ("turn_off", TURN_OFF_ACTION_KEYWORDS),
+        )
+    return common if intent is Intent.KNOWLEDGE_FACTS else ()
+
+
+def _effective_action_matches(raw_user_query: str, intent: Intent) -> tuple[ActionKeywordMatch, ...]:
+    text = _normalize(raw_user_query)
+    matches = [
+        ActionKeywordMatch(action=action, keyword=keyword, start=match.start(), end=match.end())
+        for action, keywords in _action_groups(intent)
+        for keyword in keywords
+        for match in _keyword_pattern(keyword).finditer(text)
+    ]
+    # A longer explicit phrase owns a contained cross-category keyword. This makes
+    # "cancel and delete" a delete and "set to inactive" a turn-off, while separate
+    # action phrases still remain ambiguous and fail closed.
+    effective = [
+        candidate
+        for candidate in matches
+        if not any(
+            other.action != candidate.action
+            and other.start <= candidate.start
+            and other.end >= candidate.end
+            and (other.end - other.start) > (candidate.end - candidate.start)
+            for other in matches
+        )
+    ]
+    return tuple(effective)
+
+
+def classify_action_request(raw_user_query: str, intent: Intent) -> ActionKeywordDecision:
+    """Classify only explicit action words from the raw query."""
+
+    matches = _effective_action_matches(raw_user_query, intent)
+    matched_actions = tuple(
+        action for action, _keywords in _action_groups(intent) if any(item.action == action for item in matches)
+    )
+    matched_keywords = tuple(
+        dict.fromkeys(
+            item.keyword for item in sorted(matches, key=lambda item: (item.start, item.end, item.keyword))
+        )
+    )
+    if not matched_actions:
+        return ActionKeywordDecision(
+            selected_action=None,
+            matched_actions=(),
+            matched_keywords=(),
+            reason_summary="missing_action_keyword",
+        )
+    if len(matched_actions) != 1:
+        return ActionKeywordDecision(
+            selected_action=None,
+            matched_actions=matched_actions,
+            matched_keywords=matched_keywords,
+            reason_summary="ambiguous_action_keywords",
+        )
+    return ActionKeywordDecision(
+        selected_action=matched_actions[0],
+        matched_actions=matched_actions,
+        matched_keywords=matched_keywords,
+        reason_summary=f"selected_{matched_actions[0]}_action",
+    )
+
+
+def _clean_remainder(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", text).strip(" \t\r\n,.:;!?-")
+    cleaned = re.sub(
+        r"^(?:(?:please|kindly)\s+|(?:can|could|would|will)\s+you\s+|i\s+(?:want|need)\s+you\s+to\s+)+",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    return cleaned.strip(" \t\r\n,.:;!?-")
+
+
+def _request_remainder(raw_user_query: str, intent: Intent, action: str) -> str:
+    candidates = [item for item in _effective_action_matches(raw_user_query, intent) if item.action == action]
+    if not candidates:
+        return ""
+    chosen = min(candidates, key=lambda item: (-(item.end - item.start), item.start))
+    return _clean_remainder(f"{raw_user_query[:chosen.start]} {raw_user_query[chosen.end:]}")
+
+
+def _split_replacement(text: str) -> tuple[str, str | None]:
+    parts = re.split(r"\s+(?:with|to)\s+", text, maxsplit=1, flags=re.I)
+    if len(parts) != 2:
+        return text, None
+    target, replacement = (_clean_remainder(value) for value in parts)
+    return target, replacement or None
+
+
+def _build_action_payload(raw_user_query: str, intent: Intent, action: str) -> dict[str, Any]:
+    remainder = _request_remainder(raw_user_query, intent, action)
+    payload: dict[str, Any] = {"action": action, "confidence": 1.0}
+    if intent is Intent.KNOWLEDGE_FACTS:
+        if action == "add":
+            payload["text"] = remainder
+        elif action == "modify":
+            target, replacement = _split_replacement(remainder)
+            payload["target_description"] = target
+            if replacement:
+                payload["replacement_text"] = replacement
+        else:
+            payload["target_description"] = remainder
+        return payload
+
+    if action == "add":
+        payload.update({"subject": remainder, "raw_reminder": raw_user_query})
+    elif action == "modify":
+        target, replacement = _split_replacement(remainder)
+        payload["target_description"] = target
+        if replacement:
+            payload["new_subject"] = replacement
+    else:
+        payload["target_description"] = remainder
+    return payload
+
+
+def action_payload_is_authorized(
+    request: ChatRequest,
+    intent: Intent,
+    actions: list[Any],
+) -> tuple[bool, str]:
+    """Validate branch payload cardinality and its raw-query authorization."""
+
+    if len(actions) != 1:
+        return False, "action_count_must_equal_one"
+    action = actions[0]
+    action_name = (
+        str(action.get("action") or "")
+        if isinstance(action, dict)
+        else str(getattr(getattr(action, "action", None), "value", getattr(action, "action", "")) or "")
+    ).casefold()
+    supported = {name for name, _keywords in _action_groups(intent)}
+    if action_name not in supported:
+        return False, "unsupported_branch_action"
+
+    # A confirmation token is verified and its prevalidated action loaded by the API
+    # before branch execution. It authorizes replay of exactly that one stored action.
+    if (
+        request.confirmation_token
+        and request.metadata.get("confirmation_approved")
+        and request.metadata.get("validated_knowledge_actions" if intent is Intent.KNOWLEDGE_FACTS else "validated_reminder_actions")
+    ):
+        authorization = request.metadata.get("action_authorization") or {}
+        if (
+            authorization.get("intent") == intent.value
+            and str(authorization.get("action") or "").casefold() == action_name
+        ):
+            return True, "authorized_confirmed_action"
+        return False, "confirmed_action_authorization_mismatch"
+
+    decision = classify_action_request(request.raw_query, intent)
+    if decision.selected_action != action_name:
+        return False, decision.reason_summary
+    return True, decision.reason_summary
+
+
 @dataclass
-class LLMActionDetector:
-    llm: LLMClient
-    prompt_registry: PromptRegistry = field(default_factory=lambda: DEFAULT_PROMPT_REGISTRY)
-    min_confidence: float = PromptPolicySettings.action_min_confidence
-    risky_action_validation_enabled: bool = field(
-        default_factory=lambda: PromptPolicySettings.risky_action_validation_enabled
-    )
-    risky_action_operations: tuple[str, ...] = field(
-        default_factory=lambda: PromptPolicySettings.risky_action_operations
-    )
-    risky_action_confidence_threshold: float = field(
-        default_factory=lambda: PromptPolicySettings.risky_action_confidence_threshold
-    )
+class DeterministicActionDetector:
+    """Authorize one branch action without invoking a model."""
+
     def detect(self, request: ChatRequest, rewritten_query: str, intent: Intent) -> ActionDetectionResult:
-        if request.metadata.get("knowledge_actions") or request.metadata.get("reminder_actions"):
-            return ActionDetectionResult(intent=intent, confidence=1.0, metadata={})
-        if intent not in {Intent.KNOWLEDGE_FACTS, Intent.REMINDER}:
+        if intent not in _ACTION_METADATA_KEYS:
             return ActionDetectionResult(intent=intent, confidence=1.0, metadata={})
 
-        schema = self._schema(intent)
-        try:
-            payload = self.llm.generate_json(
-                task=LLMTask.ACTION_EXTRACTION,
-                system_prompt=self.prompt_registry.system("action_detection"),
-                user_prompt=self.prompt_registry.user(
-                    PromptContext(
-                        stage="action_detection",
-                        user_id=request.user_id,
-                        raw_query=request.raw_query,
-                        rewritten_query=rewritten_query,
-                        intent=intent.value,
-                        metadata=request.metadata,
-                        platform_context=request.platform_context,
-                        extra={"current_time_utc": datetime.now(timezone.utc).isoformat()},
-                    )
-                ),
-                schema=schema,
+        action_key = _ACTION_METADATA_KEYS[intent]
+        supplied_actions = list(request.metadata.get(action_key) or [])
+        confirmed, confirmation_reason = action_payload_is_authorized(request, intent, supplied_actions)
+        if confirmed and confirmation_reason == "authorized_confirmed_action":
+            return ActionDetectionResult(
+                intent=intent,
+                confidence=1.0,
+                metadata={action_key: supplied_actions},
             )
-            validate_json_schema(payload, schema)
-        except Exception:
+
+        decision = classify_action_request(request.raw_query, intent)
+        if decision.selected_action is None:
+            if intent is Intent.KNOWLEDGE_FACTS and not supplied_actions and not decision.matched_actions:
+                return ActionDetectionResult(
+                    intent=intent,
+                    confidence=1.0,
+                    metadata={"knowledge_lookup": True},
+                )
+            missing = "single_action" if decision.matched_actions else "action_keyword"
             return ActionDetectionResult(
                 intent=intent,
                 confidence=0.0,
                 metadata={},
-                missing_fields=["llm_action_detection_unavailable"],
-                risk_flags=["safe_fallback_to_clarification"],
+                missing_fields=[missing],
+                risk_flags=[decision.reason_summary],
             )
-        result = self._parse_payload(payload, selected_intent=intent)
-        if self._needs_knowledge_recovery(result):
-            recovered = self._recover_knowledge_action(request, rewritten_query)
-            if recovered is not None:
-                result = recovered
-        
-        if self.risky_action_validation_enabled and result.metadata:
-            result = self._validate_risky_actions(request, rewritten_query, result)
-            
-        return result
 
-    def _parse_payload(self, payload: dict[str, Any], *, selected_intent: Intent) -> ActionDetectionResult:
-        # Action extraction is downstream of intent routing. The extractor may
-        # describe fields for that branch, but it must never reroute the request.
-        intent = selected_intent
-        confidence = float(payload.get("confidence", 0.0))
-        metadata = {}
-        if intent is Intent.KNOWLEDGE_FACTS:
-            metadata["knowledge_actions"] = list(payload.get("knowledge_actions") or [])
-        if intent is Intent.REMINDER:
-            metadata["reminder_actions"] = list(payload.get("reminder_actions") or [])
-        missing_fields = [str(item) for item in payload.get("missing_fields") or []]
-        risk_flags = [str(item) for item in payload.get("risk_flags") or []]
-        if confidence < self.min_confidence:
-            missing_fields = missing_fields or ["low_confidence_action_detection"]
+        if len(supplied_actions) > 1:
+            return ActionDetectionResult(
+                intent=intent,
+                confidence=0.0,
+                metadata={},
+                missing_fields=["single_action"],
+                risk_flags=["multiple_action_payloads_rejected"],
+            )
+        if supplied_actions:
+            if not isinstance(supplied_actions[0], dict):
+                return ActionDetectionResult(
+                    intent=intent,
+                    confidence=0.0,
+                    metadata={},
+                    missing_fields=["single_action"],
+                    risk_flags=["invalid_action_payload_rejected"],
+                )
+            supplied_name = str(supplied_actions[0].get("action") or "").casefold()
+            if supplied_name != decision.selected_action:
+                return ActionDetectionResult(
+                    intent=intent,
+                    confidence=0.0,
+                    metadata={},
+                    missing_fields=["action_keyword"],
+                    risk_flags=["action_payload_keyword_mismatch"],
+                )
+            action_payload = dict(supplied_actions[0])
+        else:
+            action_payload = _build_action_payload(request.raw_query, intent, decision.selected_action)
+
+        action_payload["action"] = decision.selected_action
+        action_payload.setdefault("confidence", 1.0)
         return ActionDetectionResult(
             intent=intent,
-            confidence=confidence,
-            metadata=metadata,
-            missing_fields=missing_fields,
-            risk_flags=risk_flags,
-        )
-
-    @staticmethod
-    def _needs_knowledge_recovery(result: ActionDetectionResult) -> bool:
-        return bool(
-            result.intent is Intent.KNOWLEDGE_FACTS
-            and not result.metadata.get("knowledge_actions")
-        )
-
-    def _recover_knowledge_action(
-        self, request: ChatRequest, rewritten_query: str
-    ) -> ActionDetectionResult | None:
-        operation_schema = {
-            "type": "object",
-            "properties": {
-                "operation": {"type": "string", "enum": ["add", "modify", "delete", "lookup"]},
-            },
-            "required": ["operation"],
-        }
-        try:
-            operation_payload = self.llm.generate_json(
-                task=LLMTask.ACTION_EXTRACTION,
-                system_prompt=self.prompt_registry.system("knowledge_operation_recovery"),
-                user_prompt=self.prompt_registry.user(
-                    PromptContext(
-                        stage="action_detection",
-                        user_id=request.user_id,
-                        raw_query=request.raw_query,
-                        rewritten_query=rewritten_query,
-                        intent=Intent.KNOWLEDGE_FACTS.value,
-                        metadata=request.metadata,
-                        platform_context=request.platform_context,
-                        extra={"recovery_reason": "initial knowledge extraction returned no executable action"},
-                    )
-                ),
-                schema=operation_schema,
-            )
-            validate_json_schema(operation_payload, operation_schema)
-        except Exception:
-            return None
-
-        operation = operation_payload.get("operation")
-        if operation == "lookup":
-            return ActionDetectionResult(
-                intent=Intent.KNOWLEDGE_FACTS,
-                confidence=1.0,
-                metadata={"knowledge_lookup": True},
-            )
-        if operation != "add":
-            return None
-
-        content_schema = {
-            "type": "object",
-            "properties": {"text": {"type": "string"}},
-            "required": ["text"],
-        }
-        try:
-            content_payload = self.llm.generate_json(
-                task=LLMTask.ACTION_EXTRACTION,
-                system_prompt=self.prompt_registry.system("knowledge_add_content_recovery"),
-                user_prompt=self.prompt_registry.user(
-                    PromptContext(
-                        stage="action_detection",
-                        user_id=request.user_id,
-                        raw_query=request.raw_query,
-                        rewritten_query=rewritten_query,
-                        intent=Intent.KNOWLEDGE_FACTS.value,
-                        metadata=request.metadata,
-                        platform_context=request.platform_context,
-                    )
-                ),
-                schema=content_schema,
-            )
-            validate_json_schema(content_payload, content_schema)
-        except Exception:
-            return None
-        text = str(content_payload.get("text") or "").strip()
-        if not text:
-            return None
-        return ActionDetectionResult(
-            intent=Intent.KNOWLEDGE_FACTS,
             confidence=1.0,
-            metadata={"knowledge_actions": [{"action": "add", "text": text}]},
+            metadata={
+                action_key: [action_payload],
+                "action_authorization": {
+                    "intent": intent.value,
+                    "action": decision.selected_action,
+                    "matched_keywords": list(decision.matched_keywords),
+                    "reason_summary": decision.reason_summary,
+                },
+            },
         )
-
-    def _validate_risky_actions(self, request: ChatRequest, rewritten_query: str, result: ActionDetectionResult) -> ActionDetectionResult:
-        risky_actions = []
-        for i, action in enumerate(result.metadata.get("knowledge_actions", [])):
-            if action.get("action") in self.risky_action_operations:
-                risky_actions.append({"type": "knowledge", "index": i, "action": action})
-        for i, action in enumerate(result.metadata.get("reminder_actions", [])):
-            if action.get("action") in self.risky_action_operations:
-                risky_actions.append({"type": "reminder", "index": i, "action": action})
-                
-        if not risky_actions:
-            return result
-            
-        schema = self._risky_schema()
-        try:
-            payload = self.llm.generate_json(
-                task=LLMTask.RISKY_ACTION,
-                system_prompt=self.prompt_registry.system("risky_action_validation"),
-                user_prompt=self.prompt_registry.user(
-                    PromptContext(
-                        stage="risky_action_validation",
-                        user_id=request.user_id,
-                        raw_query=request.raw_query,
-                        rewritten_query=rewritten_query,
-                        intent=result.intent.value,
-                        metadata={"risky_actions": [ra["action"] for ra in risky_actions]},
-                        platform_context=request.platform_context,
-                    )
-                ),
-                schema=schema,
-            )
-            validate_json_schema(payload, schema)
-        except Exception:
-            result.missing_fields.append("risky_action_validation_failed")
-            return result
-            
-        validation_results = payload.get("results", [])
-        
-        if len(validation_results) != len(risky_actions):
-            result.missing_fields.append("risky_validation_count_mismatch")
-            return result
-            
-        for ra, val_res in zip(risky_actions, validation_results):
-            action = ra["action"]
-            
-            action["risk_approved"] = val_res.get("approved", False)
-            action["risk_level"] = val_res.get("risk_level", "high")
-            
-            if val_res.get("requires_clarification") or val_res.get("confidence", 0.0) < self.risky_action_confidence_threshold:
-                result.missing_fields.append("risky_action_requires_clarification")
-            
-        return result
-
-    def _risky_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "results": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "action_index": {"type": "integer"},
-                            "approved": {"type": "boolean"},
-                            "risk_level": {"type": "string"},
-                            "missing_fields": {"type": "array", "items": {"type": "string"}},
-                            "requires_clarification": {"type": "boolean"},
-                            "confidence": {"type": "number"}
-                        },
-                        "required": ["action_index", "approved", "risk_level", "missing_fields", "requires_clarification", "confidence"]
-                    }
-                }
-            },
-            "required": ["results"]
-        }
-
-    def _schema(self, selected_intent: Intent) -> dict[str, Any]:
-        action_key = "knowledge_actions" if selected_intent is Intent.KNOWLEDGE_FACTS else "reminder_actions"
-        action_schema = self._knowledge_action_schema() if selected_intent is Intent.KNOWLEDGE_FACTS else self._reminder_action_schema()
-        return {
-            "type": "object",
-            "properties": {
-                "confidence": {"type": "number"},
-                action_key: {"type": "array", "items": action_schema},
-                "missing_fields": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-                "risk_flags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-            },
-            "required": [
-                "confidence",
-                action_key,
-                "missing_fields",
-                "risk_flags",
-            ],
-        }
-
-    @staticmethod
-    def _knowledge_action_schema() -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["add", "delete", "modify"]},
-                "text": {"type": "string"},
-                "target_description": {"type": "string"},
-                "replacement_text": {"type": "string"},
-            },
-            "required": ["action"],
-        }
-
-    @staticmethod
-    def _reminder_action_schema() -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["add", "delete", "modify", "turn_on", "turn_off"]},
-                "subject": {"type": "string"},
-                "event_time": {"type": "string"},
-                "notification_time": {"type": "string"},
-                "time_semantics": {"type": "string", "enum": ["event_time", "notification_time", "unspecified"]},
-                "reminder_time": {"type": "string"},
-                "target_description": {"type": "string"},
-                "new_reminder_time": {"type": "string"},
-                "new_subject": {"type": "string"},
-            },
-            "required": ["action"],
-        }

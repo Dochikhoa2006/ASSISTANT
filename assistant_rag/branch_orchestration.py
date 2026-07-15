@@ -317,6 +317,8 @@ class ValidatedActionBuilder:
         self.reminder_resolver = reminder_resolver
 
     def build_knowledge_actions(self, user_id: str, actions: list[dict[str, Any]], user_query: str, rewritten_query: str, repository: AssistantRepository) -> list[ValidatedKnowledgeAction]:
+        if len(actions) != 1:
+            return []
         validated = []
         for action_dict in actions:
             action_type_str = action_dict.get("action", "").lower()
@@ -374,6 +376,8 @@ class ValidatedActionBuilder:
         return validated
 
     def build_reminder_actions(self, user_id: str, actions: list[dict[str, Any]], user_query: str, rewritten_query: str, repository: AssistantRepository) -> list[ValidatedReminderAction]:
+        if len(actions) != 1:
+            return []
         validated = []
         for action_dict in actions:
             action_type_str = action_dict.get("action", "").lower()

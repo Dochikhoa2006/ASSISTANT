@@ -19,6 +19,7 @@ from .contracts import (
 )
 from .llm import LLMClient, LLMTask
 from .prompts import PromptRegistry
+from .chat_history import inject_chat_history
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,10 @@ class KnowledgeRetrievalValidationStrategy:
         }
 
         system_prompt = self.prompts.system("knowledge_retrieval_validation")
-        user_prompt = "Runtime context:\n" + json.dumps(prompt_input, indent=2)
+        user_prompt = "Runtime context:\n" + json.dumps(
+            inject_chat_history(prompt_input),
+            indent=2,
+        )
 
         try:
             raw_response = self.llm.generate_json(
@@ -236,7 +240,11 @@ class ReminderRetrievalValidationStrategy:
         }
 
         system_prompt = self.prompts.system("reminder_retrieval_validation")
-        user_prompt = "Runtime context:\n" + json.dumps(prompt_input, indent=2, default=str)
+        user_prompt = "Runtime context:\n" + json.dumps(
+            inject_chat_history(prompt_input),
+            indent=2,
+            default=str,
+        )
 
         try:
             raw_response = self.llm.generate_json(

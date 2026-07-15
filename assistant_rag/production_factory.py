@@ -30,7 +30,7 @@ from .platform import PlatformSelector
 from .prompts import DEFAULT_PROMPT_REGISTRY
 from .retrieval import HybridRetriever
 from .reranking import SentenceTransformerCrossEncoderReranker
-from .action_detection import LLMActionDetector
+from .action_detection import DeterministicActionDetector
 from .context_filter import HardRuleContextFilter, TwoLayerContextFilter
 from .generation import LLMClarificationStrategy, LLMHumanInTheLoopStrategy, LLMReminderSupportingStrategy, LLMGeneralHITLStrategy
 from .retrieval_validation import KnowledgeRetrievalValidationStrategy, ReminderRetrievalValidationStrategy
@@ -42,7 +42,7 @@ from .content_composer import (
     GeneratePDFTool,
     GeneratePPTXTool,
     ContentToolRegistry,
-    ReActContentComposer,
+    DeterministicContentComposer,
 )
 from .autoscan import ReminderAutoscan
 from .reminder_timing import ReminderTimingPlanner
@@ -234,14 +234,7 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
         bm25_top_k=assistant_config.retrieval.bm25_top_k,
         chroma_top_k=assistant_config.retrieval.chroma_top_k,
     )
-    action_detector = LLMActionDetector(
-        llm,
-        prompt_registry,
-        min_confidence=settings.prompt_policy.action_min_confidence,
-        risky_action_validation_enabled=settings.prompt_policy.risky_action_validation_enabled,
-        risky_action_operations=settings.prompt_policy.risky_action_operations,
-        risky_action_confidence_threshold=settings.prompt_policy.risky_action_confidence_threshold,
-    )
+    action_detector = DeterministicActionDetector()
     
     hard_rule_filter = HardRuleContextFilter(
         allowed_reminder_statuses=settings.prompt_policy.context_filter_allowed_reminder_statuses,
@@ -312,10 +305,9 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
         config=gp_config,
     )
 
-    content_composer = ReActContentComposer(
-        registry=tool_registry, llm=llm,
-        prompt_registry=prompt_registry, config=gp_config,
-    ) if gp_config.content_composer_enabled else None
+    content_composer = DeterministicContentComposer(
+        registry=tool_registry,
+    )
 
     general_hitl = LLMGeneralHITLStrategy(
         llm=llm, prompt_registry=prompt_registry,

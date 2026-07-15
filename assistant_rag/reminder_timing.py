@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 import json
 
 from .llm import LLMClient, LLMTask
+from .chat_history import CHAT_HISTORY_PROMPT_RULE, inject_chat_history
 
 
 @dataclass(frozen=True)
@@ -73,16 +74,17 @@ class ReminderTimingPlanner:
                     "events, a day-before reminder can be appropriate. If the stakes, timezone, event "
                     "meaning, or timing preference are unclear, set needs_clarification=true. Never change "
                     "an explicit user-selected notification time; such requests do not reach this planner."
+                    f"\n\n{CHAT_HISTORY_PROMPT_RULE}"
                 ),
                 user_prompt=json.dumps(
-                    {
+                    inject_chat_history({
                         "user_query": raw_query,
                         "subject": subject,
                         "event_time_utc": event_time.isoformat(),
                         "user_timezone": user_timezone,
                         "current_time_utc": now.isoformat(),
                         "minutes_until_event": minutes_until_event,
-                    },
+                    }),
                     ensure_ascii=False,
                 ),
                 schema=schema,

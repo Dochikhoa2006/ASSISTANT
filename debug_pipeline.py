@@ -20,7 +20,7 @@ from assistant_rag.branch_orchestration import (
     ReminderTargetResolver,
     ValidatedActionBuilder,
 )
-from assistant_rag.action_detection import LLMActionDetector
+from assistant_rag.action_detection import DeterministicActionDetector
 from assistant_rag.branches import (
     BranchRouter,
     ClarificationBranch,
@@ -37,7 +37,7 @@ from assistant_rag.content_composer import (
     AnswerGenerationTool,
     ContentToolRegistry,
     GenerateExcelTool,
-    ReActContentComposer,
+    DeterministicContentComposer,
 )
 from assistant_rag.contracts import (
     BundledResponse,
@@ -525,12 +525,7 @@ class ScenarioLLM:
         return "Start with Python basics, practice daily, then build small projects."
 
     def generate_json(self, **kwargs: Any) -> dict[str, Any]:
-        return {
-            "thought": "Use the default answer tool for a learning-plan question.",
-            "tool_name": "answer_generation",
-            "tool_input": {},
-            "is_final_answer": True,
-        }
+        raise AssertionError("deterministic content composer must not request a ReAct decision")
 
 
 def _normalize(text: str) -> str:
@@ -1504,100 +1499,46 @@ def scenario_last_qa_mandatory_before_classification(settings: ProductionSetting
     )
 
 
-def scenario_model_backed_action_extraction(settings: ProductionSettings) -> ScenarioResult:
-    """Mutation content must come from the configured semantic extractor, not lexical shortcuts."""
-    class ScriptedActionLLM:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def generate_json(self, **_: Any) -> dict[str, Any]:
-            self.calls += 1
-            return {
-                "intent": Intent.KNOWLEDGE_FACTS.value,
-                "confidence": 0.96,
-                "knowledge_actions": [
-                    {
-                        "action": "add",
-                        "text": "The weekly release note should include operational risks.",
-                        "confidence": 0.96,
-                    }
-                ],
-                "reminder_actions": [],
-                "missing_fields": [],
-                "risk_flags": [],
-                "normalized_entities": {},
-            }
-
-    llm = ScriptedActionLLM()
-    detector = LLMActionDetector(llm)
+def scenario_deterministic_action_detection(settings: ProductionSettings) -> ScenarioResult:
+    """Action selection must use exact raw-query keywords without a model."""
+    detector = DeterministicActionDetector()
     result = detector.detect(
         ChatRequest(
             user_id=DEBUG_USER,
-            raw_query="Keep this as a durable project fact: the weekly release note should include operational risks.",
+            raw_query="Remember that the weekly release note includes operational risks.",
         ),
-        "Keep this as a durable project fact: the weekly release note should include operational risks.",
+        "A rewritten query that says delete must not affect routing.",
         Intent.KNOWLEDGE_FACTS,
     )
     actions = result.metadata.get("knowledge_actions") or []
-    if llm.calls != 1:
-        raise AssertionError(f"action extraction bypassed its configured semantic model: {llm.calls} calls")
-    if len(actions) != 1 or actions[0].get("text") != "The weekly release note should include operational risks.":
-        raise AssertionError(f"action extraction did not preserve the model-extracted fact: {actions}")
+    if len(actions) != 1 or actions[0].get("action") != "add":
+        raise AssertionError(f"deterministic action detection selected the wrong action: {actions}")
+    if "weekly release note" not in str(actions[0].get("text")):
+        raise AssertionError(f"deterministic add extraction lost supplied content: {actions}")
     if result.requires_clarification:
-        raise AssertionError(f"complete model action was incorrectly sent to clarification: {result}")
-    required_rule = "The selected branch is authoritative; never reclassify it."
-    if required_rule not in DEFAULT_PROMPT_REGISTRY.system("action_detection"):
-        raise AssertionError("action-detection prompt lost its selected-branch rule")
-    schema = detector._schema(Intent.KNOWLEDGE_FACTS)
-    if "intent" in schema["properties"] or "reminder_actions" in schema["properties"]:
-        raise AssertionError("knowledge extraction schema must contain only the selected branch contract")
-    malformed_action = {
-        "confidence": 0.96,
-        "knowledge_actions": [{"action": "persist"}],
-        "missing_fields": [],
-        "risk_flags": [],
-        "normalized_entities": {},
-    }
-    try:
-        validate_json_schema(malformed_action, schema)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("nested unsupported action values must fail structured validation")
-    return ScenarioResult("model_backed_action_extraction", True, "complete knowledge content is extracted by the configured semantic model")
+        raise AssertionError(f"explicit single action was incorrectly rejected: {result}")
+    return ScenarioResult(
+        "deterministic_action_detection",
+        True,
+        "raw-query keywords select one knowledge action without an LLM",
+    )
 
 
-def scenario_knowledge_action_recovery(settings: ProductionSettings) -> ScenarioResult:
-    """A failed first extraction may recover only through the same semantic action contract."""
-    class RecoveryLLM:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def generate_json(self, **_: Any) -> dict[str, Any]:
-            self.calls += 1
-            if self.calls == 1:
-                return {
-                    "confidence": 0.0,
-                    "knowledge_actions": [],
-                    "missing_fields": ["target_description"],
-                    "risk_flags": ["ambiguous"],
-                }
-            if self.calls == 2:
-                return {"operation": "add"}
-            return {"text": "Archived records use a reversible lifecycle."}
-
-    llm = RecoveryLLM()
-    result = LLMActionDetector(llm).detect(
-        ChatRequest(user_id=DEBUG_USER, raw_query="Store the archival lifecycle policy."),
-        "Store the archival lifecycle policy.",
+def scenario_multi_action_detection_fails_closed(settings: ProductionSettings) -> ScenarioResult:
+    """Two independently requested action categories must never produce executable actions."""
+    result = DeterministicActionDetector().detect(
+        ChatRequest(user_id=DEBUG_USER, raw_query="Delete the old policy and add a new policy."),
+        "Delete the old policy and add a new policy.",
         Intent.KNOWLEDGE_FACTS,
     )
     actions = result.metadata.get("knowledge_actions") or []
-    if llm.calls != 3 or result.requires_clarification or actions != [{"action": "add", "text": "Archived records use a reversible lifecycle."}]:
-        raise AssertionError(f"knowledge extraction recovery failed: calls={llm.calls}, result={result}")
-    if "outer storage operation" not in DEFAULT_PROMPT_REGISTRY.system("knowledge_operation_recovery"):
-        raise AssertionError("knowledge recovery prompt lost its outer-operation rule")
-    return ScenarioResult("knowledge_action_recovery", True, "failed knowledge extraction recovers through a bounded semantic retry")
+    if actions or not result.requires_clarification or "ambiguous_action_keywords" not in result.risk_flags:
+        raise AssertionError(f"multi-action request did not fail closed: {result}")
+    return ScenarioResult(
+        "multi_action_detection_fails_closed",
+        True,
+        "independent action categories produce no executable action",
+    )
 
 
 def scenario_sql_backed_knowledge_lookup(settings: ProductionSettings) -> ScenarioResult:
@@ -1647,38 +1588,18 @@ def scenario_general_sql_knowledge_fallback(settings: ProductionSettings) -> Sce
     return ScenarioResult("general_sql_knowledge_fallback", True, "general response used one canonical knowledge retrieval")
 
 
-def scenario_model_backed_knowledge_update(settings: ProductionSettings) -> ScenarioResult:
+def scenario_deterministic_knowledge_update(settings: ProductionSettings) -> ScenarioResult:
     """A complete update instruction must retain both its target and replacement."""
-    class ScriptedUpdateLLM:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def generate_json(self, **_: Any) -> dict[str, Any]:
-            self.calls += 1
-            return {
-                "confidence": 0.97,
-                "knowledge_actions": [
-                    {
-                        "action": "modify",
-                        "target_description": "primary data store",
-                        "replacement_text": "The primary data store is the production source of truth.",
-                    }
-                ],
-                "missing_fields": [],
-                "risk_flags": [],
-            }
-
-    llm = ScriptedUpdateLLM()
-    detector = LLMActionDetector(llm)
+    detector = DeterministicActionDetector()
     request = ChatRequest(user_id=DEBUG_USER, raw_query="Update the primary data-store policy to the new source-of-truth statement.")
     result = detector.detect(request, request.raw_query, Intent.KNOWLEDGE_FACTS)
     actions = result.metadata.get("knowledge_actions") or []
-    if llm.calls != 1 or result.requires_clarification:
-        raise AssertionError(f"complete update was not accepted by action extraction: {result}")
+    if result.requires_clarification:
+        raise AssertionError(f"complete update was not accepted by deterministic detection: {result}")
     expected = {
         "action": "modify",
-        "target_description": "primary data store",
-        "replacement_text": "The primary data store is the production source of truth.",
+        "target_description": "the primary data-store policy",
+        "replacement_text": "the new source-of-truth statement",
     }
     if len(actions) != 1 or any(actions[0].get(key) != value for key, value in expected.items()):
         raise AssertionError(f"update extraction lost target or replacement: {actions}")
@@ -1693,7 +1614,7 @@ def scenario_model_backed_knowledge_update(settings: ProductionSettings) -> Scen
     assert_response(response, ResponseType.KNOWLEDGE_ACTION, "confirm")
     if not response.actions_pending_confirmation:
         raise AssertionError("validated knowledge update must require confirmation before writing")
-    return ScenarioResult("model_backed_knowledge_update", True, "complete updates preserve target and replacement, then require confirmation")
+    return ScenarioResult("deterministic_knowledge_update", True, "deterministic updates preserve target and replacement, then require confirmation")
 
 
 def scenario_clarification_schema_echo_recovery(settings: ProductionSettings) -> ScenarioResult:
@@ -2344,11 +2265,10 @@ def scenario_onnx_non_retryable_model_error(settings: ProductionSettings) -> Sce
     return ScenarioResult("onnx_non_retryable_model_error", True, "missing ONNX repositories stop retrying after the first definitive failure")
 
 
-def scenario_content_composer_general_react(settings: ProductionSettings) -> ScenarioResult:
+def scenario_content_composer_deterministic(settings: ProductionSettings) -> ScenarioResult:
     state = build_scenario_state(settings)
     config = GeneralPurposeConfig(
         content_composer_enabled=True,
-        content_composer_max_iterations=1,
         content_composer_fallback_tool="answer_generation",
         content_composer_default_tool="answer_generation",
     )
@@ -2357,11 +2277,8 @@ def scenario_content_composer_general_react(settings: ProductionSettings) -> Sce
         tools=[AnswerGenerationTool(llm=llm, prompt_registry=DEFAULT_PROMPT_REGISTRY)],
         config=config,
     )
-    composer = ReActContentComposer(
+    composer = DeterministicContentComposer(
         registry=registry,
-        llm=llm,
-        prompt_registry=DEFAULT_PROMPT_REGISTRY,
-        config=config,
     )
     from assistant_rag.contracts import (
         ContentComposerInput,
@@ -2406,11 +2323,8 @@ def scenario_content_composer_general_react(settings: ProductionSettings) -> Sce
         ],
         config=config,
     )
-    artifact_composer = ReActContentComposer(
+    artifact_composer = DeterministicContentComposer(
         registry=artifact_registry,
-        llm=llm,
-        prompt_registry=DEFAULT_PROMPT_REGISTRY,
-        config=config,
     )
     artifact_result = artifact_composer.compose(
         replace(
@@ -2421,12 +2335,12 @@ def scenario_content_composer_general_react(settings: ProductionSettings) -> Sce
         ),
         config,
     )
-    if artifact_result.used_tool_names != ("generate_excel",) or len(artifact_result.artifacts) != 1:
-        raise AssertionError(f"explicit Excel request did not create an artifact: {artifact_result!r}")
+    if artifact_result.used_tool_names != ("answer_generation", "generate_excel") or len(artifact_result.artifacts) != 1:
+        raise AssertionError(f"answer-first explicit Excel request did not create exactly one artifact: {artifact_result!r}")
     artifact_path = Path(str(artifact_result.artifacts[0].get("storage_path") or ""))
     if not artifact_path.is_file() or not zipfile.is_zipfile(artifact_path):
         raise AssertionError("generated Excel artifact was not a downloadable workbook")
-    return ScenarioResult("content_composer_general_react", True, "composer creates downloadable files for explicit artifact requests")
+    return ScenarioResult("content_composer_deterministic", True, "deterministic composer always answers and creates one downloadable file for an explicit artifact request")
 
 
 def scenario_general_broad_retrieval_approved(settings: ProductionSettings) -> ScenarioResult:
@@ -2812,11 +2726,11 @@ SCENARIOS: tuple[ScenarioFn, ...] = (
     scenario_structured_clarification_fallback_policy,
     scenario_mutation_clarification_fast_path,
     scenario_last_qa_mandatory_before_classification,
-    scenario_model_backed_action_extraction,
-    scenario_knowledge_action_recovery,
+    scenario_deterministic_action_detection,
+    scenario_multi_action_detection_fails_closed,
     scenario_sql_backed_knowledge_lookup,
     scenario_general_sql_knowledge_fallback,
-    scenario_model_backed_knowledge_update,
+    scenario_deterministic_knowledge_update,
     scenario_clarification_schema_echo_recovery,
     scenario_content_composer_react_structured_policy,
     scenario_structured_fallback_terminal_quiet,
@@ -2826,7 +2740,7 @@ SCENARIOS: tuple[ScenarioFn, ...] = (
     scenario_debug_hybrid_llm_compatibility,
     scenario_hybrid_structured_onnx_failover,
     scenario_onnx_non_retryable_model_error,
-    scenario_content_composer_general_react,
+    scenario_content_composer_deterministic,
     scenario_general_broad_retrieval_approved,
     scenario_lastqa_supporting_skip,
     scenario_knowledge_add,
