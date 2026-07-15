@@ -39,92 +39,55 @@ class GeneralSubBranchDetector:
                 reason_summary="Detector disabled by config.",
             )
 
-        history_map = {}
-        human_qs = []
-        reminder_qs = []
-        extracted_types = []
-        
-        if context.chat_history:
-            for idx, hop in enumerate(context.chat_history):
-                history_map[f"conversation_candidate_{idx}"] = {
-                    "role": "conversation_hop",
-                    "text": hop.get("text") or (
-                        f"User: {hop.get('raw_user_query', '')}\n"
-                        f"Assistant: {hop.get('raw_response', '')}"
-                    ).strip(),
-                    "topic_id": hop.get("topic_id"),
-                    "hop_id": hop.get("hop_id"),
-                }
-            human_qs = [q.text for q in context.approved_conversation_context.human_supporting_questions]
-            reminder_qs = [q.text for q in context.approved_conversation_context.reminder_supporting_questions]
-            extracted_types = [t.value for t in context.approved_conversation_context.extracted_expected_response_types]
+        approved_context = context.approved_conversation_context
+        last_qa_state = context.last_qa_state
+        support_question_rule_fired = bool(
+            last_qa_state is not None
+            and last_qa_state.supporting_questions
+            and approved_context is not None
+            and approved_context._internal_selected_hop_candidates
+        )
 
-        try:
-            payload = self.llm.generate_json(
-                task=LLMTask.GENERAL_SUB_BRANCH_DETECTION,
-                system_prompt=self.prompt_registry.system("general_sub_branch_detector"),
-                user_prompt=self.prompt_registry.user(
-                    PromptContext(
-                        stage="general_sub_branch_detector",
-                        rewritten_query=context.rewritten_query,
-                        extra={
-                            "approved_conversation_history": history_map,
-                            "human_supporting_questions": human_qs,
-                            "reminder_supporting_questions": reminder_qs,
-                            "extracted_expected_response_types": extracted_types,
-                            "merged_supporting_detail": merged_supporting_detail,
-                        },
-                    )
-                ),
-                schema=GENERAL_SUB_BRANCH_DETECTION_SCHEMA,
-            )
-            
-            sub_branch_val = str(payload.get("sub_branch", config.general_sub_branch_fallback_mode))
-            try:
-                sub_branch = GeneralSubBranch(sub_branch_val)
-            except ValueError:
-                sub_branch = GeneralSubBranch(config.general_sub_branch_fallback_mode)
-
-            try:
-                persistence_val = str(payload.get("persistence_mode", "create_new_topic"))
-                persistence_mode = PersistenceMode(persistence_val)
-            except ValueError:
-                persistence_mode = PersistenceMode.CREATE_NEW_TOPIC
-
-            confidence = float(payload.get("confidence", 0.0))
-            if confidence < config.general_sub_branch_confidence_threshold:
-                sub_branch = GeneralSubBranch(config.general_sub_branch_fallback_mode)
-                persistence_mode = PersistenceMode.CREATE_NEW_TOPIC
-
-            selected_ref = payload.get("selected_candidate_ref")
-            selected_topic_id = None
-            selected_hop_id = None
-            
-            if selected_ref and selected_ref in history_map:
-                selected_topic_id = history_map[selected_ref].get("topic_id")
-                selected_hop_id = history_map[selected_ref].get("hop_id")
-
+        if support_question_rule_fired:
+            selected_topic_id = last_qa_state.linked_topic_id
+            selected_hop_id = last_qa_state.linked_hop_id
             return GeneralSubBranchDecision(
-                sub_branch=sub_branch,
-                confidence=confidence,
-                persistence_mode=persistence_mode,
-                selected_candidate_ref=selected_ref,
+                sub_branch=GeneralSubBranch.SUPPORT_QUESTION_ANSWER,
+                confidence=1.0,
+                persistence_mode=PersistenceMode.APPEND_TO_EXISTING_TOPIC,
                 selected_topic_id=selected_topic_id,
                 selected_hop_id=selected_hop_id,
                 selected_parent_hop_id=selected_hop_id,
-                reason_summary=str(payload.get("reason_summary", "")),
-                risk_flags=tuple(payload.get("risk_flags", [])),
-                missing_context=tuple(payload.get("missing_context", [])),
+                reason_summary="Deterministic rule fired: SUPPORT_QUESTION_ANSWER.",
             )
-        except Exception as e:
-            logger.debug("General sub-branch detection failed: %s", e)
-            fallback = GeneralSubBranch(config.general_sub_branch_fallback_mode)
+
+        if approved_context is not None and approved_context.approved_conversation_history:
+            selected_topic_id = (
+                approved_context._internal_selected_topic_candidates[0]
+                if approved_context._internal_selected_topic_candidates
+                else None
+            )
+            selected_hop_id = (
+                approved_context._internal_selected_hop_candidates[0]
+                if approved_context._internal_selected_hop_candidates
+                else None
+            )
             return GeneralSubBranchDecision(
-                sub_branch=fallback,
-                confidence=0.0,
-                persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
-                reason_summary=f"LLM failure: {e}",
+                sub_branch=GeneralSubBranch.CONVERSATION_FOLLOW_UP,
+                confidence=1.0,
+                persistence_mode=PersistenceMode.APPEND_TO_EXISTING_TOPIC,
+                selected_topic_id=selected_topic_id,
+                selected_hop_id=selected_hop_id,
+                selected_parent_hop_id=selected_hop_id,
+                reason_summary="Deterministic rule fired: CONVERSATION_FOLLOW_UP.",
             )
+
+        return GeneralSubBranchDecision(
+            sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
+            confidence=1.0,
+            persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
+            reason_summary="Deterministic rule fired: NEW_CONVERSATION_TOPIC.",
+        )
 
 
 class GeneralSubBranchValidator:

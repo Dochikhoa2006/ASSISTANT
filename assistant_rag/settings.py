@@ -65,15 +65,15 @@ class OllamaSettings:
     # Task: QUERY_REWRITE
     model_query_rewrite: str = "qwen3.5:4b"
     timeout_query_rewrite: float = 12.0
-    num_ctx_query_rewrite: int = 384
-    num_predict_query_rewrite: int | None = 48
+    num_ctx_query_rewrite: int = 1024
+    num_predict_query_rewrite: int | None = 128
     temperature_query_rewrite: float = 0.0
 
     # Task: LAST_QA
     model_last_qa: str = "qwen3.5:4b"
     timeout_last_qa: float = 18.0
-    num_ctx_last_qa: int = 1024
-    num_predict_last_qa: int | None = 96
+    num_ctx_last_qa: int = 2048
+    num_predict_last_qa: int | None = 160
     temperature_last_qa: float = 0.0
     json_retry_count_last_qa: int = 1
 
@@ -81,7 +81,7 @@ class OllamaSettings:
     model_intent: str = "qwen3.5:4b"
     model_intent_fallback: str | None = "qwen3.5:4b"
     timeout_intent: float = 20.0
-    num_ctx_intent: int = 1024
+    num_ctx_intent: int = 1536
     num_predict_intent: int | None = 48
     temperature_intent: float = 0.0
 
@@ -96,7 +96,7 @@ class OllamaSettings:
     model_generate_clarification: str = "qwen3.5:4b"
     model_generate_clarification_fallback: str | None = "qwen3.5:4b"
     timeout_generate_clarification: float = 15.0
-    num_ctx_generate_clarification: int = 1024
+    num_ctx_generate_clarification: int = 1536
     num_predict_generate_clarification: int | None = 160
     temperature_generate_clarification: float = 0.0
     json_retry_count_generate_clarification: int = 1
@@ -104,7 +104,7 @@ class OllamaSettings:
     # Task: GENERATE_HUMAN_SUPPORTING
     model_generate_human_supporting: str = "qwen3.5:4b"
     timeout_generate_human_supporting: float = 15.0
-    num_ctx_generate_human_supporting: int = 1024
+    num_ctx_generate_human_supporting: int = 2048
     num_predict_generate_human_supporting: int | None = 160
     temperature_generate_human_supporting: float = 0.25
     json_retry_count_generate_human_supporting: int = 1
@@ -112,7 +112,7 @@ class OllamaSettings:
     # Task: GENERATE_REMINDER_SUPPORTING
     model_generate_reminder_supporting: str = "qwen3.5:4b"
     timeout_generate_reminder_supporting: float = 15.0
-    num_ctx_generate_reminder_supporting: int = 1024
+    num_ctx_generate_reminder_supporting: int = 1536
     num_predict_generate_reminder_supporting: int | None = 160
     temperature_generate_reminder_supporting: float = 0.2
     json_retry_count_generate_reminder_supporting: int = 1
@@ -120,8 +120,8 @@ class OllamaSettings:
     # Task: CLARIFICATION_MERGE
     model_clarification_merge: str = "qwen3.5:4b"
     timeout_clarification_merge: float = 24.0
-    num_ctx_clarification_merge: int = 768
-    num_predict_clarification_merge: int | None = 128
+    num_ctx_clarification_merge: int = 1536
+    num_predict_clarification_merge: int | None = 256
     temperature_clarification_merge: float = 0.0
     json_retry_count_clarification_merge: int = 1
 
@@ -151,8 +151,8 @@ class OllamaSettings:
     # Task: RETRIEVAL_VALIDATION
     model_retrieval_validation: str = "microsoft/Phi-4-mini-instruct-onnx"
     timeout_retrieval_validation: float = 35.0
-    num_ctx_retrieval_validation: int = 1536
-    num_predict_retrieval_validation: int | None = 192
+    num_ctx_retrieval_validation: int = 4096
+    num_predict_retrieval_validation: int | None = 256
     temperature_retrieval_validation: float = 0.0
 
     # Task: GENERAL_SUB_BRANCH_DETECTION

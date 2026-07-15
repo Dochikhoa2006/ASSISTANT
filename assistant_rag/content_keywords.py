@@ -85,9 +85,9 @@ EXCEL_FILE_KEYWORDS: tuple[str, ...] = (
 
 
 POWERPOINT_FILE_KEYWORDS: tuple[str, ...] = (
-    "powerpoint", "microsoft powerpoint", "ms powerpoint", "ppt", "pptx", ".ppt",
+    "powerpoint", "power point", "microsoft powerpoint", "ms powerpoint", "ppt", "pptx", ".ppt",
     ".pptx", "presentation", "slide presentation", "slide deck", "deck", "slides",
-    "slideshow", "pitch deck", "investor deck", "sales deck", "marketing deck",
+    "slideshow", "slide show", "pitch deck", "investor deck", "sales deck", "marketing deck",
     "training deck", "teaching slides", "lecture slides", "conference presentation",
     "seminar presentation", "webinar presentation", "project presentation",
     "project kickoff", "business review", "operating review",

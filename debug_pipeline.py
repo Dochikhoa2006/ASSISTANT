@@ -10,6 +10,7 @@ import json
 import logging
 import smtplib
 import sys
+from tempfile import TemporaryDirectory
 import zipfile
 from typing import Any, Callable
 from types import SimpleNamespace
@@ -55,6 +56,7 @@ from assistant_rag.contracts import (
 )
 from assistant_rag.database import SQLiteRepository, now_iso
 from assistant_rag.hybrid_llm import HybridLLMClient
+from assistant_rag.general_sub_branch import GeneralSubBranchDetector
 from assistant_rag.last_qa import InMemoryLastQAStore
 from assistant_rag.llm import (
     LLMTask,
@@ -74,6 +76,10 @@ from assistant_rag.production_factory import (
     build_production_runtime,
 )
 from assistant_rag.prompts import CONTENT_COMPOSER_REACT_SCHEMA, DEFAULT_PROMPT_REGISTRY
+from assistant_rag.request_lifecycle import (
+    ChatRequestLifecycleExecutor,
+    RequestLifecycleConflict,
+)
 from assistant_rag.settings import ProductionSettings
 
 
@@ -1617,6 +1623,90 @@ def scenario_deterministic_knowledge_update(settings: ProductionSettings) -> Sce
     return ScenarioResult("deterministic_knowledge_update", True, "deterministic updates preserve target and replacement, then require confirmation")
 
 
+def scenario_shared_confirmation_lifecycle(settings: ProductionSettings) -> ScenarioResult:
+    """Debug and Streamlit confirmation semantics commit and replay exactly once."""
+
+    state = build_scenario_state(settings)
+    seed_knowledge(
+        state,
+        title="Project Atlas",
+        text="Project Atlas retention is 30 days.",
+    )
+    lifecycle = ChatRequestLifecycleExecutor(
+        pipeline=state.pipeline,
+        repository=state.repository,
+    )
+    query = "Change Project Atlas retention to 45 days"
+    initial = lifecycle.execute(
+        ChatRequest(
+            user_id=state.user_id,
+            raw_query=query,
+            idempotency_key="scenario-confirmation-initial",
+            metadata={
+                "intent": Intent.KNOWLEDGE_FACTS.value,
+                "knowledge_actions": [
+                    {
+                        "action": "modify",
+                        "target_description": "Project Atlas retention 30 days",
+                        "replacement_text": "Project Atlas retention is 45 days.",
+                    }
+                ],
+            },
+        ),
+        fallback_request_id="scenario-confirmation-initial",
+    )
+    if initial.response is None or not initial.response.actions_pending_confirmation:
+        raise AssertionError("knowledge modify did not produce a pending confirmation")
+    token = str(
+        initial.response.actions_pending_confirmation[0]["confirmation_token"]
+    )
+    confirmed_request = ChatRequest(
+        user_id=state.user_id,
+        raw_query=query,
+        confirmation_token=token,
+        idempotency_key=f"scenario-confirmation:{token}",
+    )
+    confirmed = lifecycle.execute(
+        confirmed_request,
+        fallback_request_id="scenario-confirmation-first",
+    )
+    replayed = lifecycle.execute(
+        confirmed_request,
+        fallback_request_id="scenario-confirmation-replay",
+    )
+    active = state.repository.connection.execute(
+        """
+        SELECT raw_text FROM knowledge_chunks
+        WHERE user_id = ? AND is_deleted = 0
+        """,
+        (state.user_id,),
+    ).fetchall()
+    confirmation_status = state.repository.connection.execute(
+        """
+        SELECT status FROM pending_action_confirmations
+        WHERE confirmation_token = ?
+        """,
+        (token,),
+    ).fetchone()["status"]
+    if confirmed.response is None or not confirmed.response.actions_committed:
+        raise AssertionError("confirmed knowledge action did not commit")
+    if not replayed.replayed or replayed.response is not None:
+        raise AssertionError("repeated confirmation did not use idempotent replay")
+    if [row["raw_text"] for row in active] != [
+        "Project Atlas retention is 45 days."
+    ]:
+        raise AssertionError(f"confirmation mutated knowledge incorrectly: {active!r}")
+    if confirmation_status != "confirmed":
+        raise AssertionError(
+            f"pending confirmation did not reach confirmed: {confirmation_status}"
+        )
+    return ScenarioResult(
+        "shared_confirmation_lifecycle",
+        True,
+        "pending confirmation committed once and repeated confirmation replayed safely",
+    )
+
+
 def scenario_clarification_schema_echo_recovery(settings: ProductionSettings) -> ScenarioResult:
     """Question generation must request data instances, never induce schema copying."""
     schema = {
@@ -2267,85 +2357,87 @@ def scenario_onnx_non_retryable_model_error(settings: ProductionSettings) -> Sce
 
 def scenario_content_composer_deterministic(settings: ProductionSettings) -> ScenarioResult:
     state = build_scenario_state(settings)
-    config = GeneralPurposeConfig(
-        content_composer_enabled=True,
-        content_composer_fallback_tool="answer_generation",
-        content_composer_default_tool="answer_generation",
-    )
-    llm = ScenarioLLM()
-    registry = ContentToolRegistry(
-        tools=[AnswerGenerationTool(llm=llm, prompt_registry=DEFAULT_PROMPT_REGISTRY)],
-        config=config,
-    )
-    composer = DeterministicContentComposer(
-        registry=registry,
-    )
-    from assistant_rag.contracts import (
-        ContentComposerInput,
-        GeneralSubBranch,
-        PersistenceMode,
-        SubBranchPromptContext,
-    )
+    with TemporaryDirectory(prefix="assistant-debug-artifacts-") as artifact_storage_dir:
+        config = GeneralPurposeConfig(
+            content_composer_enabled=True,
+            content_composer_fallback_tool="answer_generation",
+            content_composer_default_tool="answer_generation",
+            artifact_storage_dir=artifact_storage_dir,
+        )
+        llm = ScenarioLLM()
+        registry = ContentToolRegistry(
+            tools=[AnswerGenerationTool(llm=llm, prompt_registry=DEFAULT_PROMPT_REGISTRY)],
+            config=config,
+        )
+        composer = DeterministicContentComposer(
+            registry=registry,
+        )
+        from assistant_rag.contracts import (
+            ContentComposerInput,
+            GeneralSubBranch,
+            PersistenceMode,
+            SubBranchPromptContext,
+        )
 
-    composer_input = ContentComposerInput(
-        user_id=state.user_id,
-        raw_user_query="I want to learn Python from zero.",
-        rewritten_query="I want to learn Python from zero.",
-        sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
-        persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
-        approved_conversation_history=[],
-        human_supporting_questions=[],
-        reminder_supporting_questions=[],
-        extracted_expected_response_types=[],
-        approved_knowledge_evidence=[],
-        approved_reminder_context=[],
-        metadata={},
-        platform_context={},
-        sub_branch_prompt_context=SubBranchPromptContext(
+        composer_input = ContentComposerInput(
+            user_id=state.user_id,
+            raw_user_query="I want to learn Python from zero.",
+            rewritten_query="I want to learn Python from zero.",
             sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
             persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
-            chat_history_role="new conversation",
-            response_goal="answer directly",
-            database_update_mode="create",
-            allowed_database_updates=("conversation_hop_append",),
-            prohibited_database_updates=("knowledge_mutation",),
-        ),
-        sub_branch_supporting_prompt="Answer directly.",
-    )
-    result = composer.compose(composer_input, config)
-    if not result.final_response_text:
-        raise AssertionError("content composer returned an empty answer")
+            approved_conversation_history=[],
+            human_supporting_questions=[],
+            reminder_supporting_questions=[],
+            extracted_expected_response_types=[],
+            approved_knowledge_evidence=[],
+            approved_reminder_context=[],
+            metadata={},
+            platform_context={},
+            sub_branch_prompt_context=SubBranchPromptContext(
+                sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
+                persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
+                chat_history_role="new conversation",
+                response_goal="answer directly",
+                database_update_mode="create",
+                allowed_database_updates=("conversation_hop_append",),
+                prohibited_database_updates=("knowledge_mutation",),
+            ),
+            sub_branch_supporting_prompt="Answer directly.",
+        )
+        result = composer.compose(composer_input, config)
+        if not result.final_response_text:
+            raise AssertionError("content composer returned an empty answer")
 
-    artifact_registry = ContentToolRegistry(
-        tools=[
-            AnswerGenerationTool(llm=llm, prompt_registry=DEFAULT_PROMPT_REGISTRY),
-            GenerateExcelTool(llm=llm, prompt_registry=DEFAULT_PROMPT_REGISTRY, config=config),
-        ],
-        config=config,
-    )
-    artifact_composer = DeterministicContentComposer(
-        registry=artifact_registry,
-    )
-    artifact_result = artifact_composer.compose(
-        replace(
-            composer_input,
-            raw_user_query="Give me an Excel file to track project tasks.",
-            rewritten_query="Give me an Excel file to track project tasks.",
-            repository=state.repository,
-        ),
-        config,
-    )
-    if artifact_result.used_tool_names != ("answer_generation", "generate_excel") or len(artifact_result.artifacts) != 1:
-        raise AssertionError(f"answer-first explicit Excel request did not create exactly one artifact: {artifact_result!r}")
-    artifact_path = Path(str(artifact_result.artifacts[0].get("storage_path") or ""))
-    if not artifact_path.is_file() or not zipfile.is_zipfile(artifact_path):
-        raise AssertionError("generated Excel artifact was not a downloadable workbook")
+        artifact_registry = ContentToolRegistry(
+            tools=[
+                AnswerGenerationTool(llm=llm, prompt_registry=DEFAULT_PROMPT_REGISTRY),
+                GenerateExcelTool(llm=llm, prompt_registry=DEFAULT_PROMPT_REGISTRY, config=config),
+            ],
+            config=config,
+        )
+        artifact_composer = DeterministicContentComposer(
+            registry=artifact_registry,
+        )
+        artifact_result = artifact_composer.compose(
+            replace(
+                composer_input,
+                raw_user_query="Give me an Excel file to track project tasks.",
+                rewritten_query="Give me an Excel file to track project tasks.",
+                repository=state.repository,
+            ),
+            config,
+        )
+        if artifact_result.used_tool_names != ("answer_generation", "generate_excel") or len(artifact_result.artifacts) != 1:
+            raise AssertionError(f"answer-first explicit Excel request did not create exactly one artifact: {artifact_result!r}")
+        artifact_path = Path(str(artifact_result.artifacts[0].get("storage_path") or ""))
+        if not artifact_path.is_file() or not zipfile.is_zipfile(artifact_path):
+            raise AssertionError("generated Excel artifact was not a downloadable workbook")
     return ScenarioResult("content_composer_deterministic", True, "deterministic composer always answers and creates one downloadable file for an explicit artifact request")
 
 
 def scenario_general_broad_retrieval_approved(settings: ProductionSettings) -> ScenarioResult:
     state = build_scenario_state(settings)
-    seed_conversation(
+    topic_id, parent_hop_id = seed_conversation(
         state,
         title="Atlas Context",
         query="Project Atlas context",
@@ -2360,6 +2452,16 @@ def scenario_general_broad_retrieval_approved(settings: ProductionSettings) -> S
             }
         ],
     )
+    branch = state.pipeline.router.branches[Intent.GENERAL_RESPONSE]
+    branch.sub_branch_detector = GeneralSubBranchDetector(
+        llm=ScenarioLLM(),
+        prompt_registry=DEFAULT_PROMPT_REGISTRY,
+    )
+    branch.general_purpose_config = GeneralPurposeConfig(
+        general_sub_branch_detector_enabled=True,
+        content_composer_enabled=False,
+        hitl_supporting_question_enabled=False,
+    )
     response = run_request(
         state,
         "Continue Atlas context with QA signoff",
@@ -2371,7 +2473,44 @@ def scenario_general_broad_retrieval_approved(settings: ProductionSettings) -> S
     assert_response(response, ResponseType.NORMAL, "approved Atlas")
     if state.retriever.conversation_calls < 1:
         raise AssertionError("broad conversation retrieval did not run")
-    return ScenarioResult("general_broad_retrieval_approved", True, "approved conversation retrieval path ran")
+    if response.conversation_topic_id != topic_id:
+        raise AssertionError(
+            "approved broad retrieval did not append to the selected topic: "
+            f"expected={topic_id!r}, actual={response.conversation_topic_id!r}"
+        )
+    persisted_hop = state.repository.connection.execute(
+        """
+        SELECT topic_id, previous_hop_id, parent_hop_id, entities_json
+        FROM conversation_hops
+        WHERE hop_id = ? AND user_id = ?
+        """,
+        (response.conversation_hop_id, state.user_id),
+    ).fetchone()
+    if persisted_hop is None:
+        raise AssertionError("general follow-up response hop was not persisted")
+    persisted_entities = json.loads(str(persisted_hop["entities_json"]))
+    expected_persistence = {
+        "topic_id": topic_id,
+        "previous_hop_id": parent_hop_id,
+        "parent_hop_id": parent_hop_id,
+        "sub_branch": "conversation_follow_up",
+    }
+    actual_persistence = {
+        "topic_id": persisted_hop["topic_id"],
+        "previous_hop_id": persisted_hop["previous_hop_id"],
+        "parent_hop_id": persisted_hop["parent_hop_id"],
+        "sub_branch": persisted_entities.get("sub_branch"),
+    }
+    if actual_persistence != expected_persistence:
+        raise AssertionError(
+            "approved broad retrieval did not preserve append/topic/parent/sub-branch persistence: "
+            f"expected={expected_persistence!r}, actual={actual_persistence!r}"
+        )
+    return ScenarioResult(
+        "general_broad_retrieval_approved",
+        True,
+        "real deterministic detector appended the follow-up to the approved topic and parent hop",
+    )
 
 
 def scenario_lastqa_supporting_skip(settings: ProductionSettings) -> ScenarioResult:
@@ -2437,7 +2576,7 @@ def scenario_knowledge_add(settings: ProductionSettings) -> ScenarioResult:
     entities = state.repository.list_all_outbox_entities()
     for entity_type, entity_id in entities:
         state.repository.load_outbox_entity(entity_type=entity_type, entity_id=entity_id)
-    return ScenarioResult("knowledge_add_and_outbox_load", True, "knowledge add and outbox entity loading succeeded")
+    return ScenarioResult("knowledge_add", True, "knowledge add and outbox entity loading succeeded")
 
 
 def scenario_knowledge_modify(settings: ProductionSettings) -> ScenarioResult:
@@ -2731,6 +2870,7 @@ SCENARIOS: tuple[ScenarioFn, ...] = (
     scenario_sql_backed_knowledge_lookup,
     scenario_general_sql_knowledge_fallback,
     scenario_deterministic_knowledge_update,
+    scenario_shared_confirmation_lifecycle,
     scenario_clarification_schema_echo_recovery,
     scenario_content_composer_react_structured_policy,
     scenario_structured_fallback_terminal_quiet,
@@ -2850,8 +2990,16 @@ def interactive_main(settings: ProductionSettings) -> None:
     user_id = input("User ID [default: default_user]: ").strip() or "default_user"
     gmail_username = input("Gmail username [default: '']: ").strip()
     gmail_app_password = getpass("Gmail app password [default: '']: ")
+    lifecycle = ChatRequestLifecycleExecutor(
+        pipeline=pipeline,
+        repository=repository,
+    )
+    pending_confirmation_queries: dict[str, str] = {}
 
-    print("\nAssistant is ready! Type '/exit' or Ctrl+C to quit.")
+    print(
+        "\nAssistant is ready! Type '/exit' or Ctrl+C to quit. "
+        "Use '/confirm [token]' for a pending change."
+    )
     while True:
         try:
             query = input("\nAsk the assistant: ").strip()
@@ -2861,19 +3009,53 @@ def interactive_main(settings: ProductionSettings) -> None:
                 print("Exiting...")
                 break
 
-            request_id = new_request_id()
+            confirmation_token: str | None = None
+            request_query = query
+            if query.casefold().startswith("/confirm"):
+                parts = query.split(maxsplit=1)
+                if len(parts) == 2 and parts[1].strip():
+                    confirmation_token = parts[1].strip()
+                elif pending_confirmation_queries:
+                    confirmation_token = next(
+                        reversed(pending_confirmation_queries)
+                    )
+                else:
+                    print("No pending confirmation token is available.")
+                    continue
+                request_query = pending_confirmation_queries.get(
+                    confirmation_token,
+                    "Confirm the pending action.",
+                )
+
+            idempotency_key = (
+                f"debug-confirm:{confirmation_token}"
+                if confirmation_token
+                else new_request_id()
+            )
+            request_id = new_request_id(idempotency_key)
             start_trace(request_id)
-            response = pipeline.handle(
+            execution = lifecycle.execute(
                 ChatRequest(
                     user_id=user_id,
-                    raw_query=query,
+                    raw_query=request_query,
+                    confirmation_token=confirmation_token,
+                    idempotency_key=idempotency_key,
                     platform_context={
                         "gmail_username": gmail_username,
                         "gmail_app_password": gmail_app_password,
                     },
                 ),
-                repository,
+                fallback_request_id=request_id,
             )
+            if execution.replayed:
+                if confirmation_token:
+                    pending_confirmation_queries.pop(confirmation_token, None)
+                print("\nAssistant (idempotent replay):")
+                print(execution.payload.get("final_chat_text", "Request already completed."))
+                continue
+            response = execution.response
+            if response is None:
+                raise RuntimeError("Fresh lifecycle execution returned no response")
             print_debug_report(response, llm=llm)
             logger.info(
                 "real_pipeline_request_completed",
@@ -2884,9 +3066,20 @@ def interactive_main(settings: ProductionSettings) -> None:
                 }},
             )
             print(f"\nAssistant:\n{response.final_chat_text}")
+            if confirmation_token and response.response_type is not ResponseType.ERROR:
+                pending_confirmation_queries.pop(confirmation_token, None)
+            for confirmation in response.actions_pending_confirmation:
+                token = str(confirmation.get("confirmation_token") or "").strip()
+                if not token:
+                    continue
+                pending_confirmation_queries[token] = request_query
+                print(f"Pending confirmation token: {token}")
+                print(f"Run /confirm {token} to apply this change exactly once.")
         except KeyboardInterrupt:
             print("\nExiting...")
             break
+        except RequestLifecycleConflict as exc:
+            print(f"\nRequest not executed: {exc}", file=sys.stderr)
         except Exception as exc:
             print_current_debug_trace()
             print(f"\nError running pipeline: {exc}", file=sys.stderr)

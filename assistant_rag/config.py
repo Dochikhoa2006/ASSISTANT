@@ -142,7 +142,13 @@ class ReminderTargetResolverConfig:
             raise ValueError("reminder_target_relevance_threshold must be between 0 and 1")
         if not (0 <= self.reminder_target_ambiguity_margin <= 1):
             raise ValueError("reminder_target_ambiguity_margin must be between 0 and 1")
-        valid_statuses = {"scheduled", "notified", "cancelled", "dismissed"}
+        valid_statuses = {
+            "scheduled",
+            "notified",
+            "cancelled",
+            "dismissed",
+            "completed",
+        }
         for status_list in [self.allowed_reminder_modify_statuses, self.allowed_reminder_turn_on_statuses, self.allowed_reminder_turn_off_statuses, self.allowed_reminder_delete_statuses]:
             for status in status_list:
                 if status not in valid_statuses:

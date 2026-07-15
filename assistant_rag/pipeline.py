@@ -73,14 +73,14 @@ class AssistantPipeline:
         
         if should_run_broad_retrieval:
             with StageTimer("retrieval", {"entity_type": "conversation_hop"}):
-                conversation_results = self.retriever.retrieve_conversation(
+                raw_conversation_results = self.retriever.retrieve_conversation(
                     user_id=request.user_id,
                     query=retrieval_query,
                 )
-            with StageTimer("sql_validation", {"entity_type": "conversation_hop", "candidate_count": len(conversation_results)}):
+            with StageTimer("sql_validation", {"entity_type": "conversation_hop", "candidate_count": len(raw_conversation_results)}):
                 conversation_results = repository.hydrate_conversation_retrieval_results(
                     user_id=request.user_id,
-                    results=conversation_results,
+                    results=raw_conversation_results,
                 )
             if not conversation_results:
                 GLOBAL_METRICS.increment("retrieval_empty_total", entity_type="conversation_hop")
@@ -94,6 +94,9 @@ class AssistantPipeline:
                     config=self.config.context_filter,
                 )
             else:
+                context_status = (
+                    "all_rejected" if raw_conversation_results else "empty"
+                )
                 approved_conversation_context = ApprovedConversationContext(
                     approved_conversation_history=[],
                     human_supporting_questions=[],
@@ -101,8 +104,11 @@ class AssistantPipeline:
                     clarification_question_context=None,
                     extracted_expected_response_types=[],
                     conversation_retrieval_ran=True,
-                    conversation_context_status="empty",
+                    conversation_context_status=context_status,
                     approved_conversation_count=0,
+                    _rejected_conversation_ids=tuple(
+                        result.entity_id for result in raw_conversation_results
+                    ),
                 )
         
         chat_history = select_chat_history(

@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime, timezone
-from hashlib import sha256
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
@@ -23,6 +21,13 @@ from .auth import authenticate_token, get_auth_context
 from .rate_limit import RateLimiter, build_rate_limiter
 from .settings import ProductionSettings
 from .reminder_reply import build_reminder_reply_last_qa, build_reminder_reply_metadata
+from .request_lifecycle import (
+    ChatRequestLifecycleExecutor,
+    RequestLifecycleConflict,
+    looks_destructive as _looks_destructive,
+    looks_like_mutation as _looks_like_mutation,
+    stable_payload_hash as _stable_payload_hash,
+)
 
 
 @dataclass
@@ -71,29 +76,6 @@ class NotificationWebSocketHub:
                 repo.close()
 
 
-def _stable_payload_hash(request: ChatRequest) -> str:
-    payload = asdict(request)
-    payload.pop("idempotency_key", None)
-    encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
-    return sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _looks_like_mutation(request: ChatRequest) -> bool:
-    metadata = request.metadata or {}
-    if request.confirmation_token:
-        return True
-    if metadata.get("knowledge_actions") or metadata.get("reminder_actions"):
-        return True
-    lowered = request.raw_query.casefold()
-    mutation_words = ("remind", "reminder", "delete", "remove", "modify", "change", "turn off", "turn on", "remember that")
-    return any(word in lowered for word in mutation_words)
-
-
-def _looks_destructive(request: ChatRequest) -> bool:
-    lowered = request.raw_query.casefold()
-    return any(word in lowered for word in ("delete", "remove", "modify", "change", "turn off"))
-
-
 def _response_payload(response: Any, *, request_id: str, latency_ms: int, include_trace: bool = False) -> dict[str, object]:
     payload: dict[str, object] = {
         "request_id": request_id,
@@ -129,6 +111,19 @@ def build_api_app(
     hub.repository_factory = repository_factory
     limiter = rate_limiter or build_rate_limiter()
     settings = ProductionSettings.from_env()
+
+    def enforce_idempotency_policy(
+        request: ChatRequest, is_mutation: bool, _is_destructive: bool
+    ) -> None:
+        if (
+            is_mutation
+            and not str(request.idempotency_key or "").strip()
+            and not settings.safety.allow_missing_idempotency_key
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="idempotency_key is required for mutation requests",
+            )
 
     def get_repository() -> Iterator[AssistantRepository]:
         if repository_factory is None:
@@ -171,109 +166,101 @@ def build_api_app(
                 headers={"Retry-After": str(rate_result.retry_after_seconds)},
             )
 
-        metadata = dict(request.metadata or {})
-        confirmation_to_mark: str | None = None
-        if request.confirmation_token:
-            try:
-                confirmation = repository.load_pending_confirmation(
-                    user_id=request.user_id,
-                    confirmation_token=request.confirmation_token,
-                    now_value=datetime.now(timezone.utc).isoformat(),
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            proposed = confirmation["proposed_action"]
-            domain = proposed.get("domain")
-            if domain == "reminder":
-                metadata["validated_reminder_actions"] = proposed.get("actions", [])
-                metadata["reminder_actions"] = proposed.get("actions", [])
-            elif domain == "knowledge":
-                metadata["validated_knowledge_actions"] = proposed.get("actions", [])
-                metadata["knowledge_actions"] = proposed.get("actions", [])
-            metadata["action_authorization"] = proposed.get("action_authorization", {})
-            metadata["operation_response"] = proposed.get("operation_response", metadata.get("operation_response"))
-            metadata["topic_title"] = proposed.get("topic_title", metadata.get("topic_title"))
-            metadata["confirmation_approved"] = True
-            confirmation_to_mark = request.confirmation_token
-            request = replace(request, metadata=metadata)
+        executor = ChatRequestLifecycleExecutor(
+            pipeline=pipeline,
+            repository=repository,
+        )
 
-        is_mutation = _looks_like_mutation(request)
-        if is_mutation:
+        def enforce_mutation_limits(
+            _request: ChatRequest, is_mutation: bool, is_destructive: bool
+        ) -> None:
+            enforce_idempotency_policy(_request, is_mutation, is_destructive)
+            if not is_mutation:
+                return
             with StageTimer("rate_limit_checked", {"endpoint": "mutation"}):
-                mutation_result = limiter.allow(f"mutation:{auth_context.user_id}", 20, 60)
+                mutation_result = limiter.allow(
+                    f"mutation:{auth_context.user_id}", 20, 60
+                )
             if not mutation_result.allowed:
-                GLOBAL_METRICS.increment("rate_limit_blocked_total", endpoint="mutation")
+                GLOBAL_METRICS.increment(
+                    "rate_limit_blocked_total", endpoint="mutation"
+                )
                 raise HTTPException(
                     status_code=429,
-                    detail={"error": "rate_limited", "retry_after_seconds": mutation_result.retry_after_seconds},
-                    headers={"Retry-After": str(mutation_result.retry_after_seconds)},
+                    detail={
+                        "error": "rate_limited",
+                        "retry_after_seconds": mutation_result.retry_after_seconds,
+                    },
+                    headers={
+                        "Retry-After": str(mutation_result.retry_after_seconds)
+                    },
                 )
-            if _looks_destructive(request):
-                with StageTimer("rate_limit_checked", {"endpoint": "destructive"}):
-                    destructive_result = limiter.allow(f"destructive:{auth_context.user_id}", 5, 60)
-                if not destructive_result.allowed:
-                    GLOBAL_METRICS.increment("rate_limit_blocked_total", endpoint="destructive")
-                    raise HTTPException(
-                        status_code=429,
-                        detail={"error": "rate_limited", "retry_after_seconds": destructive_result.retry_after_seconds},
-                        headers={"Retry-After": str(destructive_result.retry_after_seconds)},
-                    )
+            if not is_destructive:
+                return
+            with StageTimer("rate_limit_checked", {"endpoint": "destructive"}):
+                destructive_result = limiter.allow(
+                    f"destructive:{auth_context.user_id}", 5, 60
+                )
+            if not destructive_result.allowed:
+                GLOBAL_METRICS.increment(
+                    "rate_limit_blocked_total", endpoint="destructive"
+                )
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "error": "rate_limited",
+                        "retry_after_seconds": destructive_result.retry_after_seconds,
+                    },
+                    headers={
+                        "Retry-After": str(destructive_result.retry_after_seconds)
+                    },
+                )
 
-        idempotency_request_id: str | None = None
-        if is_mutation and request.idempotency_key:
-            claim = repository.claim_idempotency_key(
-                user_id=request.user_id,
-                idempotency_key=request.idempotency_key,
-                payload_hash=_stable_payload_hash(request),
-            )
-            idempotency_request_id = claim.request_id
-            if claim.status == "replay" and claim.stored_response_json:
-                GLOBAL_METRICS.increment("idempotency_replay_total")
-                return json.loads(claim.stored_response_json)
-            if claim.status in {"in_progress", "conflict"}:
-                GLOBAL_METRICS.increment("mutation_conflict_total", reason=claim.reason or claim.status)
-                raise HTTPException(status_code=409, detail=claim.reason or claim.status)
-        elif is_mutation:
-            metadata.setdefault("warnings", [])
-            metadata["warnings"] = list(metadata["warnings"]) + ["Mutation request had no idempotency_key; processed in compatibility mode."]
-            request = replace(request, metadata=metadata)
-
-        try:
-            with StageTimer("api_total"):
-                response = pipeline.handle(request, repository)
+        def serialize_response(response: Any, lifecycle_request_id: str) -> dict[str, Any]:
             latency_ms = int((time.perf_counter() - start) * 1000)
             GLOBAL_METRICS.observe_latency("chat_latency_ms", latency_ms)
-            GLOBAL_METRICS.increment("chat_responses_total", response_type=response.response_type.value)
+            GLOBAL_METRICS.increment(
+                "chat_responses_total", response_type=response.response_type.value
+            )
             payload = _response_payload(
                 response,
-                request_id=idempotency_request_id or request_id,
+                request_id=lifecycle_request_id,
                 latency_ms=latency_ms,
                 include_trace=settings.operations.debug_trace_responses,
             )
             if payload["actions_committed"]:
-                GLOBAL_METRICS.increment("mutation_success_total", len(payload["actions_committed"]))  # type: ignore[arg-type]
+                GLOBAL_METRICS.increment(
+                    "mutation_success_total", len(payload["actions_committed"])
+                )
             if payload["actions_pending_confirmation"]:
-                GLOBAL_METRICS.increment("mutation_confirmation_required_total", len(payload["actions_pending_confirmation"]))  # type: ignore[arg-type]
+                GLOBAL_METRICS.increment(
+                    "mutation_confirmation_required_total",
+                    len(payload["actions_pending_confirmation"]),
+                )
             if response.response_type is ResponseType.CLARIFICATION:
                 GLOBAL_METRICS.increment("clarification_total")
-            if idempotency_request_id:
-                repository.complete_idempotency_request(
-                    request_id=idempotency_request_id,
-                    stored_response_json=json.dumps(payload, default=str),
-                )
-            if confirmation_to_mark and response.response_type is not ResponseType.ERROR:
-                repository.mark_confirmation_confirmed(
-                    user_id=request.user_id,
-                    confirmation_token=confirmation_to_mark,
-                )
             return payload
+
+        try:
+            with StageTimer("api_total"):
+                execution = executor.execute(
+                    request,
+                    fallback_request_id=request_id,
+                    serialize_response=serialize_response,
+                    before_claim=enforce_mutation_limits,
+                )
+            if execution.replayed:
+                GLOBAL_METRICS.increment("idempotency_replay_total")
+            return execution.payload
+        except RequestLifecycleConflict as exc:
+            GLOBAL_METRICS.increment(
+                "mutation_conflict_total", reason=str(exc) or "request_conflict"
+            )
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except HTTPException:
+            raise
         except Exception as exc:
             GLOBAL_METRICS.increment("chat_errors_total", error_type=type(exc).__name__)
-            if idempotency_request_id:
-                repository.fail_idempotency_request(
-                    request_id=idempotency_request_id,
-                    error_message=str(exc),
-                )
             raise
 
     @app.get("/notifications")
@@ -548,32 +535,62 @@ def build_api_app(
                 raise ValueError("Reminder reply context not found for user")
             if not context.get("source_hop_id"):
                 raise ValueError("Reminder source conversation is unavailable")
-            pipeline.last_qa_store.save(user_id, build_reminder_reply_last_qa(context))
-            request_id = new_request_id()
+            reply_last_qa = build_reminder_reply_last_qa(context)
+            idempotency_key = str(payload.get("idempotency_key") or "").strip() or None
+            request_id = new_request_id(idempotency_key)
             start_trace(request_id)
             started_at = time.perf_counter()
-            response = pipeline.handle(
-                ChatRequest(
-                    user_id=user_id,
-                    raw_query=reply_text,
-                    parent_hop_id=context.get("source_hop_id"),
-                    metadata=build_reminder_reply_metadata(
-                        reminder_id=reminder_id,
-                        notification_id=notification_id,
-                        context=context,
-                    ),
+            request = ChatRequest(
+                user_id=user_id,
+                raw_query=reply_text,
+                reminder_id=reminder_id,
+                notification_id=notification_id,
+                reply_text=reply_text,
+                parent_hop_id=context.get("source_hop_id"),
+                idempotency_key=idempotency_key,
+                metadata=build_reminder_reply_metadata(
+                    reminder_id=reminder_id,
+                    notification_id=notification_id,
+                    context=context,
                 ),
-                repository,
             )
-            repository.update_notification_ui_status(
-                user_id=user_id, notification_id=notification_id, ui_status="read"
+
+            def serialize_response(response: Any, lifecycle_request_id: str) -> dict[str, Any]:
+                # A successful response and its acknowledgement are one logical
+                # lifecycle result.  Perform the acknowledgement before the
+                # executor stores a completed replay payload; ERROR stays unread
+                # and the same key remains retryable.
+                if response.response_type is not ResponseType.ERROR:
+                    repository.update_notification_ui_status(
+                        user_id=user_id,
+                        notification_id=notification_id,
+                        ui_status="read",
+                    )
+                return _response_payload(
+                    response,
+                    request_id=lifecycle_request_id,
+                    latency_ms=int((time.perf_counter() - started_at) * 1000),
+                    include_trace=True,
+                )
+
+            def hydrate_reply_last_qa(_prepared_request: ChatRequest) -> None:
+                # The lifecycle hook runs only after a fresh/failed-retry claim.
+                # Replays and conflicts therefore never rewind Last-QA state.
+                pipeline.last_qa_store.save(user_id, reply_last_qa)
+
+            execution = ChatRequestLifecycleExecutor(
+                pipeline=pipeline,
+                repository=repository,
+            ).execute(
+                request,
+                fallback_request_id=request_id,
+                serialize_response=serialize_response,
+                before_claim=enforce_idempotency_policy,
+                before_pipeline=hydrate_reply_last_qa,
             )
-            return _response_payload(
-                response,
-                request_id=request_id,
-                latency_ms=int((time.perf_counter() - started_at) * 1000),
-                include_trace=True,
-            )
+            return execution.payload
+        except RequestLifecycleConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

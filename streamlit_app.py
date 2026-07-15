@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from hashlib import sha256
 from html import escape
 import json
 import logging
 import mimetypes
 from pathlib import Path
+from typing import Callable
 from uuid import uuid4
 
-from assistant_rag.contracts import ChatRequest
+from assistant_rag.contracts import ChatRequest, ResponseType
 from assistant_rag.llm import LLMTask
 from assistant_rag.platform import GmailSender
 from assistant_rag.observability import new_request_id, start_trace, trace_summary_asdict
@@ -20,6 +22,11 @@ from assistant_rag.reminder_reply import (
 )
 from assistant_rag.production_factory import (
     build_production_runtime,
+)
+from assistant_rag.request_lifecycle import (
+    ChatRequestExecution,
+    ChatRequestLifecycleExecutor,
+    RequestLifecycleConflict,
 )
 from assistant_rag.settings import ProductionSettings
 
@@ -85,6 +92,132 @@ def _render_artifact_downloads(st: object, artifacts: list[dict[str, object]]) -
             mime=mime_type,
             key=f"artifact-download-{artifact.get('artifact_id') or filename}",
         )
+
+
+def _execute_user_request(
+    *,
+    pipeline: object,
+    repository: object,
+    request: ChatRequest,
+    before_pipeline: Callable[[ChatRequest], None] | None = None,
+) -> ChatRequestExecution:
+    """Run the same confirmation/idempotency lifecycle as the HTTP API."""
+
+    request_id = new_request_id(request.idempotency_key)
+    start_trace(request_id)
+    return ChatRequestLifecycleExecutor(
+        pipeline=pipeline,
+        repository=repository,
+    ).execute(
+        request,
+        fallback_request_id=request_id,
+        before_pipeline=before_pipeline,
+    )
+
+
+def _chat_message_from_execution(execution: ChatRequestExecution) -> dict[str, object]:
+    response = execution.response
+    payload = execution.payload
+    if response is not None:
+        platform_payload = response.platform_payload
+        return {
+            "role": "assistant",
+            "content": response.final_chat_text,
+            "artifacts": list(platform_payload.get("artifacts") or []),
+            "pending_confirmations": list(response.actions_pending_confirmation),
+            "response_type": response.response_type.value,
+        }
+    platform_payload = payload.get("platform_payload") or {}
+    return {
+        "role": "assistant",
+        "content": str(payload.get("final_chat_text") or "Request already completed."),
+        "artifacts": list(platform_payload.get("artifacts") or []),
+        "pending_confirmations": list(
+            payload.get("actions_pending_confirmation") or []
+        ),
+        "response_type": str(payload.get("response_type") or "normal"),
+    }
+
+
+def _render_confirmation_controls(
+    st: object,
+    *,
+    message: dict[str, object],
+    pipeline: object,
+    repository: object,
+    user_id: str,
+    gmail_username: str,
+    gmail_app_password: str,
+) -> None:
+    """Render durable, exactly-once confirmation controls for one answer."""
+
+    confirmations = list(message.get("pending_confirmations") or [])
+    if not confirmations:
+        return
+    st.caption("This change is waiting for your confirmation.")
+    for confirmation in confirmations:
+        if not isinstance(confirmation, dict):
+            continue
+        token = str(confirmation.get("confirmation_token") or "").strip()
+        if not token:
+            continue
+        action_type = str(confirmation.get("action_type") or "change")
+        if st.button(
+            f"Confirm {action_type.replace('_', ' ')}",
+            key=f"confirm-action-{token}",
+            type="primary",
+        ):
+            try:
+                execution = _execute_user_request(
+                    pipeline=pipeline,
+                    repository=repository,
+                    request=ChatRequest(
+                        user_id=user_id,
+                        raw_query=str(
+                            message.get("request_query")
+                            or "Confirm the pending action."
+                        ),
+                        confirmation_token=token,
+                        idempotency_key=f"streamlit-confirm:{token}",
+                        platform_context={
+                            "gmail_username": gmail_username,
+                            "gmail_app_password": gmail_app_password,
+                        },
+                    ),
+                )
+            except RequestLifecycleConflict as exc:
+                st.error(f"This change could not be confirmed: {exc}")
+                continue
+            except Exception:
+                logger.exception("streamlit pending confirmation execution failed")
+                st.error(
+                    "The confirmed change could not be completed. It remains pending; "
+                    "please try again."
+                )
+                continue
+
+            confirmed_message = _chat_message_from_execution(execution)
+            confirmation_failed = (
+                confirmed_message.get("response_type") == ResponseType.ERROR.value
+            )
+            if not confirmation_failed:
+                message["pending_confirmations"] = []
+            st.session_state.chat_messages.extend(
+                [
+                    {"role": "user", "content": "Confirm the pending change."},
+                    confirmed_message,
+                ]
+            )
+            if confirmation_failed:
+                st.session_state.confirmation_error_notice = (
+                    "The confirmed change was not completed. It remains pending; "
+                    "please try again."
+                )
+            else:
+                st.session_state.confirmation_notice = (
+                    "The confirmed request was processed exactly once."
+                )
+            st.rerun()
 
 
 def _session_transcript(messages: list[dict[str, str]], *, max_chars: int = 12_000) -> str:
@@ -306,32 +439,63 @@ def _render_reminder_notifications(
                     else:
                         # The hash lookup restores the source hop's user query,
                         # response, and supporting questions before normal routing.
-                        pipeline.last_qa_store.save(user_id, build_reminder_reply_last_qa(context))
-                        start_trace(new_request_id())
-                        response = pipeline.handle(
-                            ChatRequest(
+                        reply_last_qa = build_reminder_reply_last_qa(context)
+                        reply_fingerprint = sha256(
+                            (
+                                f"{notification['notification_id']}\0{reply}"
+                            ).encode("utf-8")
+                        ).hexdigest()
+                        execution = _execute_user_request(
+                            pipeline=pipeline,
+                            repository=repository,
+                            request=ChatRequest(
                                 user_id=user_id,
                                 raw_query=reply,
                                 parent_hop_id=context.get("source_hop_id"),
+                                idempotency_key=(
+                                    f"streamlit-reminder-reply:"
+                                    f"{notification['notification_id']}:"
+                                    f"{reply_fingerprint}"
+                                ),
                                 metadata=reply_metadata,
                                 platform_context={
                                     "gmail_username": st.session_state.get("gmail_username", ""),
                                     "gmail_app_password": st.session_state.get("gmail_app_password", ""),
                                 },
                             ),
-                            repository,
+                            # Hydrate the reminder's source Last-QA only after a
+                            # fresh/failed-retry idempotency claim. Replays and
+                            # conflicts must never rewind the user's latest state.
+                            before_pipeline=lambda _request: pipeline.last_qa_store.save(
+                                user_id,
+                                reply_last_qa,
+                            ),
                         )
+                        response_message = _chat_message_from_execution(execution)
+                        response_message["request_query"] = reply
                         st.session_state.chat_messages.extend([
                             {"role": "user", "content": reply},
-                            {"role": "assistant", "content": response.final_chat_text},
+                            response_message,
                         ])
-                        # A successful reply is an explicit acknowledgement.
-                        repository.update_notification_ui_status(
-                            user_id=user_id,
-                            notification_id=str(notification["notification_id"]),
-                            ui_status="read",
-                        )
-                        st.session_state.reminder_reply_notice = "Your reminder reply was sent through the main chatbot."
+                        if (
+                            response_message.get("response_type")
+                            == ResponseType.ERROR.value
+                        ):
+                            st.session_state.reminder_reply_error_notice = (
+                                "Your reminder reply could not be completed. The notification "
+                                "was left unread so you can retry."
+                            )
+                        else:
+                            # Only a successful pipeline result explicitly acknowledges
+                            # the notification. Error responses must remain retryable.
+                            repository.update_notification_ui_status(
+                                user_id=user_id,
+                                notification_id=str(notification["notification_id"]),
+                                ui_status="read",
+                            )
+                            st.session_state.reminder_reply_notice = (
+                                "Your reminder reply was sent through the main chatbot."
+                            )
                         st.rerun()
             st.divider()
 
@@ -445,12 +609,34 @@ def main() -> None:
     reminder_reply_notice = st.session_state.pop("reminder_reply_notice", None)
     if reminder_reply_notice:
         st.success(reminder_reply_notice)
+    confirmation_notice = st.session_state.pop("confirmation_notice", None)
+    if confirmation_notice:
+        st.success(confirmation_notice)
+    confirmation_error_notice = st.session_state.pop(
+        "confirmation_error_notice", None
+    )
+    if confirmation_error_notice:
+        st.error(confirmation_error_notice)
+    reminder_reply_error_notice = st.session_state.pop(
+        "reminder_reply_error_notice", None
+    )
+    if reminder_reply_error_notice:
+        st.error(reminder_reply_error_notice)
 
     for message in st.session_state.chat_messages:
         with st.chat_message(message["role"]):
             st.write(message["content"])
             if message["role"] == "assistant":
                 _render_artifact_downloads(st, list(message.get("artifacts") or []))
+                _render_confirmation_controls(
+                    st,
+                    message=message,
+                    pipeline=st.session_state.pipeline,
+                    repository=st.session_state.repository,
+                    user_id=user_id,
+                    gmail_username=gmail_username,
+                    gmail_app_password=gmail_app_password,
+                )
 
     query = st.chat_input("Ask the assistant")
     if query:
@@ -461,11 +647,16 @@ def main() -> None:
             with st.spinner("Thinking…"):
                 # Streamlit uses the same production assembly and request
                 # lifecycle as interactive debug; tracing only observes it.
-                start_trace(new_request_id())
-                response = st.session_state.pipeline.handle(
-                    ChatRequest(
+                execution = _execute_user_request(
+                    pipeline=st.session_state.pipeline,
+                    repository=st.session_state.repository,
+                    request=ChatRequest(
                         user_id=user_id,
                         raw_query=query,
+                        idempotency_key=(
+                            f"streamlit-chat:{st.session_state.chat_view_id}:"
+                            f"{uuid4().hex}"
+                        ),
                         # Do not pass the UI-only chat_view_id or its summary.
                         # Every visual chat deliberately shares the same
                         # application-level user/conversation history.
@@ -474,19 +665,30 @@ def main() -> None:
                             "gmail_app_password": gmail_app_password,
                         },
                     ),
-                    st.session_state.repository,
                 )
+                response = execution.response
+                if response is None:
+                    raise RuntimeError(
+                        "New Streamlit request unexpectedly resolved as an idempotent replay"
+                    )
+            response_message = _chat_message_from_execution(execution)
+            response_message["request_query"] = query
+            st.session_state.chat_messages.append(response_message)
             st.write(response.final_chat_text)
             response_artifacts = list(response.platform_payload.get("artifacts") or [])
             _render_artifact_downloads(st, response_artifacts)
+            _render_confirmation_controls(
+                st,
+                message=response_message,
+                pipeline=st.session_state.pipeline,
+                repository=st.session_state.repository,
+                user_id=user_id,
+                gmail_username=gmail_username,
+                gmail_app_password=gmail_app_password,
+            )
             if show_pipeline_trace:
                 with st.expander("Production pipeline trace", expanded=False):
                     st.json(trace_summary_asdict(response.trace_summary) or {})
-        st.session_state.chat_messages.append({
-            "role": "assistant",
-            "content": response.final_chat_text,
-            "artifacts": response_artifacts,
-        })
         logger.info(
             "streamlit_real_pipeline_request_completed",
             extra={"payload": {

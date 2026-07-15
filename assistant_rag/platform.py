@@ -74,6 +74,27 @@ def _message_recipients(payload: dict[str, Any]) -> list[str]:
     return _recipient_emails(payload.get("recipients") or payload.get("recipient"))
 
 
+def _recipient_identifiers(value: Any) -> list[str]:
+    """Return unique, non-empty platform recipient identifiers in order."""
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    recipients: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        recipient = _clean(item)
+        key = recipient.casefold()
+        if recipient and key not in seen:
+            seen.add(key)
+            recipients.append(recipient)
+    return recipients
+
+
+def _channel_message_recipients(channel: str, payload: dict[str, Any]) -> list[str]:
+    """Apply email validation only to Gmail; other channels use opaque IDs."""
+    if channel == "gmail":
+        return _message_recipients(payload)
+    return _recipient_identifiers(payload.get("recipients") or payload.get("recipient"))
+
+
 def _gmail_recipient_candidates(text: str) -> list[str]:
     """Extract addresses only from explicit recipient clauses in the request."""
     recipients: list[str] = []
@@ -581,8 +602,9 @@ class PlatformSelector:
                 extracted = {}
         allowed_gmail_recipients = _gmail_recipient_candidates(text) if channel == "gmail" else []
         allowed_gmail_keys = {item.casefold() for item in allowed_gmail_recipients}
-        recipients = _recipient_emails(extracted.get("recipients"))
-        for recipient in _recipient_emails(extracted.get("recipient")):
+        recipient_parser = _recipient_emails if channel == "gmail" else _recipient_identifiers
+        recipients = recipient_parser(extracted.get("recipients"))
+        for recipient in recipient_parser(extracted.get("recipient")):
             if recipient.casefold() not in {item.casefold() for item in recipients}:
                 recipients.append(recipient)
         if channel == "gmail":
@@ -623,7 +645,7 @@ class PlatformSelector:
 
     @staticmethod
     def _missing_fields(channel: str, message: dict[str, Any], context: dict[str, Any]) -> list[str]:
-        missing = [field for field in ("recipient", "body") if not (_message_recipients(message) if field == "recipient" else _clean(message.get(field)))]
+        missing = [field for field in ("recipient", "body") if not (_channel_message_recipients(channel, message) if field == "recipient" else _clean(message.get(field)))]
         if channel == "gmail":
             if not _message_recipients(message):
                 missing = [item for item in missing if item != "recipient"] + ["at least one valid recipient email address"]
@@ -645,7 +667,7 @@ class PlatformSelector:
         sender = self.senders.get(channel)
         if sender is None:
             raise ValueError(f"No sender is configured for {channel}.")
-        recipients = _message_recipients(message)
+        recipients = _channel_message_recipients(channel, message)
         if channel == "gmail":
             return sender.send(message, context)
 

@@ -447,7 +447,20 @@ class ValidatedActionBuilder:
                 
                 dt = None
                 if action_dict.get("new_reminder_time"):
-                    dt = datetime.fromisoformat(action_dict.get("new_reminder_time"))
+                    try:
+                        replacement_value = action_dict.get("new_reminder_time")
+                        dt = (
+                            replacement_value
+                            if isinstance(replacement_value, datetime)
+                            else datetime.fromisoformat(str(replacement_value))
+                        )
+                    except (TypeError, ValueError):
+                        # An explicitly supplied but malformed replacement time
+                        # is missing usable input, not an orchestration error.
+                        # Keep the mutation in the clarification path so an
+                        # invalid timestamp can never crash or reach storage.
+                        dt = None
+                        res = ActionValidationResult.CLARIFY_MISSING_FIELDS
 
                 observed_status = None
                 observed_version = None

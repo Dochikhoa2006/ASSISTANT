@@ -26,6 +26,9 @@ ALL_ACTION_CASES = (
     *((Intent.KNOWLEDGE_FACTS, keyword, "delete") for keyword in DELETE_ACTION_KEYWORDS),
     *((Intent.KNOWLEDGE_FACTS, keyword, "modify") for keyword in MODIFY_ACTION_KEYWORDS),
     *((Intent.KNOWLEDGE_FACTS, keyword, "add") for keyword in ADD_ACTION_KEYWORDS),
+    *((Intent.REMINDER, keyword, "delete") for keyword in DELETE_ACTION_KEYWORDS),
+    *((Intent.REMINDER, keyword, "modify") for keyword in MODIFY_ACTION_KEYWORDS),
+    *((Intent.REMINDER, keyword, "add") for keyword in ADD_ACTION_KEYWORDS),
     *((Intent.REMINDER, keyword, "turn_on") for keyword in TURN_ON_ACTION_KEYWORDS),
     *((Intent.REMINDER, keyword, "turn_off") for keyword in TURN_OFF_ACTION_KEYWORDS),
 )

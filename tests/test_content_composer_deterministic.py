@@ -6,6 +6,12 @@ from types import SimpleNamespace
 import pytest
 
 from assistant_rag.config import GeneralPurposeConfig
+from assistant_rag.content_keywords import (
+    DOCUMENT_FILE_KEYWORDS,
+    EXCEL_FILE_KEYWORDS,
+    FILE_CREATION_VERB_KEYWORDS,
+    POWERPOINT_FILE_KEYWORDS,
+)
 from assistant_rag.content_composer import (
     AnswerGenerationTool,
     ContentToolRegistry,
@@ -100,6 +106,67 @@ def _compose(raw_query: str, rewritten_query: str | None = None):
     composer, tools, config = _composer()
     result = composer.compose(_input(raw_query, rewritten_query), config)
     return result, tools
+
+
+@pytest.mark.parametrize("verb_keyword", FILE_CREATION_VERB_KEYWORDS)
+@pytest.mark.parametrize(
+    ("file_keyword", "target_file_type", "expected_tool"),
+    (
+        (".pdf", "document", "generate_pdf"),
+        (".xlsx", "excel", "generate_excel"),
+        (".pptx", "powerpoint", "generate_pptx"),
+    ),
+)
+def test_every_configured_verb_keyword_requires_and_selects_one_explicit_file_type(
+    verb_keyword: str,
+    file_keyword: str,
+    target_file_type: str,
+    expected_tool: str,
+) -> None:
+    decision = classify_file_creation_request(
+        f"Please {verb_keyword} the result as a {file_keyword} file.",
+        GeneralPurposeConfig(),
+    )
+
+    assert verb_keyword in decision.matched_verb_keywords
+    # A few supplied verbs (for example ``chart`` and ``document``) are also
+    # explicit file-type keywords. Their one occurrence must keep both roles;
+    # when it conflicts with the stated extension, fail closed as ambiguous.
+    verb_file_types = {
+        *(("document",) if verb_keyword in DOCUMENT_FILE_KEYWORDS else ()),
+        *(("excel",) if verb_keyword in EXCEL_FILE_KEYWORDS else ()),
+        *(("powerpoint",) if verb_keyword in POWERPOINT_FILE_KEYWORDS else ()),
+    }
+    explicit_file_types = verb_file_types | {target_file_type}
+    if len(explicit_file_types) == 1:
+        assert decision.selected_tool_name == expected_tool
+        assert decision.matched_file_types == (target_file_type,)
+    else:
+        assert decision.selected_tool_name is None
+        assert set(decision.matched_file_types) == explicit_file_types
+        assert decision.reason_summary == "ambiguous_file_types"
+
+
+@pytest.mark.parametrize(
+    ("file_keyword", "expected_tool"),
+    (
+        *((keyword, "generate_pdf") for keyword in DOCUMENT_FILE_KEYWORDS),
+        *((keyword, "generate_excel") for keyword in EXCEL_FILE_KEYWORDS),
+        *((keyword, "generate_pptx") for keyword in POWERPOINT_FILE_KEYWORDS),
+    ),
+)
+def test_every_configured_file_keyword_with_an_explicit_verb_selects_exactly_one_tool(
+    file_keyword: str,
+    expected_tool: str,
+) -> None:
+    decision = classify_file_creation_request(
+        f"Create the requested {file_keyword}.",
+        GeneralPurposeConfig(),
+    )
+
+    assert file_keyword in decision.matched_file_keywords
+    assert decision.selected_tool_name == expected_tool
+    assert len(decision.matched_file_types) == 1
 
 
 @pytest.mark.parametrize(

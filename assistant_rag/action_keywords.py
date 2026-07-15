@@ -31,10 +31,11 @@ MODIFY_ACTION_KEYWORDS: tuple[str, ...] = (
 
 
 ADD_ACTION_KEYWORDS: tuple[str, ...] = (
-    "add", "create", "insert", "save", "store", "record", "remember",
-    "remember that", "keep", "retain", "register", "include", "append",
-    "attach", "enter", "log", "capture", "note", "note that", "write down",
+    "add", "create", "insert", "save", "store", "remember", "remember that", "keep",
+    "retain", "register", "include", "append", "attach", "enter", "log",
+    "capture", "note that", "write down",
     "put in", "put into", "add to", "save to", "store in", "record in",
+    "record that",
     "create a new", "add a new", "insert a new", "set a reminder",
     "create a reminder", "add a reminder", "schedule a reminder", "schedule",
     "remind me", "remember this", "save this", "store this", "record this",
