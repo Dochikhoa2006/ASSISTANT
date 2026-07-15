@@ -7,6 +7,7 @@ from email.message import EmailMessage
 from pathlib import Path
 import imaplib
 import json
+import logging
 import re
 import smtplib
 import time
@@ -17,12 +18,27 @@ from .contracts import BundledResponse, ChatRequest
 from .llm import LLMClient, LLMTask
 
 
+logger = logging.getLogger(__name__)
+
+
 _CHANNELS = ("gmail", "zalo", "telegram")
-_EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w.+-])")
+# A terminal period is ordinary sentence punctuation, not part of an address.
+# Do not reject otherwise-valid recipients written at the end of a sentence.
+_EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w+-])")
 _SEND_WORDS = re.compile(r"\b(send|deliver|email|mail|message|nhắn|gửi)\b", re.I)
 _DIRECT_SEND_WORDS = re.compile(r"\b(send|deliver|gửi)\b", re.I)
 _DO_NOT_SEND = re.compile(r"\b(?:do\s+not|don't|not\s+to|without)\s+(?:send|deliver|gửi)\b", re.I)
 _DRAFT_WORDS = re.compile(r"\b(compose|draft|write|prepare|soạn)\b", re.I)
+_EMAIL_MESSAGE_WORDS = re.compile(r"\b(?:email|mail|message)\b", re.I)
+_DIRECT_EMAIL_VERB = re.compile(r"\b(?:email|mail)\s+(?:to\s+)?[\w.+-]+@", re.I)
+_FILE_DELIVERY_WORDS = re.compile(r"\b(?:file|attachment|document|excel|spreadsheet|workbook|pdf|powerpoint|presentation|pptx)\b", re.I)
+_SUBJECT_LINE = re.compile(r"^\s*subject\s*:\s*(.+?)\s*$", re.I | re.M)
+_EMAIL_SALUTATION = re.compile(r"^\s*(?:dear|hello|hi)\b", re.I | re.M)
+_SAVE_GMAIL_DRAFT = re.compile(
+    r"\b(?:save|store|create|add|put)\b[\s\w'-]{0,48}\b(?:gmail(?:'s)?\s+)?drafts?\b"
+    r"|\b(?:gmail(?:'s)?\s+)?drafts?\b[\s\w'-]{0,32}\b(?:save|store|create|add|put)\b",
+    re.I,
+)
 
 
 class PlatformFormatter(Protocol):
@@ -82,6 +98,59 @@ def _gmail_recipient_candidates(text: str) -> list[str]:
     return []
 
 
+def _is_explicit_email_message_request(text: str) -> bool:
+    """Recognize a request to prepare or send an email with stated recipients.
+
+    This deliberately requires both a real email address and message-writing
+    language. It does not route ordinary questions that merely mention an
+    address, and it never decides whether a message may be sent.
+    """
+    has_message_action = bool(
+        (_DRAFT_WORDS.search(text) or _DIRECT_SEND_WORDS.search(text))
+        and _EMAIL_MESSAGE_WORDS.search(text)
+    )
+    has_file_delivery_action = bool(_DIRECT_SEND_WORDS.search(text) and _FILE_DELIVERY_WORDS.search(text))
+    return bool(
+        _recipient_emails(text)
+        and (has_message_action or has_file_delivery_action or _DIRECT_EMAIL_VERB.search(text))
+    )
+
+
+def _requests_gmail_draft_save(text: str) -> bool:
+    """Return whether the user explicitly authorized saving to Gmail Drafts.
+
+    Writing or drafting an email is local preparation. Persisting it to a
+    provider mailbox is a separate external action and must be requested
+    directly, even when Gmail credentials are available in the UI.
+    """
+    return bool(_SAVE_GMAIL_DRAFT.search(text))
+
+
+def _subject_from_bundled_response(text: str) -> str:
+    match = _SUBJECT_LINE.search(text or "")
+    return _clean(match.group(1)) if match else ""
+
+
+def _body_from_bundled_response(text: str) -> str:
+    """Prefer the drafted message portion when the answer contains one."""
+    response = _clean(text)
+    salutation = _EMAIL_SALUTATION.search(response)
+    if salutation:
+        return response[salutation.start():].strip()
+    return response
+
+
+def _safe_imap_failure_reason(exc: Exception) -> str:
+    """Describe an IMAP failure without exposing provider responses or secrets."""
+    if isinstance(exc, imaplib.IMAP4.error):
+        return "Gmail rejected the IMAP sign-in or draft-mailbox request"
+    if isinstance(exc, RuntimeError):
+        return "Gmail rejected the draft-mailbox operation"
+    if isinstance(exc, (TimeoutError, OSError)):
+        return "the Gmail IMAP service could not be reached"
+    return "the Gmail IMAP draft service returned an unexpected error"
+
+
 def _public_artifacts(payload: dict[str, Any]) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     for item in payload.get("artifacts", []) or []:
@@ -110,7 +179,13 @@ class GmailSender:
     draft_mailbox: str = "[Gmail]/Drafts"
     timeout_seconds: float = 20.0
 
-    def validate_credentials(self, username: str, app_password: str) -> tuple[bool, str]:
+    def validate_smtp_credentials(self, username: str, app_password: str) -> tuple[bool, str]:
+        """Verify the credentials needed to send Gmail messages.
+
+        This intentionally does not contact IMAP. Sending and saving a remote
+        Gmail draft are distinct operations, and the UI's normal credential
+        check should stay fast and side-effect free.
+        """
         username = _clean(username)
         app_password = "".join(_clean(app_password).split())
         if not username or not app_password:
@@ -118,9 +193,40 @@ class GmailSender:
         try:
             with smtplib.SMTP_SSL(self.host, self.port, timeout=self.timeout_seconds) as client:
                 client.login(username, app_password)
-            return True, "Gmail credentials are valid."
         except Exception as exc:
-            return False, f"Gmail sign-in failed: {exc}"
+            logger.warning("Gmail SMTP credential validation failed: %s", type(exc).__name__)
+            return False, "Gmail SMTP sign-in failed. Verify the Gmail username and app password."
+        return True, "Gmail sending credentials are valid."
+
+    def validate_credentials(self, username: str, app_password: str) -> tuple[bool, str]:
+        """Verify both SMTP sending and optional IMAP Gmail-draft access."""
+        valid, message = self.validate_smtp_credentials(username, app_password)
+        if not valid:
+            return False, message
+        username = _clean(username)
+        app_password = "".join(_clean(app_password).split())
+
+        client: Any | None = None
+        try:
+            client = imaplib.IMAP4_SSL(
+                self.imap_host,
+                self.imap_port,
+                timeout=self.timeout_seconds,
+            )
+            client.login(username, app_password)
+            status, _ = client.list()
+            if _clean(status).upper() != "OK":
+                raise RuntimeError("Gmail did not allow draft mailbox listing.")
+        except Exception as exc:
+            logger.warning("Gmail IMAP credential validation failed: %s", type(exc).__name__)
+            return False, f"Gmail IMAP draft access failed: {_safe_imap_failure_reason(exc)}."
+        finally:
+            if client is not None:
+                try:
+                    client.logout()
+                except Exception:
+                    pass
+        return True, "Gmail SMTP and IMAP draft access are valid."
 
     def send(self, payload: dict[str, Any], platform_context: dict[str, Any]) -> dict[str, Any]:
         username = _clean(platform_context.get("gmail_username"))
@@ -161,12 +267,13 @@ class GmailSender:
         if not recipients:
             raise ValueError("At least one valid Gmail recipient is required before saving a draft.")
         message = self._email_message(payload, username, recipients)
-        client = imaplib.IMAP4_SSL(
-            self.imap_host,
-            self.imap_port,
-            timeout=self.timeout_seconds,
-        )
+        client: Any | None = None
         try:
+            client = imaplib.IMAP4_SSL(
+                self.imap_host,
+                self.imap_port,
+                timeout=self.timeout_seconds,
+            )
             client.login(username, app_password)
             mailbox = self._resolve_draft_mailbox(client)
             status, _ = client.append(
@@ -178,10 +285,11 @@ class GmailSender:
             if _clean(status).upper() != "OK":
                 raise RuntimeError("Gmail rejected the draft append operation.")
         finally:
-            try:
-                client.logout()
-            except Exception:
-                pass
+            if client is not None:
+                try:
+                    client.logout()
+                except Exception:
+                    pass
         return {
             "status": "draft_saved",
             "provider": "gmail",
@@ -264,9 +372,10 @@ class ZaloSender:
 class PlatformSelector:
     """Choose a platform and prepare delivery state.
 
-    ``delivery_requested`` is intentionally not read here.  It was a legacy
-    keyword/flag activation gate and made the selector conditional.  The model
-    below is now the single decision point on every completed assistant turn.
+    Explicit email-message requests with literal email recipients always enter
+    the Gmail preparation flow. All other channel selection is model-driven.
+    A local draft is the default; saving to Gmail Drafts or sending both require
+    an explicit external-action request.
     """
 
     llm: LLMClient | None = None
@@ -307,18 +416,25 @@ class PlatformSelector:
                 _clean(context.get("gmail_username"))
                 and _clean(context.get("gmail_app_password"))
             )
-            if channel == "gmail" and callable(creator) and has_credentials:
+            if (
+                channel == "gmail"
+                and _requests_gmail_draft_save(request.raw_query)
+                and callable(creator)
+                and has_credentials
+            ):
                 try:
                     draft_dispatch = creator(message, context)
-                except Exception:
+                except Exception as exc:
+                    logger.warning("Gmail draft save failed: %s", type(exc).__name__)
                     return self._delivery_result(
                         base,
                         channel=channel,
                         status="failed",
                         message=message,
                         question=(
-                            "The Gmail draft could not be saved. Check the Gmail credentials "
-                            "and account IMAP access, then try again."
+                            "The Gmail draft could not be saved because "
+                            f"{_safe_imap_failure_reason(exc)}. Check the Gmail app password "
+                            "and IMAP access, then try again."
                         ),
                     )
                 return self._delivery_result(
@@ -379,7 +495,13 @@ class PlatformSelector:
         )
 
     def _choose_channel(self, response: BundledResponse, request: ChatRequest) -> dict[str, Any]:
-        """Run the selector LLM for every query; never infer from keywords."""
+        """Choose Gmail deterministically for explicit email messages, else use the LLM."""
+        if _is_explicit_email_message_request(request.raw_query):
+            return {
+                "channel": "gmail",
+                "confidence": 1.0,
+                "source": "deterministic_explicit_email_request",
+            }
         if self.llm is None:
             return {"channel": "none", "confidence": 0.0, "source": "safe_fallback_no_llm"}
         schema = {
@@ -455,11 +577,16 @@ class PlatformSelector:
         # The bundled answer is the canonical body unless a platform-specific
         # extractor safely supplied a body. This makes artifact/general answers
         # usable by all delivery platforms without a second answer generator.
-        body = _clean(extracted.get("body")) or response.final_chat_text
+        body = _clean(extracted.get("body")) or _body_from_bundled_response(response.final_chat_text)
         subject = _clean(extracted.get("subject"))
         if not subject:
             subject_match = re.search(r"\bsubject\s*[:=-]\s*([^\n.;]+)", text, re.I)
             subject = subject_match.group(1).strip(" '\"") if subject_match else ""
+        if not subject:
+            subject = _subject_from_bundled_response(response.final_chat_text)
+        attachments = _public_artifacts(base) if re.search(r"\b(attach|attachment|file|document|đính kèm)\b", text, re.I) else []
+        if not subject and attachments:
+            subject = "Requested file"
         mode = _clean(extracted.get("mode"))
         if _DO_NOT_SEND.search(text):
             mode = "draft"
@@ -469,7 +596,6 @@ class PlatformSelector:
             mode = "draft"
         elif mode not in {"send", "draft"}:
             mode = "send" if _SEND_WORDS.search(text) and not _DRAFT_WORDS.search(text) else "draft"
-        attachments = _public_artifacts(base) if re.search(r"\b(attach|attachment|file|document|đính kèm)\b", text, re.I) else []
         return {
             "channel": channel,
             "recipient": ", ".join(recipients),

@@ -10,6 +10,7 @@ import json
 import logging
 import smtplib
 import sys
+import zipfile
 from typing import Any, Callable
 from types import SimpleNamespace
 from pathlib import Path
@@ -32,7 +33,12 @@ from assistant_rag.classification import LLMLastQAResolver, LastQAResolver, Quer
 from assistant_rag.config import GeneralPurposeConfig
 from assistant_rag.context_filter import HardRuleContextFilter, TwoLayerContextFilter
 from assistant_rag.retrieval_policy import RETRIEVAL_PIPELINE_POLICY
-from assistant_rag.content_composer import AnswerGenerationTool, ContentToolRegistry, ReActContentComposer
+from assistant_rag.content_composer import (
+    AnswerGenerationTool,
+    ContentToolRegistry,
+    GenerateExcelTool,
+    ReActContentComposer,
+)
 from assistant_rag.contracts import (
     BundledResponse,
     ChatRequest,
@@ -1034,6 +1040,91 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
     if "app-password-for-test" in debug_output:
         raise AssertionError("Gmail app password leaked through debug_pipeline output")
 
+    # A literal-recipient email-writing request must enter Gmail preparation
+    # even if no platform model is available or it would have selected none.
+    # This is still draft-only: a write request cannot authorize SMTP sending.
+    day_off_response = BundledResponse(
+        final_chat_text=(
+            "To inform the recipients about your day off, use this email:\n\n"
+            "Subject: Day Off Notification\n\n"
+            "Dear Vaiojjr and Koffdo,\n\n"
+            "I will be unavailable tomorrow because I am taking a day off.\n\n"
+            "Best regards,\n[Your Name]"
+        ),
+        response_type=ResponseType.NORMAL,
+        last_qa_state=LastQAState(
+            last_user_query="",
+            last_response="",
+            response_type=ResponseType.NORMAL,
+        ),
+    )
+    exact_request = "Write an email to inform a day-off to vaiojjr@gmail.com and koffdo75@gmail.com."
+    deterministic_draft = PlatformSelector(llm=None).select(
+        day_off_response,
+        ChatRequest(user_id="platform-test", raw_query=exact_request),
+    )
+    if deterministic_draft["platform_selection"] != {
+        "channel": "gmail",
+        "confidence": 1.0,
+        "source": "deterministic_explicit_email_request",
+    }:
+        raise AssertionError(f"explicit email request did not select Gmail: {deterministic_draft!r}")
+    if deterministic_draft["delivery"]["status"] != "draft_ready":
+        raise AssertionError(f"email-writing request did not produce a draft: {deterministic_draft!r}")
+    if deterministic_draft["draft"]["recipients"] != ["vaiojjr@gmail.com", "koffdo75@gmail.com"]:
+        raise AssertionError("explicit email request lost one or more recipients")
+    if deterministic_draft["draft"]["subject"] != "Day Off Notification":
+        raise AssertionError("email subject was not recovered from the bundled draft")
+    if not deterministic_draft["draft"]["body"].startswith("Dear Vaiojjr and Koffdo,"):
+        raise AssertionError("email body included explanatory text instead of the drafted message")
+
+    class ExplodingDraftGmailSender(GmailSender):
+        def create_draft(self, _payload: dict[str, Any], _platform_context: dict[str, Any]) -> dict[str, Any]:
+            raise AssertionError("a write-email request must not save a remote Gmail draft")
+
+    local_draft_with_credentials = PlatformSelector(
+        llm=None,
+        senders={"gmail": ExplodingDraftGmailSender()},
+    ).select(
+        day_off_response,
+        ChatRequest(
+            user_id="platform-test",
+            raw_query=exact_request,
+            platform_context={
+                "gmail_username": "sender@example.com",
+                "gmail_app_password": "app-password-for-test",
+            },
+        ),
+    )
+    if local_draft_with_credentials["delivery"]["status"] != "draft_ready":
+        raise AssertionError("writing an email with saved credentials unexpectedly attempted Gmail IMAP")
+    ordinary_address_question = PlatformSelector(llm=None).select(
+        day_off_response,
+        ChatRequest(
+            user_id="platform-test",
+            raw_query="Is vaiojjr@gmail.com an email address I should use?",
+        ),
+    )
+    if ordinary_address_question["delivery"]["channel"] != "none":
+        raise AssertionError("an ordinary email-address question incorrectly entered Gmail delivery")
+
+    state = build_scenario_state(settings)
+    state.pipeline.platform_selector = PlatformSelector(llm=None)
+    deterministic_pipeline_response = run_request(
+        state,
+        exact_request,
+        metadata={
+            "intent": Intent.GENERAL_RESPONSE.value,
+            "normal_response_text": day_off_response.final_chat_text,
+        },
+    )
+    if deterministic_pipeline_response.platform_payload["delivery"]["status"] != "draft_ready":
+        raise AssertionError("full pipeline did not preserve the deterministic Gmail draft")
+    if not deterministic_pipeline_response.final_chat_text.startswith("Gmail draft is ready for review"):
+        raise AssertionError(f"full pipeline did not surface Gmail draft status: {deterministic_pipeline_response.final_chat_text!r}")
+    if "It has not been sent." not in deterministic_pipeline_response.final_chat_text:
+        raise AssertionError("local Gmail drafts did not clearly state that no email was sent")
+
     # Even a bad extractor response cannot turn an explicit do-not-send request
     # into an SMTP side effect; raw user intent remains authoritative.
     original_imap_ssl = imaplib.IMAP4_SSL
@@ -1044,7 +1135,7 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
             bundled,
             ChatRequest(
                 user_id="platform-test",
-                raw_query="Draft a Gmail update to alice@example.com and bob@example.com; do not send.",
+                raw_query="Save a Gmail draft update to alice@example.com and bob@example.com; do not send.",
                 platform_context={
                     "gmail_username": "sender@example.com",
                     "gmail_app_password": "app-password-for-test",
@@ -1067,6 +1158,98 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
     if b"alice@example.com, bob@example.com" not in draft_bytes:
         raise AssertionError("saved Gmail draft did not include every extracted recipient")
 
+    # The Streamlit credential check must verify the IMAP path used by draft
+    # creation, not merely the SMTP path used for sends.
+    try:
+        smtplib.SMTP_SSL = FakeSMTP  # type: ignore[assignment]
+        imaplib.IMAP4_SSL = FakeIMAP  # type: ignore[assignment]
+        valid_credentials, validation_message = GmailSender().validate_credentials(
+            "sender@example.com", "app-password-for-test"
+        )
+        smtp_valid, smtp_validation_message = GmailSender().validate_smtp_credentials(
+            "sender@example.com", "app-password-for-test"
+        )
+    finally:
+        smtplib.SMTP_SSL = original_smtp_ssl  # type: ignore[assignment]
+        imaplib.IMAP4_SSL = original_imap_ssl  # type: ignore[assignment]
+    if not valid_credentials or validation_message != "Gmail SMTP and IMAP draft access are valid.":
+        raise AssertionError(f"credential validation did not verify both Gmail protocols: {validation_message!r}")
+
+    if not smtp_valid or smtp_validation_message != "Gmail sending credentials are valid.":
+        raise AssertionError(f"SMTP-only credential validation was not available: {smtp_validation_message!r}")
+
+    class RejectingIMAP(FakeIMAP):
+        def login(self, username: str, password: str) -> tuple[str, list[bytes]]:
+            super().login(username, password)
+            raise imaplib.IMAP4.error("AUTHENTICATIONFAILED")
+
+    try:
+        smtplib.SMTP_SSL = FakeSMTP  # type: ignore[assignment]
+        imaplib.IMAP4_SSL = RejectingIMAP  # type: ignore[assignment]
+        valid_credentials, validation_message = GmailSender().validate_credentials(
+            "sender@example.com", "app-password-for-test"
+        )
+        failed_draft = PlatformSelector(
+            llm=ScriptedPlatformLLM("send"), senders={"gmail": GmailSender()}
+        ).select(
+            bundled,
+            ChatRequest(
+                user_id="platform-test",
+                raw_query="Save a Gmail draft update to alice@example.com and bob@example.com; do not send.",
+                platform_context={
+                    "gmail_username": "sender@example.com",
+                    "gmail_app_password": "app-password-for-test",
+                },
+            ),
+        )
+    finally:
+        smtplib.SMTP_SSL = original_smtp_ssl  # type: ignore[assignment]
+        imaplib.IMAP4_SSL = original_imap_ssl  # type: ignore[assignment]
+    if valid_credentials or "Gmail IMAP draft access failed" not in validation_message:
+        raise AssertionError(f"IMAP validation failure was not surfaced safely: {validation_message!r}")
+    failure_question = failed_draft["delivery"].get("question", "")
+    if failed_draft["delivery"]["status"] != "failed" or "Gmail rejected the IMAP sign-in" not in failure_question:
+        raise AssertionError(f"draft failure hid the actionable IMAP reason: {failed_draft!r}")
+
+    # A generated artifact must be visible to Gmail extraction and travel as a
+    # MIME attachment when the user explicitly asks to send that file.
+    attachment_bundled = replace(
+        bundled,
+        platform_payload={
+            "artifacts": [{
+                "artifact_id": "platform-test-artifact",
+                "filename": "generated_notes.txt",
+                "storage_path": str(Path(__file__)),
+            }],
+        },
+    )
+    try:
+        smtplib.SMTP_SSL = FakeSMTP  # type: ignore[assignment]
+        attached_delivery = PlatformSelector(
+            llm=ScriptedPlatformLLM("send"), senders={"gmail": GmailSender()}
+        ).select(
+            attachment_bundled,
+            ChatRequest(
+                user_id="platform-test",
+                raw_query="Send the generated file to alice@example.com.",
+                platform_context={
+                    "gmail_username": "sender@example.com",
+                    "gmail_app_password": "app-password-for-test",
+                },
+            ),
+        )
+    finally:
+        smtplib.SMTP_SSL = original_smtp_ssl  # type: ignore[assignment]
+    if attached_delivery["delivery"]["status"] != "sent":
+        raise AssertionError(f"explicit file delivery did not reach Gmail: {attached_delivery!r}")
+    attachment_message = FakeSMTP.instances[-1].message
+    if not str(attachment_message["Subject"]) or not list(attachment_message.iter_attachments()):
+        raise AssertionError(
+            "generated artifact was not attached to the Gmail message: "
+            f"{attached_delivery!r}; attachment_count={len(list(attachment_message.iter_attachments()))}"
+        )
+
+    smtp_connections_before_missing_credentials = len(FakeSMTP.instances)
     missing_credentials_selector = PlatformSelector(
         llm=ScriptedPlatformLLM("send"),
         senders={"gmail": GmailSender()},
@@ -1080,7 +1263,7 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
     )
     if missing_credentials["delivery"]["status"] != "needs_input":
         raise AssertionError("Gmail send without credentials was not safely blocked")
-    if len(FakeSMTP.instances) != 2:
+    if len(FakeSMTP.instances) != smtp_connections_before_missing_credentials:
         raise AssertionError("missing Gmail credentials unexpectedly invoked SMTP sending")
     return ScenarioResult(
         "platform_gmail_multi_recipient_delivery",
@@ -2187,37 +2370,63 @@ def scenario_content_composer_general_react(settings: ProductionSettings) -> Sce
         SubBranchPromptContext,
     )
 
-    result = composer.compose(
-        ContentComposerInput(
-            user_id=state.user_id,
-            raw_user_query="I want to learn Python from zero.",
-            rewritten_query="I want to learn Python from zero.",
+    composer_input = ContentComposerInput(
+        user_id=state.user_id,
+        raw_user_query="I want to learn Python from zero.",
+        rewritten_query="I want to learn Python from zero.",
+        sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
+        persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
+        approved_conversation_history=[],
+        human_supporting_questions=[],
+        reminder_supporting_questions=[],
+        extracted_expected_response_types=[],
+        approved_knowledge_evidence=[],
+        approved_reminder_context=[],
+        metadata={},
+        platform_context={},
+        sub_branch_prompt_context=SubBranchPromptContext(
             sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
             persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
-            approved_conversation_history=[],
-            human_supporting_questions=[],
-            reminder_supporting_questions=[],
-            extracted_expected_response_types=[],
-            approved_knowledge_evidence=[],
-            approved_reminder_context=[],
-            metadata={},
-            platform_context={},
-            sub_branch_prompt_context=SubBranchPromptContext(
-                sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
-                persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
-                chat_history_role="new conversation",
-                response_goal="answer directly",
-                database_update_mode="create",
-                allowed_database_updates=("conversation_hop_append",),
-                prohibited_database_updates=("knowledge_mutation",),
-            ),
-            sub_branch_supporting_prompt="Answer directly.",
+            chat_history_role="new conversation",
+            response_goal="answer directly",
+            database_update_mode="create",
+            allowed_database_updates=("conversation_hop_append",),
+            prohibited_database_updates=("knowledge_mutation",),
+        ),
+        sub_branch_supporting_prompt="Answer directly.",
+    )
+    result = composer.compose(composer_input, config)
+    if not result.final_response_text:
+        raise AssertionError("content composer returned an empty answer")
+
+    artifact_registry = ContentToolRegistry(
+        tools=[
+            AnswerGenerationTool(llm=llm, prompt_registry=DEFAULT_PROMPT_REGISTRY),
+            GenerateExcelTool(llm=llm, prompt_registry=DEFAULT_PROMPT_REGISTRY, config=config),
+        ],
+        config=config,
+    )
+    artifact_composer = ReActContentComposer(
+        registry=artifact_registry,
+        llm=llm,
+        prompt_registry=DEFAULT_PROMPT_REGISTRY,
+        config=config,
+    )
+    artifact_result = artifact_composer.compose(
+        replace(
+            composer_input,
+            raw_user_query="Give me an Excel file to track project tasks.",
+            rewritten_query="Give me an Excel file to track project tasks.",
+            repository=state.repository,
         ),
         config,
     )
-    if not result.final_response_text:
-        raise AssertionError("content composer returned an empty answer")
-    return ScenarioResult("content_composer_general_react", True, "composer handled flattened approved conversation context")
+    if artifact_result.used_tool_names != ("generate_excel",) or len(artifact_result.artifacts) != 1:
+        raise AssertionError(f"explicit Excel request did not create an artifact: {artifact_result!r}")
+    artifact_path = Path(str(artifact_result.artifacts[0].get("storage_path") or ""))
+    if not artifact_path.is_file() or not zipfile.is_zipfile(artifact_path):
+        raise AssertionError("generated Excel artifact was not a downloadable workbook")
+    return ScenarioResult("content_composer_general_react", True, "composer creates downloadable files for explicit artifact requests")
 
 
 def scenario_general_broad_retrieval_approved(settings: ProductionSettings) -> ScenarioResult:

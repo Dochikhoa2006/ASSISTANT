@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from html import escape
 import json
 import logging
+import mimetypes
+from pathlib import Path
 from uuid import uuid4
 
 from assistant_rag.contracts import ChatRequest
@@ -34,6 +36,55 @@ def _initialise_chat_state(st: object) -> None:
         session_state.chat_session_summaries = []
     if "chat_view_id" not in session_state:
         session_state.chat_view_id = uuid4().hex
+
+
+def _render_gmail_credential_check(st: object) -> None:
+    """Render a fragment so credential checks do not rerun the full app."""
+    @st.fragment
+    def credential_check() -> None:
+        if st.button(
+            "Check Gmail credentials",
+            help="Checks Gmail sending access only; it does not send mail or save a draft.",
+            key="check_gmail_credentials",
+        ):
+            valid, message = GmailSender().validate_smtp_credentials(
+                st.session_state.get("gmail_username", ""),
+                st.session_state.get("gmail_app_password", ""),
+            )
+            st.session_state.gmail_credential_check_result = {"valid": valid, "message": message}
+        result = st.session_state.get("gmail_credential_check_result")
+        if result:
+            (st.success if result["valid"] else st.error)(result["message"])
+
+    credential_check()
+
+
+def _clear_gmail_credential_check_result(st: object) -> None:
+    st.session_state.pop("gmail_credential_check_result", None)
+
+
+def _render_artifact_downloads(st: object, artifacts: list[dict[str, object]]) -> None:
+    """Offer generated files directly in Streamlit without exposing file paths."""
+    downloadable = [
+        artifact for artifact in artifacts
+        if isinstance(artifact, dict)
+        and str(artifact.get("filename") or "").strip()
+        and Path(str(artifact.get("storage_path") or "")).is_file()
+    ]
+    if not downloadable:
+        return
+    st.caption("Generated files")
+    for artifact in downloadable:
+        path = Path(str(artifact["storage_path"]))
+        filename = str(artifact["filename"])
+        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        st.download_button(
+            label=f"Download {filename}",
+            data=path.read_bytes(),
+            file_name=filename,
+            mime=mime_type,
+            key=f"artifact-download-{artifact.get('artifact_id') or filename}",
+        )
 
 
 def _session_transcript(messages: list[dict[str, str]], *, max_chars: int = 12_000) -> str:
@@ -340,16 +391,27 @@ def main() -> None:
 
         st.divider()
         st.subheader("Gmail & Debug")
-        gmail_username = st.text_input("Gmail username", value="", key="gmail_username")
-        gmail_app_password = st.text_input("Gmail app password", value="", type="password", key="gmail_app_password")
+        gmail_username = st.text_input(
+            "Gmail username",
+            value="",
+            key="gmail_username",
+            on_change=_clear_gmail_credential_check_result,
+            args=(st,),
+        )
+        gmail_app_password = st.text_input(
+            "Gmail app password",
+            value="",
+            type="password",
+            key="gmail_app_password",
+            on_change=_clear_gmail_credential_check_result,
+            args=(st,),
+        )
         show_pipeline_trace = st.checkbox(
             "Show real pipeline trace",
             value=False,
             help="Show the exact production stages and latency for this request.",
         )
-        if st.button("Check Gmail credentials"):
-            valid, message = GmailSender().validate_credentials(gmail_username, gmail_app_password)
-            (st.success if valid else st.error)(message)
+        _render_gmail_credential_check(st)
 
         st.divider()
         if st.button("New chat", type="primary", help="Summarize and clear this visible chat. Your database conversation history is unchanged."):
@@ -387,6 +449,8 @@ def main() -> None:
     for message in st.session_state.chat_messages:
         with st.chat_message(message["role"]):
             st.write(message["content"])
+            if message["role"] == "assistant":
+                _render_artifact_downloads(st, list(message.get("artifacts") or []))
 
     query = st.chat_input("Ask the assistant")
     if query:
@@ -413,10 +477,16 @@ def main() -> None:
                     st.session_state.repository,
                 )
             st.write(response.final_chat_text)
+            response_artifacts = list(response.platform_payload.get("artifacts") or [])
+            _render_artifact_downloads(st, response_artifacts)
             if show_pipeline_trace:
                 with st.expander("Production pipeline trace", expanded=False):
                     st.json(trace_summary_asdict(response.trace_summary) or {})
-        st.session_state.chat_messages.append({"role": "assistant", "content": response.final_chat_text})
+        st.session_state.chat_messages.append({
+            "role": "assistant",
+            "content": response.final_chat_text,
+            "artifacts": response_artifacts,
+        })
         logger.info(
             "streamlit_real_pipeline_request_completed",
             extra={"payload": {

@@ -159,7 +159,8 @@ class AssistantPipeline:
             elif delivery.get("status") == "draft_ready":
                 final_chat_text = (
                     f"{delivery.get('channel', 'Message').title()} draft is ready for review "
-                    f"for {delivery.get('recipient', 'the recipient')}."
+                    f"for {delivery.get('recipient', 'the recipient')}. It has not been sent. "
+                    "To deliver it, explicitly ask to send the email."
                 )
             elif delivery.get("status") == "draft_saved":
                 final_chat_text = (

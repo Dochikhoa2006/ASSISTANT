@@ -57,8 +57,8 @@ class RedisRateLimiter:
                 retry_after = max(1, int((window_ms - (now_ms - int(oldest[0][1]))) / 1000))
             return RateLimitResult(allowed=False, retry_after_seconds=retry_after)
         return RateLimitResult(allowed=True)
-
-
+    
+    
 def build_rate_limiter() -> RateLimiter:
     redis_url = os.getenv("ASSISTANT_REDIS_URL")
     if redis_url:

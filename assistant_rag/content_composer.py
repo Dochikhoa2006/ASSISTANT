@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -23,6 +24,13 @@ from .prompts import (
 logger = logging.getLogger(__name__)
 
 
+_ARTIFACT_REQUEST_ACTION = re.compile(
+    r"\b(?:create|generate|make|build|give(?:\s+me)?|download|export|produce)\b",
+    re.I,
+)
+_ARTIFACT_FILE_WORD = re.compile(r"\b(?:file|document|workbook|spreadsheet|report|presentation|deck)\b", re.I)
+
+
 class ContentTool(Protocol):
     @property
     def name(self) -> str: ...
@@ -30,6 +38,56 @@ class ContentTool(Protocol):
     def description(self) -> str: ...
     def can_handle(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> bool: ...
     def execute(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> ContentToolResult: ...
+
+
+def _artifact_fallback_result(
+    *,
+    tool_name: str,
+    file_type: str,
+    filename: str,
+    label: str,
+    composer_input: ContentComposerInput,
+    config: GeneralPurposeConfig,
+    error: Exception,
+) -> ContentToolResult:
+    """Create a usable file even when the optional content-planning LLM fails."""
+    if composer_input.repository is None:
+        return ContentToolResult(
+            tool_name=tool_name,
+            output_text="",
+            confidence=0.0,
+            fallback_used=True,
+            reason_summary=str(error),
+        )
+    try:
+        artifact = ArtifactGenerator(
+            composer_input.repository,
+            storage_dir=config.artifact_storage_dir,
+            download_base_url=config.artifact_download_base_url,
+        ).generate(
+            user_id=composer_input.user_id,
+            file_type=file_type,
+            filename=filename,
+            content=f"{label}\n\nRequest: {composer_input.raw_user_query}",
+            metadata={"tool_name": tool_name, "plan_summary": composer_input.raw_user_query[:500]},
+        )
+    except Exception as artifact_error:
+        return ContentToolResult(
+            tool_name=tool_name,
+            output_text="",
+            confidence=0.0,
+            fallback_used=True,
+            reason_summary=str(artifact_error),
+        )
+    return ContentToolResult(
+        tool_name=tool_name,
+        output_text=f"Created {label.casefold()}: {artifact['filename']}.",
+        confidence=0.55,
+        fallback_used=True,
+        reason_summary=f"{file_type}_file_created_with_fallback_plan: {type(error).__name__}",
+        artifact=artifact,
+        warnings=("artifact_plan_fallback",),
+    )
 
 
 class AnswerGenerationTool:
@@ -110,7 +168,7 @@ class GenerateExcelTool:
         self.config = config
 
     def can_handle(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> bool:
-        query_lower = composer_input.rewritten_query.casefold()
+        query_lower = f"{composer_input.raw_user_query}\n{composer_input.rewritten_query}".casefold()
         return any(k in query_lower for k in config.excel_tool_signal_keywords)
 
     def execute(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> ContentToolResult:
@@ -159,12 +217,14 @@ class GenerateExcelTool:
                 artifact=artifact,
             )
         except Exception as e:
-            return ContentToolResult(
+            return _artifact_fallback_result(
                 tool_name=self.name,
-                output_text="",
-                confidence=0.0,
-                fallback_used=True,
-                reason_summary=str(e),
+                file_type="xlsx",
+                filename="generated_workbook.xlsx",
+                label="Excel workbook",
+                composer_input=composer_input,
+                config=config,
+                error=e,
             )
 
 
@@ -189,7 +249,7 @@ class GeneratePDFTool:
         self.config = config
 
     def can_handle(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> bool:
-        query_lower = composer_input.rewritten_query.casefold()
+        query_lower = f"{composer_input.raw_user_query}\n{composer_input.rewritten_query}".casefold()
         return any(k in query_lower for k in config.pdf_tool_signal_keywords)
 
     def execute(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> ContentToolResult:
@@ -237,12 +297,14 @@ class GeneratePDFTool:
                 artifact=artifact,
             )
         except Exception as e:
-            return ContentToolResult(
+            return _artifact_fallback_result(
                 tool_name=self.name,
-                output_text="",
-                confidence=0.0,
-                fallback_used=True,
-                reason_summary=str(e),
+                file_type="pdf",
+                filename="generated_report.pdf",
+                label="PDF document",
+                composer_input=composer_input,
+                config=config,
+                error=e,
             )
 
 
@@ -268,7 +330,7 @@ class GeneratePPTXTool:
         self.config = config
 
     def can_handle(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> bool:
-        query_lower = composer_input.rewritten_query.casefold()
+        query_lower = f"{composer_input.raw_user_query}\n{composer_input.rewritten_query}".casefold()
         return any(k in query_lower for k in config.pptx_tool_signal_keywords)
 
     def execute(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> ContentToolResult:
@@ -321,12 +383,14 @@ class GeneratePPTXTool:
                 artifact=artifact,
             )
         except Exception as e:
-            return ContentToolResult(
+            return _artifact_fallback_result(
                 tool_name=self.name,
-                output_text="",
-                confidence=0.0,
-                fallback_used=True,
-                reason_summary=str(e),
+                file_type="pptx",
+                filename="generated_presentation.pptx",
+                label="PowerPoint presentation",
+                composer_input=composer_input,
+                config=config,
+                error=e,
             )
 
 
@@ -355,6 +419,18 @@ class ReActContentComposer:
     prompt_registry: PromptRegistry
     config: GeneralPurposeConfig
 
+    def _explicit_artifact_tool(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> ContentTool | None:
+        """Use the file tool deterministically for an unambiguous file request."""
+        request_text = f"{composer_input.raw_user_query}\n{composer_input.rewritten_query}"
+        if not (_ARTIFACT_REQUEST_ACTION.search(request_text) or _ARTIFACT_FILE_WORD.search(request_text)):
+            return None
+        matches = [
+            tool
+            for tool in self.registry._tools.values()
+            if tool.name != config.content_composer_default_tool and tool.can_handle(composer_input, config)
+        ]
+        return matches[0] if len(matches) == 1 else None
+
     def compose(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> ContentComposerResult:
         artifacts: list[dict[str, Any]] = []
         if not config.content_composer_enabled:
@@ -376,6 +452,22 @@ class ReActContentComposer:
                 final_response_text=result.output_text,
                 tool_trace_summary=f"Composer disabled, used default tool: {tool.name}",
                 used_tool_names=(tool.name,),
+                confidence=result.confidence,
+                fallback_used=result.fallback_used,
+                reason_summary=result.reason_summary,
+                content_warnings=result.warnings,
+                artifacts=tuple(artifacts),
+            )
+
+        explicit_artifact_tool = self._explicit_artifact_tool(composer_input, config)
+        if explicit_artifact_tool is not None:
+            result = explicit_artifact_tool.execute(composer_input, config)
+            if result.artifact:
+                artifacts.append(result.artifact)
+            return ContentComposerResult(
+                final_response_text=result.output_text,
+                tool_trace_summary=f"Explicit file request: {explicit_artifact_tool.name}",
+                used_tool_names=(explicit_artifact_tool.name,),
                 confidence=result.confidence,
                 fallback_used=result.fallback_used,
                 reason_summary=result.reason_summary,
