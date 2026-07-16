@@ -863,9 +863,16 @@ class ReminderBranch:
     def execute(self, context: PipelineContext, repository: AssistantRepository) -> BranchResult:
         # Intent dispatch is authoritative. The dedicated extraction model is
         # deliberately the first executable component inside this branch.
-        detection = self.action_detector.detect(
-            context.request, context.rewritten_query, Intent.REMINDER
+        context_history = getattr(context, "chat_history", None)
+        branch_chat_history = (
+            current_chat_history()
+            if context_history is None
+            else list(context_history)
         )
+        with canonical_chat_history_scope(branch_chat_history):
+            detection = self.action_detector.detect(
+                context.request, context.rewritten_query, Intent.REMINDER
+            )
         if detection.requires_clarification:
             return self._generate_clarification(
                 context,
@@ -884,19 +891,19 @@ class ReminderBranch:
             _validated_reminder_from_dict(action)
             for action in context.request.metadata.get("validated_reminder_actions", [])
         ] if context.request.metadata.get("confirmation_approved") else []
+        if prevalidated_actions and (
+            len(actions) != 1
+            or len(prevalidated_actions) != 1
+            or str(actions[0].get("action") or "").casefold()
+            != prevalidated_actions[0].action.value
+        ):
+            return self._generate_clarification(
+                context,
+                ["single_action"],
+                "The confirmation extraction did not match the validated action.",
+            )
         if self.reminder_mutation_pipeline or self.validated_action_builder:
             if prevalidated_actions:
-                if (
-                    len(actions) != 1
-                    or len(prevalidated_actions) != 1
-                    or str(actions[0].get("action") or "").casefold()
-                    != prevalidated_actions[0].action.value
-                ):
-                    return self._generate_clarification(
-                        context,
-                        ["single_action"],
-                        "The confirmation extraction did not match the validated action.",
-                    )
                 validated_actions = prevalidated_actions
             elif self.reminder_mutation_pipeline:
                 validated_actions = [
@@ -924,6 +931,26 @@ class ReminderBranch:
             clarification_needed = False
             clarification_missing_fields: list[str] = []
             for v_act in validated_actions:
+                if v_act.hitl_reason == "internal_pipeline_failure":
+                    return BranchResult(
+                        response_type=ResponseType.ERROR,
+                        fallback_or_error_message=self.prompt_registry.message(
+                            # TODO: add reminder_pipeline_unavailable prompt key.
+                            "knowledge_pipeline_unavailable"
+                        ),
+                    )
+                if v_act.hitl_reason == "reminder_validation_clarification":
+                    clarification_q = getattr(v_act, "clarification_question", None)
+                    if clarification_q and clarification_q.strip():
+                        return BranchResult(
+                            response_type=ResponseType.CLARIFICATION,
+                            clarification_question=GeneratedQuestion(
+                                text=clarification_q,
+                                source=QuestionSource.CLARIFICATION_QUESTION,
+                                purpose="reminder_validation_fail",
+                                confidence=v_act.confidence,
+                            ),
+                        )
                 if v_act.validation_result in (ActionValidationResult.CLARIFY_AMBIGUOUS_TARGET, ActionValidationResult.CLARIFY_MISSING_FIELDS):
                     clarification_needed = True
                     if v_act.factuality_concern:
@@ -1010,7 +1037,15 @@ class ReminderBranch:
                     },
                 )
         else:
-            executable_actions = actions
+            # No mutation pipeline is configured. Never allow a newly extracted
+            # action to bypass retrieval, the validation model, or finalization.
+            return BranchResult(
+                response_type=ResponseType.ERROR,
+                fallback_or_error_message=self.prompt_registry.message(
+                    # TODO: add reminder_pipeline_unavailable prompt key.
+                    "knowledge_pipeline_unavailable"
+                ),
+            )
 
         success_text = context.request.metadata.get(
             "operation_response", self.prompt_registry.message("reminder_updated") if hasattr(self.prompt_registry, "message") else "Reminder updated successfully."
