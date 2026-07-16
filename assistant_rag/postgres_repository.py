@@ -7,6 +7,8 @@ from typing import Any, Iterator, Optional
 from datetime import datetime, timezone
 
 from sqlalchemy import create_engine, select, insert, update, delete, and_, or_, func, case
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine, Connection
 
 from .repository import AssistantRepository
@@ -17,7 +19,11 @@ from .reminder_safety import normalize_subject, token_similarity, utc_minute, wi
 from .recurrence import calculate_next_fire_time
 from .lifecycle import is_artifact_downloadable, is_indexable_conversation_hop, is_indexable_knowledge_chunk
 from .metrics import GLOBAL_METRICS
-from .conversation_embedding import conversation_hop_embedding_metadata, serialize_conversation_hop
+from .conversation_embedding import (
+    conversation_hop_embedding_metadata,
+    conversation_hop_semantic_payload,
+    serialize_conversation_hop,
+)
 from .errors import (
     KnowledgeConflictError,
     ReminderConflictError,
@@ -393,7 +399,6 @@ class PostgresRepository(AssistantRepository):
             reminder_notifications.c.source_hop_id,
             reminder_notifications.c.ui_status,
             conversation_hops.c.topic_id,
-            conversation_hops.c.raw_user_query.label("source_raw_user_query"),
             conversation_hops.c.rewritten_user_query.label("source_rewritten_user_query"),
             conversation_hops.c.raw_response.label("source_raw_response"),
             conversation_hops.c.supporting_questions_json,
@@ -430,11 +435,10 @@ class PostgresRepository(AssistantRepository):
                 "source_hop_id": row[5],
                 "ui_status": row[6],
                 "topic_id": row[7],
-                "source_raw_user_query": row[8],
-                "source_rewritten_user_query": row[9],
-                "source_raw_response": row[10],
-                "supporting_questions_json": row[11],
-                "source_response_type": row[12],
+                "source_rewritten_user_query": row[8],
+                "source_raw_response": row[9],
+                "supporting_questions_json": row[10],
+                "source_response_type": row[11],
             }
 
 
@@ -450,8 +454,29 @@ class PostgresRepository(AssistantRepository):
         replaces_chunk_id: str | None = None,
         change_reason: str | None = None,
         modified_by_user_query: str | None = None,
+        knowledge_topic_id: str | None = None,
     ) -> tuple[str, str, str | None]:
-        topic_id = self.ensure_knowledge_topic(cursor, user_id=user_id, title=title)
+        if knowledge_topic_id is not None:
+            topic_row = cursor.execute(
+                select(knowledge_topics.c.knowledge_topic_id).where(
+                    and_(
+                        knowledge_topics.c.user_id == user_id,
+                        knowledge_topics.c.knowledge_topic_id
+                        == knowledge_topic_id,
+                    )
+                )
+            ).fetchone()
+            if not topic_row:
+                raise KnowledgeConflictError(
+                    "Knowledge topic not found for user"
+                )
+            topic_id = str(topic_row[0])
+        else:
+            topic_id = self.ensure_knowledge_topic(
+                cursor,
+                user_id=user_id,
+                title=title,
+            )
         
         normalized = " ".join(text.split())
         c_hash = content_hash(user_id, normalized)
@@ -488,6 +513,17 @@ class PostgresRepository(AssistantRepository):
                 
         chunk_id = new_id()
         timestamp = now_iso()
+        next_chunk_index = cursor.execute(
+            select(
+                (func.coalesce(func.max(knowledge_chunks.c.chunk_index), -1) + 1)
+                .label("next_index")
+            ).where(
+                and_(
+                    knowledge_chunks.c.user_id == user_id,
+                    knowledge_chunks.c.knowledge_topic_id == topic_id,
+                )
+            )
+        ).scalar_one()
         
         outbox_job_id = self.insert_outbox_job(
             cursor,
@@ -502,7 +538,7 @@ class PostgresRepository(AssistantRepository):
                 knowledge_topic_id=topic_id,
                 user_id=user_id,
                 source_id=source_id,
-                chunk_index=0,
+                chunk_index=int(next_chunk_index),
                 raw_text=text,
                 normalized_text=text,
                 summary=text,
@@ -538,19 +574,70 @@ class PostgresRepository(AssistantRepository):
             
         topic_id = new_id()
         timestamp = now_iso()
+        values = {
+            "knowledge_topic_id": topic_id,
+            "user_id": user_id,
+            "title": title,
+            "description": "",
+            "entities_json": "{}",
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "version": 1,
+        }
+        dialect_name = cursor.dialect.name
+        if dialect_name == "postgresql":
+            create_statement = postgresql_insert(knowledge_topics).values(**values)
+        elif dialect_name == "sqlite":
+            create_statement = sqlite_insert(knowledge_topics).values(**values)
+        else:
+            raise RepositoryValidationError(
+                f"Unsupported SQL dialect for conflict-safe knowledge topics: {dialect_name}"
+            )
         cursor.execute(
-            insert(knowledge_topics).values(
-                knowledge_topic_id=topic_id,
-                user_id=user_id,
-                title=title,
-                description='',
-                entities_json='{}',
-                created_at=timestamp,
-                updated_at=timestamp,
-                version=1
+            create_statement.on_conflict_do_nothing(
+                index_elements=[
+                    knowledge_topics.c.user_id,
+                    knowledge_topics.c.title,
+                ]
             )
         )
-        return topic_id
+        resolved = cursor.execute(
+            select(knowledge_topics.c.knowledge_topic_id).where(
+                and_(
+                    knowledge_topics.c.user_id == user_id,
+                    knowledge_topics.c.title == title,
+                )
+            )
+        ).fetchone()
+        if not resolved:
+            raise KnowledgeConflictError("Knowledge topic could not be resolved")
+        return str(resolved[0])
+
+    @staticmethod
+    def _touch_knowledge_topic(
+        cursor: Connection,
+        *,
+        user_id: str,
+        knowledge_topic_id: str,
+    ) -> None:
+        result = cursor.execute(
+            update(knowledge_topics)
+            .where(
+                and_(
+                    knowledge_topics.c.user_id == user_id,
+                    knowledge_topics.c.knowledge_topic_id
+                    == knowledge_topic_id,
+                )
+            )
+            .values(
+                updated_at=now_iso(),
+                version=knowledge_topics.c.version + 1,
+            )
+        )
+        if result.rowcount != 1:
+            raise KnowledgeConflictError(
+                "Knowledge topic changed before mutation completion"
+            )
 
     def get_knowledge_chunks_by_ids(
         self, user_id: str, chunk_ids: list[str], include_deleted: bool = False
@@ -1146,6 +1233,7 @@ class PostgresRepository(AssistantRepository):
             return RepositoryTransactionResult(
                 committed=True,
                 results=(),
+                audit_topic_id=hop_write.topic_id,
                 audit_hop_id=hop_write.hop_id,
                 indexing_outbox_ids=(hop_write.outbox_job_id,),
             )
@@ -1155,13 +1243,18 @@ class PostgresRepository(AssistantRepository):
     ) -> RepositoryActionResult:
         action_type = action.action
         if action_type is KnowledgeAction.ADD:
-            _, chunk_id, outbox_job_id = self.add_knowledge_chunk(
+            topic_id, chunk_id, outbox_job_id = self.add_knowledge_chunk(
                 cursor,
                 user_id=user_id,
                 title=action.topic_title or "Knowledge",
                 text=action.knowledge_text or action.new_text or "",
                 source_id=None,
                 metadata=None,
+            )
+            self._touch_knowledge_topic(
+                cursor,
+                user_id=user_id,
+                knowledge_topic_id=topic_id,
             )
             return RepositoryActionResult(
                 action_id=new_id(),
@@ -1174,6 +1267,59 @@ class PostgresRepository(AssistantRepository):
             )
         if action_type in {KnowledgeAction.DELETE, KnowledgeAction.MODIFY}:
             chunk_id = action.target_chunk_ids[0]
+            target = cursor.execute(
+                select(
+                    knowledge_chunks.c.knowledge_topic_id,
+                    knowledge_chunks.c.normalized_text,
+                ).where(
+                    and_(
+                        knowledge_chunks.c.user_id == user_id,
+                        knowledge_chunks.c.chunk_id == chunk_id,
+                        knowledge_chunks.c.is_deleted == 0,
+                    )
+                )
+            ).fetchone()
+            if not target:
+                raise KnowledgeConflictError(
+                    "Active knowledge target was not found"
+                )
+            target_topic_id = str(target[0])
+            if action.target_topic_ids and set(action.target_topic_ids) != {
+                target_topic_id
+            }:
+                raise KnowledgeConflictError(
+                    "Knowledge target topic no longer matches"
+                )
+            if action_type is KnowledgeAction.MODIFY:
+                replacement_text = " ".join(
+                    (action.replacement_text or action.new_text or "").split()
+                )
+                if not replacement_text:
+                    raise KnowledgeConflictError(
+                        "Knowledge replacement text is empty"
+                    )
+                if replacement_text == str(target[1]):
+                    raise KnowledgeConflictError(
+                        "Knowledge replacement already matches the active target"
+                    )
+                duplicate_replacement = cursor.execute(
+                    select(knowledge_chunks.c.chunk_id)
+                    .where(
+                        and_(
+                            knowledge_chunks.c.user_id == user_id,
+                            knowledge_chunks.c.knowledge_topic_id
+                            == target_topic_id,
+                            knowledge_chunks.c.content_hash
+                            == content_hash(user_id, replacement_text),
+                            knowledge_chunks.c.chunk_id != chunk_id,
+                        )
+                    )
+                    .limit(1)
+                ).fetchone()
+                if duplicate_replacement:
+                    raise KnowledgeConflictError(
+                        "Knowledge replacement already exists in the target topic"
+                    )
             expected_version = action.observed_versions.get(chunk_id)
             del_outbox_job_id = self.soft_delete_knowledge_chunk(
                 cursor,
@@ -1194,11 +1340,17 @@ class PostgresRepository(AssistantRepository):
                     replaces_chunk_id=chunk_id,
                     change_reason=action.reason_summary or "modify",
                     modified_by_user_query=action.target_description,
+                    knowledge_topic_id=target_topic_id,
                 )
                 cursor.execute(
                     update(knowledge_chunks)
                     .where(and_(knowledge_chunks.c.user_id == user_id, knowledge_chunks.c.chunk_id == chunk_id))
                     .values(replaced_by_chunk_id=new_chunk_id)
+                )
+                self._touch_knowledge_topic(
+                    cursor,
+                    user_id=user_id,
+                    knowledge_topic_id=target_topic_id,
                 )
                 
                 outbox_jobs = [del_outbox_job_id]
@@ -1214,6 +1366,11 @@ class PostgresRepository(AssistantRepository):
                     indexing_outbox_ids=tuple(outbox_jobs),
                     user_safe_summary="Modified knowledge.",
                 )
+            self._touch_knowledge_topic(
+                cursor,
+                user_id=user_id,
+                knowledge_topic_id=target_topic_id,
+            )
             return RepositoryActionResult(
                 action_id=new_id(),
                 action_type=action_type.value,
@@ -1244,10 +1401,38 @@ class PostgresRepository(AssistantRepository):
                 topic_id = self.ensure_topic(cursor, user_id=user_id, title=topic_title)
                 results: list[RepositoryActionResult] = []
                 outbox_jobs: list[str] = []
+                knowledge_entities: list[dict[str, Any]] = []
                 for action in actions:
                     result = self._apply_knowledge_action(cursor, user_id=user_id, action=action)
                     results.append(result)
                     outbox_jobs.extend(result.indexing_outbox_ids)
+                    if not result.domain_entity_id:
+                        raise KnowledgeConflictError(
+                            "Knowledge mutation did not resolve a chunk"
+                        )
+                    entity_row = cursor.execute(
+                        select(knowledge_chunks.c.knowledge_topic_id).where(
+                            and_(
+                                knowledge_chunks.c.user_id == user_id,
+                                knowledge_chunks.c.chunk_id
+                                == result.domain_entity_id,
+                            )
+                        )
+                    ).fetchone()
+                    if not entity_row:
+                        raise KnowledgeConflictError(
+                            "Knowledge mutation chunk was not persisted"
+                        )
+                    knowledge_entities.append(
+                        {
+                            "entity_type": "knowledge_chunk",
+                            "action": action.action.value,
+                            "knowledge_topic_id": str(entity_row[0]),
+                            "knowledge_chunk_id": result.domain_entity_id,
+                            "target_chunk_ids": list(action.target_chunk_ids),
+                            "status": result.status,
+                        }
+                    )
                 hop = self.append_conversation_hop(
                     cursor,
                     topic_id=topic_id,
@@ -1258,6 +1443,7 @@ class PostgresRepository(AssistantRepository):
                     raw_response=response_text,
                     response_type="knowledge_action",
                     parent_hop_id=parent_hop_id,
+                    entities={"knowledge": knowledge_entities},
                 )
                 outbox_jobs.append(hop.outbox_job_id)
                 updated_results = []
@@ -1278,6 +1464,7 @@ class PostgresRepository(AssistantRepository):
                 return RepositoryTransactionResult(
                     committed=True,
                     results=tuple(updated_results),
+                    audit_topic_id=hop.topic_id,
                     audit_hop_id=hop.hop_id,
                     indexing_outbox_ids=tuple(outbox_jobs),
                 )
@@ -1373,6 +1560,7 @@ class PostgresRepository(AssistantRepository):
                 return RepositoryTransactionResult(
                     committed=True,
                     results=tuple(updated_results),
+                    audit_topic_id=hop_write.topic_id,
                     audit_hop_id=hop_write.hop_id,
                     indexing_outbox_ids=(hop_write.outbox_job_id,),
                 )
@@ -1406,6 +1594,31 @@ class PostgresRepository(AssistantRepository):
         audit_hop_id: str,
     ) -> RepositoryActionResult:
         action_type = action.action
+
+        def preserve_explicit_notification_time(reminder_id: str) -> None:
+            if action.timing_plan_required:
+                return
+            result = cursor.execute(
+                update(reminders)
+                .where(
+                    and_(
+                        reminders.c.user_id == user_id,
+                        reminders.c.reminder_id == reminder_id,
+                    )
+                )
+                .values(
+                    timing_plan_status="planned",
+                    timing_planned_at=now_iso(),
+                    timing_plan_reason=(
+                        "Explicit notification time preserved from validated reminder mutation."
+                    ),
+                )
+            )
+            if result.rowcount != 1:
+                raise ReminderConflictError(
+                    "Explicit reminder timing state could not be preserved"
+                )
+
         if action_type is ReminderAction.ADD:
             if not action.reminder_time:
                 raise RepositoryValidationError("Reminder time is required")
@@ -1430,10 +1643,20 @@ class PostgresRepository(AssistantRepository):
                 source_topic_id=source_topic_id,
                 source_hop_id=audit_hop_id,
                 reminder_time=action.reminder_time.isoformat(),
-                event_time=(action.event_time or action.reminder_time).isoformat(),
+                event_time=(
+                    action.event_time
+                    or (action.reminder_time if action.timing_plan_required else None)
+                ).isoformat()
+                if (
+                    action.event_time
+                    or (action.reminder_time if action.timing_plan_required else None)
+                )
+                else None,
                 raw_reminder=action.raw_reminder or "",
                 reminder_summary=action.reminder_summary or "",
                 subject=action.subject or "",
+                supporting_question=action.supporting_question,
+                supporting_response=action.supporting_response,
                 user_timezone=action.user_timezone or "UTC",
                 original_time_text=action.original_time_text,
                 recurrence_rule=action.recurrence_rule,
@@ -1441,6 +1664,7 @@ class PostgresRepository(AssistantRepository):
                 next_fire_time=action.next_fire_time.isoformat() if action.next_fire_time else (action.reminder_time.isoformat() if action.recurrence_rule and action.reminder_time else None),
                 parent_recurring_reminder_id=action.parent_recurring_reminder_id,
             )
+            preserve_explicit_notification_time(reminder_id)
             return RepositoryActionResult(
                 action_id=new_id(),
                 action_type=action_type.value,
@@ -1449,7 +1673,12 @@ class PostgresRepository(AssistantRepository):
                 domain_entity_id=reminder_id,
                 indexing_outbox_ids=(),
                 user_safe_summary=(
-                    f"Added reminder '{action.subject}'. Timing will be finalized by autoscan before it can notify you."
+                    f"Added reminder '{action.subject}'. "
+                    + (
+                        "Timing will be finalized by autoscan before it can notify you."
+                        if action.timing_plan_required
+                        else "The validated notification time was preserved."
+                    )
                 ),
             )
 
@@ -1476,6 +1705,21 @@ class PostgresRepository(AssistantRepository):
                 expected_version=action.observed_version,
                 expected_status=action.observed_status,
             )
+            replacement_summary = (
+                action.replacement_summary
+                if action.replacement_summary is not None
+                else action.reminder_summary
+            )
+            replacement_recurrence_rule = (
+                action.replacement_recurrence_rule
+                if action.replacement_recurrence_rule is not None
+                else action.recurrence_rule
+            )
+            replacement_recurrence_timezone = (
+                action.replacement_recurrence_timezone
+                if action.replacement_recurrence_timezone is not None
+                else action.recurrence_timezone or action.user_timezone
+            )
             replacement_time = action.replacement_time or action.reminder_time or action.observed_reminder_time
             if not replacement_time:
                 raise RepositoryValidationError("Replacement reminder time is required")
@@ -1485,17 +1729,28 @@ class PostgresRepository(AssistantRepository):
                 source_topic_id=original_source[0] or source_topic_id,
                 source_hop_id=original_source[1] or audit_hop_id,
                 reminder_time=replacement_time.isoformat(),
-                event_time=(action.event_time or replacement_time).isoformat(),
+                event_time=(
+                    action.event_time
+                    or (replacement_time if action.timing_plan_required else None)
+                ).isoformat()
+                if (
+                    action.event_time
+                    or (replacement_time if action.timing_plan_required else None)
+                )
+                else None,
                 raw_reminder=action.raw_reminder or "",
-                reminder_summary=action.replacement_summary or action.reminder_summary or "",
+                reminder_summary=replacement_summary or "",
                 subject=action.replacement_subject or action.subject or "",
+                supporting_question=action.supporting_question,
+                supporting_response=action.supporting_response,
                 user_timezone=action.user_timezone or "UTC",
                 original_time_text=action.original_time_text,
-                recurrence_rule=action.replacement_recurrence_rule or action.recurrence_rule,
-                recurrence_timezone=action.replacement_recurrence_timezone or action.recurrence_timezone or action.user_timezone,
-                next_fire_time=action.next_fire_time.isoformat() if action.next_fire_time else (replacement_time.isoformat() if (action.replacement_recurrence_rule or action.recurrence_rule) else None),
+                recurrence_rule=replacement_recurrence_rule,
+                recurrence_timezone=replacement_recurrence_timezone,
+                next_fire_time=action.next_fire_time.isoformat() if action.next_fire_time else (replacement_time.isoformat() if replacement_recurrence_rule else None),
                 parent_recurring_reminder_id=reminder_id,
             )
+            preserve_explicit_notification_time(new_reminder_id)
             return RepositoryActionResult(
                 action_id=new_id(),
                 action_type=action_type.value,
@@ -1504,7 +1759,12 @@ class PostgresRepository(AssistantRepository):
                 domain_entity_id=new_reminder_id,
                 indexing_outbox_ids=(),
                 user_safe_summary=(
-                    f"Modified reminder '{action.replacement_subject or action.subject}'. Timing will be recalculated by autoscan."
+                    f"Modified reminder '{action.replacement_subject or action.subject}'. "
+                    + (
+                        "Timing will be recalculated by autoscan."
+                        if action.timing_plan_required
+                        else "The validated notification time was preserved."
+                    )
                 ),
             )
 
@@ -2001,6 +2261,59 @@ class PostgresRepository(AssistantRepository):
                 } for r in rows
             ]
 
+    def claim_outbox_jobs_by_ids(
+        self,
+        *,
+        job_ids: list[str],
+        max_attempts: int,
+    ) -> list[dict[str, Any]]:
+        unique_ids = list(dict.fromkeys(job_id for job_id in job_ids if job_id))
+        if not unique_ids:
+            return []
+        with self.transaction() as cursor:
+            rows = cursor.execute(
+                update(indexing_outbox)
+                .where(
+                    and_(
+                        indexing_outbox.c.job_id.in_(unique_ids),
+                        indexing_outbox.c.retry_count < max_attempts,
+                        indexing_outbox.c.status.in_(["pending", "failed"]),
+                    )
+                )
+                .values(status="processing", updated_at=now_iso())
+                .returning(
+                    indexing_outbox.c.job_id,
+                    indexing_outbox.c.entity_type,
+                    indexing_outbox.c.entity_id,
+                    indexing_outbox.c.operation,
+                )
+            ).fetchall()
+            return [
+                {
+                    "job_id": row[0],
+                    "entity_type": row[1],
+                    "entity_id": row[2],
+                    "operation": row[3],
+                }
+                for row in rows
+            ]
+
+    def get_outbox_job_statuses(
+        self,
+        *,
+        job_ids: list[str],
+    ) -> dict[str, str]:
+        unique_ids = list(dict.fromkeys(job_id for job_id in job_ids if job_id))
+        if not unique_ids:
+            return {}
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(indexing_outbox.c.job_id, indexing_outbox.c.status).where(
+                    indexing_outbox.c.job_id.in_(unique_ids)
+                )
+            ).fetchall()
+        return {str(row[0]): str(row[1]) for row in rows}
+
     def release_stale_processing_jobs(self, *, max_attempts: int, timeout_cutoff: str) -> None:
         with self.transaction() as cursor:
             stmt = update(indexing_outbox).where(
@@ -2200,9 +2513,10 @@ class PostgresRepository(AssistantRepository):
             hop = hop_map.get(result.entity_id)
             if not hop:
                 continue
-            payload = dict(result.payload)
-            payload.update(hop)
-            payload["text"] = serialize_conversation_hop(hop)
+            semantic_hop = conversation_hop_semantic_payload(hop)
+            payload = conversation_hop_semantic_payload(result.payload)
+            payload.update(semantic_hop)
+            payload["text"] = serialize_conversation_hop(semantic_hop)
             hydrated.append(
                 RetrievalResult(
                     entity_type=result.entity_type,

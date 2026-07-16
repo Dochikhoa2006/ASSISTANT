@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from email.message import EmailMessage
 from pathlib import Path
 import imaplib
@@ -426,6 +426,7 @@ class PlatformSelector:
     def select(self, response: BundledResponse, request: ChatRequest) -> dict[str, Any]:
         base = dict(response.platform_payload)
         context = request.platform_context or {}
+        rewritten_query = response.last_qa_state.last_user_query
         if response.response_type is ResponseType.ERROR:
             base["platform_selection"] = {
                 "channel": "none",
@@ -433,7 +434,7 @@ class PlatformSelector:
                 "source": "safe_fallback_error_response",
             }
             return self._hitl_passthrough(base, response)
-        selection = self._choose_channel(response, request)
+        selection = self._choose_channel(response, rewritten_query)
         channel = selection["channel"]
         base["platform_selection"] = selection
         if channel == "none":
@@ -443,7 +444,10 @@ class PlatformSelector:
         if formatter:
             generated_artifacts = base.get("artifacts")
             had_generated_artifacts = "artifacts" in base
-            base.update(formatter.format(response, request))
+            # Preserve the formatter protocol while preventing extensions from
+            # observing or acting on pre-rewrite text through ChatRequest.
+            formatter_request = replace(request, raw_query=rewritten_query)
+            base.update(formatter.format(response, formatter_request))
             if had_generated_artifacts:
                 # A channel formatter may shape text, but it cannot replace or
                 # discard files created by the content-composition stage.
@@ -451,7 +455,12 @@ class PlatformSelector:
             else:
                 base.pop("artifacts", None)
 
-        message = self._extract(channel, response, request, base)
+        message = self._extract(
+            channel,
+            response,
+            base,
+            rewritten_query,
+        )
         unavailable_attachments = list(message.get("unavailable_attachments") or [])
         if unavailable_attachments:
             return self._delivery_hold(
@@ -481,7 +490,7 @@ class PlatformSelector:
             )
             if (
                 channel == "gmail"
-                and _requests_gmail_draft_save(request.raw_query)
+                and _requests_gmail_draft_save(rewritten_query)
                 and callable(creator)
                 and has_credentials
             ):
@@ -557,9 +566,13 @@ class PlatformSelector:
             dispatch=dispatch,
         )
 
-    def _choose_channel(self, response: BundledResponse, request: ChatRequest) -> dict[str, Any]:
+    def _choose_channel(
+        self,
+        response: BundledResponse,
+        rewritten_query: str,
+    ) -> dict[str, Any]:
         """Choose Gmail deterministically for explicit email messages, else use the LLM."""
-        if _is_explicit_email_message_request(request.raw_query):
+        if _is_explicit_email_message_request(rewritten_query):
             return {
                 "channel": "gmail",
                 "confidence": 1.0,
@@ -589,7 +602,7 @@ class PlatformSelector:
                 ),
                 user_prompt=json.dumps(
                     inject_chat_history({
-                        "user_query": request.raw_query,
+                        "rewritten_query": rewritten_query,
                         "bundled_response": response.final_chat_text,
                         "available_platforms": list(_CHANNELS),
                     })
@@ -610,8 +623,14 @@ class PlatformSelector:
         # rather than accidentally preparing or sending a message.
         return {"channel": "none", "confidence": 0.0, "source": "safe_fallback_llm_error"}
 
-    def _extract(self, channel: str, response: BundledResponse, request: ChatRequest, base: dict[str, Any]) -> dict[str, Any]:
-        text = request.raw_query
+    def _extract(
+        self,
+        channel: str,
+        response: BundledResponse,
+        base: dict[str, Any],
+        rewritten_query: str,
+    ) -> dict[str, Any]:
+        text = rewritten_query
         extracted: dict[str, Any] = {}
         if self.llm is not None:
             schema = {"type": "object", "required": ["subject", "body", "mode"], "properties": {"recipient": {"type": "string"}, "recipients": {"type": "array", "items": {"type": "string"}}, "subject": {"type": "string"}, "body": {"type": "string"}, "mode": {"type": "string", "enum": ["send", "draft"]}}}
@@ -626,7 +645,7 @@ class PlatformSelector:
                     ),
                     user_prompt=json.dumps(
                         inject_chat_history({
-                            "user_query": text,
+                            "rewritten_query": text,
                             "bundled_response": response.final_chat_text,
                             "available_artifacts": [
                                 {
@@ -648,9 +667,9 @@ class PlatformSelector:
             if recipient.casefold() not in {item.casefold() for item in recipients}:
                 recipients.append(recipient)
         if channel == "gmail":
-            # Literal addresses in the raw request are authoritative. The LLM
-            # extractor may neither invent addresses nor narrow the explicit
-            # ordered recipient set.
+            # Literal addresses in the rewritten request are authoritative.
+            # The LLM extractor may neither invent addresses nor narrow the
+            # explicit ordered recipient set.
             recipients = allowed_gmail_recipients
         # The bundled answer is the canonical body unless a platform-specific
         # extractor safely supplied a body. This makes artifact/general answers

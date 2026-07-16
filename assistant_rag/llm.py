@@ -10,7 +10,6 @@ import time
 from typing import Any, Protocol
 from urllib import error, request
 
-from .action_detection import enforce_mutation_only_intent
 from .contracts import Intent, ResponseType
 from .metrics import GLOBAL_METRICS
 from .observability import StageTimer, current_trace
@@ -39,6 +38,9 @@ class LLMTask(str, Enum):
     KNOWLEDGE_ACTION_EXTRACTION = "knowledge_action_extraction"
     KNOWLEDGE_ACTION_VALIDATION = "knowledge_action_validation"
     KNOWLEDGE_CONTENT_FINALIZATION = "knowledge_content_finalization"
+    REMINDER_ACTION_EXTRACTION = "reminder_action_extraction"
+    REMINDER_ACTION_VALIDATION = "reminder_action_validation"
+    REMINDER_CONTENT_FINALIZATION = "reminder_content_finalization"
     GENERATE_CLARIFICATION = "generate_clarification"
     GENERATE_HUMAN_SUPPORTING = "generate_human_supporting"
     GENERATE_REMINDER_SUPPORTING = "generate_reminder_supporting"
@@ -524,6 +526,28 @@ def structured_fallback_payload(
             "requires_clarification": False,
             "reason_summary": reason,
         })
+    elif task == LLMTask.REMINDER_ACTION_EXTRACTION:
+        payload.update({
+            "action": "add",
+            "toggle_direction": "",
+            "retrieval_text": "",
+            "changed_fields": [],
+            "subject": "",
+            "reminder_summary": "",
+            "raw_reminder": "",
+            "notification_time": "",
+            "event_time": "",
+            "time_semantics": "unchanged",
+            "user_timezone": "",
+            "original_time_text": "",
+            "recurrence_rule": "",
+            "recurrence_timezone": "",
+            "supporting_question": "",
+            "supporting_response": "",
+            "confidence": 0.0,
+            "missing_fields": ["llm_structured_fallback"],
+            "reason_summary": reason,
+        })
     elif task in {
         LLMTask.ACTION_EXTRACTION,
         LLMTask.KNOWLEDGE_ACTION_EXTRACTION,
@@ -577,7 +601,7 @@ def structured_fallback_payload(
     elif task == LLMTask.CLARIFICATION_MERGE:
         payload.update({
             "answered_clarification": False,
-            "merged_query": str(context.get("rewritten_query") or context.get("raw_query") or ""),
+            "merged_query": str(context.get("rewritten_query") or ""),
             "confidence": 0.0,
             "missing_context": ["clarification_merge_unavailable"],
             "reason_summary": reason,
@@ -596,9 +620,21 @@ def structured_fallback_payload(
             "confidence": 1.0,
             "is_final_answer": True,
         })
+    elif task == LLMTask.KNOWLEDGE_ACTION_VALIDATION:
+        payload.update({
+            "operation": _first_enum(schema, "operation") or "add",
+            "decision": "FAIL",
+            "selected_candidate_keys": [],
+            "confidence": 0.0,
+            "clarification_question": DEFAULT_PROMPT_REGISTRY.message(
+                "knowledge_missing_action"
+            ),
+            "reason_summary": reason,
+            "candidate_assessments": [],
+        })
     elif task in {
         LLMTask.RETRIEVAL_VALIDATION,
-        LLMTask.KNOWLEDGE_ACTION_VALIDATION,
+        LLMTask.REMINDER_ACTION_VALIDATION,
     }:
         operation = _first_enum(schema, "operation") or "delete"
         payload.update({
@@ -616,6 +652,31 @@ def structured_fallback_payload(
                 "requires_hitl": True,
                 "factuality_concern": False,
             })
+        if "hitl_reason" in (schema.get("properties") or {}):
+            payload["hitl_reason"] = "llm_structured_fallback"
+    elif task == LLMTask.REMINDER_CONTENT_FINALIZATION:
+        payload.update({
+            "operation": _first_enum(schema, "operation") or "add",
+            "selected_candidate_key": "",
+            "field_bindings": [
+                {"field": field, "source": "extracted_action"}
+                for field in (
+                    "subject",
+                    "reminder_summary",
+                    "raw_reminder",
+                    "notification_time",
+                    "event_time",
+                    "user_timezone",
+                    "original_time_text",
+                    "recurrence_rule",
+                    "recurrence_timezone",
+                    "supporting_question",
+                    "supporting_response",
+                )
+            ],
+            "confidence": 0.0,
+            "reason_summary": reason,
+        })
     elif task == LLMTask.ACTION_PLANNING:
         payload.update({"confidence": 0.0, "reason_summary": reason})
     elif task in {
@@ -828,7 +889,7 @@ class OllamaIntentClassifier:
         explicit_intent = request.metadata.get("intent")
         if explicit_intent:
             try:
-                return enforce_mutation_only_intent(request, Intent(explicit_intent))
+                return Intent(explicit_intent)
             except ValueError:
                 pass
         schema = {
@@ -868,7 +929,6 @@ class OllamaIntentClassifier:
                     PromptContext(
                         stage="intent_classifier",
                         user_id=request.user_id,
-                        raw_query=request.raw_query,
                         rewritten_query=rewritten_query,
                         metadata=request.metadata,
                         platform_context=request.platform_context,
@@ -896,4 +956,4 @@ class OllamaIntentClassifier:
         intent = operation_intents[operation_kind]
         if intent is Intent.CLARIFICATION and not _has_pending_clarification(last_qa_resolution):
             return Intent.GENERAL_RESPONSE
-        return enforce_mutation_only_intent(request, intent)
+        return intent

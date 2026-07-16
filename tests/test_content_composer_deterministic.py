@@ -208,14 +208,38 @@ def test_missing_or_ambiguous_signals_fail_closed_to_general_answer(query: str, 
     assert reason in result.tool_trace_summary
 
 
-def test_rewritten_query_cannot_inject_file_creation_signals() -> None:
+def test_rewritten_query_is_the_sole_file_creation_authority() -> None:
     result, tools = _compose(
-        "Can you help me with quarterly planning?",
-        rewritten_query="Create an Excel spreadsheet for quarterly planning.",
+        "RAW_SENTINEL ordinary quarterly-planning question.",
+        rewritten_query=(
+            "REWRITTEN_SENTINEL Create an Excel spreadsheet for quarterly planning."
+        ),
+    )
+
+    assert result.used_tool_names == ("answer_generation", "generate_excel")
+    assert tools["generate_excel"].calls == 1
+    assert tools["generate_pdf"].calls == 0
+    assert tools["generate_pptx"].calls == 0
+    for tool_name in result.used_tool_names:
+        composer_input = tools[tool_name].inputs[0]
+        assert "RAW_SENTINEL" not in composer_input.raw_user_query
+        assert "RAW_SENTINEL" not in composer_input.rewritten_query
+
+
+def test_raw_query_file_signals_cannot_authorize_file_creation() -> None:
+    result, tools = _compose(
+        "RAW_SENTINEL Create an Excel spreadsheet for quarterly planning.",
+        rewritten_query="REWRITTEN_SENTINEL Explain quarterly planning.",
     )
 
     assert result.used_tool_names == ("answer_generation",)
-    assert all(tools[name].calls == 0 for name in ("generate_pdf", "generate_excel", "generate_pptx"))
+    assert all(
+        tools[name].calls == 0
+        for name in ("generate_pdf", "generate_excel", "generate_pptx")
+    )
+    answer_input = tools["answer_generation"].inputs[0]
+    assert "RAW_SENTINEL" not in answer_input.raw_user_query
+    assert "RAW_SENTINEL" not in answer_input.rewritten_query
 
 
 def test_keyword_matching_uses_boundaries_instead_of_substrings() -> None:
@@ -265,7 +289,9 @@ def test_compound_email_and_excel_request_has_disjoint_tool_responsibilities() -
     assert answer_scope["assigned_file_tool"] == "generate_excel"
     assert "email" in answer_scope["answer_generation_responsibility"]
     assert "file_request_scope" not in answer_scope
-    assert excel_input.raw_user_query == query  # raw input is retained for authorization only
+    # The compatibility field mirrors the rewritten file-tool sub-scope; it
+    # never restores the original raw query.
+    assert excel_input.raw_user_query == excel_input.rewritten_query
     assert excel_input.rewritten_query == (
         "attach an Excel budget tracker with columns for owner, forecast, and actuals"
     )
@@ -396,7 +422,11 @@ def test_direct_file_tool_execution_is_rejected_without_authorized_intent(tool_c
 
     tool = tool_class(llm=ExplodingLLM(), prompt_registry=SimpleNamespace())
     result = tool.execute(
-        SimpleNamespace(raw_user_query="Tell me what this file type is."),
+        SimpleNamespace(
+            raw_user_query="RAW_SENTINEL Create an Excel workbook.",
+            rewritten_query="REWRITTEN_SENTINEL Tell me what this file type is.",
+            metadata={},
+        ),
         GeneralPurposeConfig(),
     )
 

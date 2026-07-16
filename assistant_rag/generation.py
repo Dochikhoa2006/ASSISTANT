@@ -54,7 +54,6 @@ class LLMClarificationStrategy:
                     PromptContext(
                         stage="generate_clarification",
                         user_id=context.request.user_id,
-                        raw_query=context.request.raw_query,
                         rewritten_query=context.rewritten_query,
                         intent=context.intent.value,
                         extra={
@@ -135,7 +134,6 @@ class LLMHumanInTheLoopStrategy:
                     PromptContext(
                         stage="generate_human_supporting",
                         user_id=context.request.user_id,
-                        raw_query=context.request.raw_query,
                         rewritten_query=context.rewritten_query,
                         intent=context.intent.value,
                         extra={
@@ -210,7 +208,6 @@ class LLMReminderSupportingStrategy:
                     PromptContext(
                         stage="generate_reminder_supporting",
                         user_id=context.request.user_id,
-                        raw_query=context.request.raw_query,
                         rewritten_query=context.rewritten_query,
                         intent=context.intent.value,
                         extra={
@@ -296,7 +293,6 @@ class LLMGeneralHITLStrategy:
                     PromptContext(
                         stage="general_hitl_evaluation",
                         user_id=context.request.user_id,
-                        raw_query=context.request.raw_query,
                         rewritten_query=context.rewritten_query,
                         extra={
                             "draft_response": response_text,

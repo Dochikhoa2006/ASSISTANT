@@ -10,7 +10,11 @@ from assistant_rag.branch_orchestration import (
     ReminderTargetResolver,
     ValidatedActionBuilder,
 )
-from assistant_rag.branches import KnowledgeFactsBranch, ReminderBranch
+from assistant_rag.branches import (
+    KnowledgeFactsBranch,
+    ReminderBranch,
+    _validated_reminder_from_dict,
+)
 from assistant_rag.config import ReminderTargetResolverConfig
 from assistant_rag.contracts import (
     ActionValidationResult,
@@ -743,6 +747,144 @@ def test_reminder_add_binds_new_reminder_to_audit_hop(
     assert row["timing_plan_status"] == "pending"
 
 
+def test_reminder_add_persists_supporting_question_and_response(
+    repository: SQLiteRepository,
+) -> None:
+    action = ValidatedReminderAction(
+        action=ReminderAction.ADD,
+        validation_result=ActionValidationResult.EXECUTE,
+        subject="Payroll",
+        reminder_summary="Run payroll",
+        raw_reminder="Remind me to run payroll.",
+        supporting_question="Should this include contractors?",
+        supporting_response="Yes, include contractors.",
+        event_time=BASE_TIME,
+        reminder_time=BASE_TIME,
+        user_timezone="UTC",
+    )
+
+    result = _reminder_transaction(repository, [action])
+
+    assert result.committed
+    reminder_id = result.results[0].domain_entity_id
+    assert reminder_id is not None
+    row = _reminder_row(repository, reminder_id)
+    assert row["supporting_question"] == "Should this include contractors?"
+    assert row["supporting_response"] == "Yes, include contractors."
+
+
+@pytest.mark.parametrize(
+    (
+        "replacement_summary",
+        "replacement_recurrence_rule",
+        "replacement_recurrence_timezone",
+        "expected_summary",
+        "expected_recurrence_rule",
+        "expected_recurrence_timezone",
+    ),
+    (
+        (None, None, None, "Run payroll", "weekly", "UTC"),
+        ("", "", "", "", "", ""),
+    ),
+)
+def test_reminder_modify_persists_full_optional_fields_with_none_aware_replacements(
+    repository: SQLiteRepository,
+    replacement_summary: str | None,
+    replacement_recurrence_rule: str | None,
+    replacement_recurrence_timezone: str | None,
+    expected_summary: str,
+    expected_recurrence_rule: str,
+    expected_recurrence_timezone: str,
+) -> None:
+    original = _seed_reminder(repository)
+    replacement_time = BASE_TIME + timedelta(days=1)
+    action = _targeted_reminder_action(
+        ReminderAction.MODIFY,
+        original,
+        replacement_time=replacement_time,
+        reminder_summary="Run payroll",
+        raw_reminder="Remind me to run payroll.",
+        supporting_question="Should this include contractors?",
+        supporting_response="Yes, include contractors.",
+        user_timezone="UTC",
+        original_time_text="tomorrow at 9:30",
+        recurrence_rule="weekly",
+        recurrence_timezone="UTC",
+        replacement_summary=replacement_summary,
+        replacement_recurrence_rule=replacement_recurrence_rule,
+        replacement_recurrence_timezone=replacement_recurrence_timezone,
+    )
+
+    result = _reminder_transaction(repository, [action])
+
+    assert result.committed
+    replacement_id = result.results[0].domain_entity_id
+    assert replacement_id is not None
+    row = _reminder_row(repository, replacement_id)
+    assert row["reminder_summary"] == expected_summary
+    assert row["recurrence_rule"] == expected_recurrence_rule
+    assert row["recurrence_timezone"] == expected_recurrence_timezone
+    assert row["supporting_question"] == "Should this include contractors?"
+    assert row["supporting_response"] == "Yes, include contractors."
+    assert row["source_topic_id"] == original["source_topic_id"]
+    assert row["source_hop_id"] == original["source_hop_id"]
+
+
+def test_validated_reminder_confirmation_payload_rehydrates_all_fields() -> None:
+    later = BASE_TIME + timedelta(days=1)
+    action = _validated_reminder_from_dict(
+        {
+            "action": ReminderAction.MODIFY.value,
+            "validation_result": ActionValidationResult.EXECUTE.value,
+            "target_reminder_ids": ["reminder-1"],
+            "observed_status": ReminderStatus.SCHEDULED.value,
+            "observed_version": 4,
+            "observed_reminder_time": BASE_TIME.isoformat(),
+            "subject": "Payroll",
+            "event_time": BASE_TIME.isoformat(),
+            "reminder_time": BASE_TIME.isoformat(),
+            "reminder_summary": "Run payroll",
+            "raw_reminder": "Remind me to run payroll.",
+            "supporting_question": "Should this include contractors?",
+            "supporting_response": "Yes.",
+            "user_timezone": "Asia/Ho_Chi_Minh",
+            "original_time_text": "tomorrow morning",
+            "recurrence_rule": "weekly",
+            "recurrence_timezone": "Asia/Ho_Chi_Minh",
+            "next_fire_time": later.isoformat(),
+            "parent_recurring_reminder_id": "parent-1",
+            "replacement_subject": "Quarterly payroll",
+            "replacement_time": later.isoformat(),
+            "replacement_summary": "",
+            "replacement_recurrence_rule": "",
+            "replacement_recurrence_timezone": "",
+            "confidence": 0.97,
+            "matched_fields": ["subject", "reminder_summary"],
+            "reason_summary": "Validated reminder update.",
+            "requires_hitl": True,
+            "factuality_concern": True,
+            "hitl_reason": "factuality_confirmation",
+        }
+    )
+
+    assert action.observed_reminder_time == BASE_TIME
+    assert action.event_time == BASE_TIME
+    assert action.reminder_time == BASE_TIME
+    assert action.next_fire_time == later
+    assert action.replacement_time == later
+    assert action.supporting_question == "Should this include contractors?"
+    assert action.supporting_response == "Yes."
+    assert action.recurrence_rule == "weekly"
+    assert action.recurrence_timezone == "Asia/Ho_Chi_Minh"
+    assert action.parent_recurring_reminder_id == "parent-1"
+    assert action.replacement_summary == ""
+    assert action.replacement_recurrence_rule == ""
+    assert action.replacement_recurrence_timezone == ""
+    assert action.requires_hitl
+    assert action.factuality_concern
+    assert action.hitl_reason == "factuality_confirmation"
+
+
 def test_reminder_add_exact_duplicate_is_a_safe_transactional_noop(
     repository: SQLiteRepository,
 ) -> None:
@@ -850,12 +992,35 @@ class _StaticKnowledgeBuilder:
         return [self.action]
 
 
+class _StaticKnowledgePipeline:
+    def __init__(self, action: ValidatedKnowledgeAction) -> None:
+        self.action = action
+
+    def build_action(self, **_kwargs):
+        return self.action
+
+
 class _StaticReminderBuilder:
     def __init__(self, action: ValidatedReminderAction) -> None:
         self.action = action
 
     def build_reminder_actions(self, *_args, **_kwargs):
         return [self.action]
+
+
+class _StaticExtractionDetector:
+    def __init__(self, metadata_key: str, payload: dict) -> None:
+        self.metadata_key = metadata_key
+        self.payload = dict(payload)
+        self.calls = 0
+
+    def detect(self, *_args, **_kwargs):
+        self.calls += 1
+        return SimpleNamespace(
+            requires_clarification=False,
+            missing_fields=[],
+            metadata={self.metadata_key: [dict(self.payload)]},
+        )
 
 
 def _context(query: str, metadata: dict) -> SimpleNamespace:
@@ -867,7 +1032,7 @@ def _context(query: str, metadata: dict) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("action_type", (KnowledgeAction.MODIFY, KnowledgeAction.DELETE))
-def test_knowledge_destructive_actions_require_confirmation_before_write(
+def test_knowledge_pass_executes_directly_without_pending_confirmation(
     repository: SQLiteRepository,
     config,
     action_type: KnowledgeAction,
@@ -898,9 +1063,11 @@ def test_knowledge_destructive_actions_require_confirmation_before_write(
     }
     if action_type is KnowledgeAction.MODIFY:
         payload["replacement_text"] = "Atlas retention is 45 days."
+    detector = _StaticExtractionDetector("knowledge_actions", payload)
     branch = KnowledgeFactsBranch(
         config=config,
-        validated_action_builder=_StaticKnowledgeBuilder(action),
+        action_detector=detector,
+        knowledge_mutation_pipeline=_StaticKnowledgePipeline(action),
     )
 
     result = branch.execute(
@@ -909,13 +1076,28 @@ def test_knowledge_destructive_actions_require_confirmation_before_write(
     )
 
     assert result.response_type is ResponseType.KNOWLEDGE_ACTION
-    assert len(result.actions_pending_confirmation) == 1
-    assert _knowledge_row(repository, original["chunk_id"])["is_deleted"] == 0
+    assert result.actions_pending_confirmation == []
+    assert _knowledge_row(repository, original["chunk_id"])["is_deleted"] == 1
     pending = repository.connection.execute(
         "SELECT * FROM pending_action_confirmations"
     ).fetchall()
-    assert len(pending) == 1
-    assert pending[0]["target_entity_id"] == original["chunk_id"]
+    assert pending == []
+    assert result.knowledge_operation_results
+    assert all(
+        operation.status == "committed"
+        for operation in result.knowledge_operation_results
+    )
+    active_rows = repository.connection.execute(
+        "SELECT raw_text FROM knowledge_chunks WHERE user_id = ? AND is_deleted = 0",
+        (USER_ID,),
+    ).fetchall()
+    if action_type is KnowledgeAction.MODIFY:
+        assert [row["raw_text"] for row in active_rows] == [
+            "Atlas retention is 45 days."
+        ]
+    else:
+        assert active_rows == []
+    assert detector.calls == 1
 
 
 @pytest.mark.parametrize(
@@ -948,10 +1130,6 @@ def test_reminder_confirmation_policy_matrix(
             replacement_time=BASE_TIME + timedelta(days=1),
         )
     action = _targeted_reminder_action(action_type, original, **changes)
-    branch = ReminderBranch(
-        config=config,
-        validated_action_builder=_StaticReminderBuilder(action),
-    )
     verb = {
         ReminderAction.DELETE: "Delete",
         ReminderAction.MODIFY: "Modify",
@@ -964,6 +1142,12 @@ def test_reminder_confirmation_policy_matrix(
     }
     if action_type is ReminderAction.MODIFY:
         payload["new_subject"] = "Moved payroll"
+    detector = _StaticExtractionDetector("reminder_actions", payload)
+    branch = ReminderBranch(
+        config=config,
+        action_detector=detector,
+        validated_action_builder=_StaticReminderBuilder(action),
+    )
 
     result = branch.execute(
         _context(f"{verb} the Payroll reminder.", {"reminder_actions": [payload]}),
@@ -981,6 +1165,7 @@ def test_reminder_confirmation_policy_matrix(
         assert result.actions_pending_confirmation == []
         assert len(result.reminder_operation_results) == 1
         assert result.reminder_operation_results[0].status == "committed"
+    assert detector.calls == 1
 
 
 def test_reminder_branch_exact_duplicate_is_safe_noop(
@@ -998,8 +1183,15 @@ def test_reminder_branch_exact_duplicate_is_safe_noop(
         event_time=datetime.fromisoformat(existing["reminder_time"]),
         confidence=1.0,
     )
+    payload = {
+        "action": "add",
+        "subject": "Payroll",
+        "reminder_time": existing["reminder_time"],
+    }
+    detector = _StaticExtractionDetector("reminder_actions", payload)
     branch = ReminderBranch(
         config=config,
+        action_detector=detector,
         validated_action_builder=_StaticReminderBuilder(action),
     )
 
@@ -1007,13 +1199,7 @@ def test_reminder_branch_exact_duplicate_is_safe_noop(
         _context(
             "Create the Payroll reminder.",
             {
-                "reminder_actions": [
-                    {
-                        "action": "add",
-                        "subject": "Payroll",
-                        "reminder_time": existing["reminder_time"],
-                    }
-                ]
+                "reminder_actions": [payload]
             },
         ),
         repository,
@@ -1022,3 +1208,4 @@ def test_reminder_branch_exact_duplicate_is_safe_noop(
     assert result.response_type is ResponseType.SAFE_NOOP
     assert result.actions_pending_confirmation == []
     assert repository.table_count("reminders") == 1
+    assert detector.calls == 1

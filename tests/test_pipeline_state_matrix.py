@@ -192,7 +192,16 @@ def test_pipeline_retrieval_gate_exhaustive_boolean_matrix(
 ) -> None:
     state = _last_qa_state()
     candidate = _retrieval_result()
-    retrieved_history = [{"hop_id": "hop-retrieved", "raw_user_query": "Earlier"}]
+    retrieved_history = [
+        {
+            "hop_id": "hop-retrieved",
+            "raw_user_query": "RAW_HISTORY_SENTINEL",
+            "rewritten_user_query": "Earlier",
+        }
+    ]
+    semantic_history = [
+        {"hop_id": "hop-retrieved", "rewritten_user_query": "Earlier"}
+    ]
     approved = _approved_context(retrieved_history)
     pipeline, retriever, context_filter, repository = _pipeline_probe(
         resolution=_resolution(state=state, skip=skip_broad_retrieval),
@@ -223,7 +232,7 @@ def test_pipeline_retrieval_gate_exhaustive_boolean_matrix(
         "conversation_retrieval" if expected_to_run else "last_qa"
     )
     assert observed["chat_history"] == (
-        retrieved_history if expected_to_run else last_qa_chat_history(state)
+        semantic_history if expected_to_run else last_qa_chat_history(state)
     )
     assert observed["scoped_history"] == observed["chat_history"]
     assert observed["resolution"].state is (None if expected_to_run else state)
@@ -325,7 +334,13 @@ def test_chat_history_source_precedence_complete_state_matrix(
     approved_variant: str,
 ) -> None:
     state = _last_qa_state() if last_qa_present else None
-    retrieved_history = [{"hop_id": "hop-approved", "raw_user_query": "Earlier"}]
+    retrieved_history = [
+        {
+            "hop_id": "hop-approved",
+            "raw_user_query": "RAW_HISTORY_SENTINEL",
+            "rewritten_user_query": "Earlier",
+        }
+    ]
     approved_context = {
         "none": None,
         "empty": _approved_context([]),
@@ -339,7 +354,11 @@ def test_chat_history_source_precedence_complete_state_matrix(
     )
 
     if conversation_retrieval:
-        expected = retrieved_history if approved_variant == "approved" else []
+        expected = (
+            [{"hop_id": "hop-approved", "rewritten_user_query": "Earlier"}]
+            if approved_variant == "approved"
+            else []
+        )
     else:
         expected = last_qa_chat_history(state)
     assert selected == expected

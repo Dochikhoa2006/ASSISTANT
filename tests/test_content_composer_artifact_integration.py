@@ -261,11 +261,15 @@ def test_compound_email_and_attachment_keep_real_outputs_disjoint(
     assert workbook_plan not in result.final_response_text
     assert repository.table_count("generated_artifacts") == 1
 
-    bundled = BundledResponse(
+    draft_query = (
+        "Draft an email about the Excel workbook to finance@example.com and "
+        "operations@example.com; do not send it."
+    )
+    draft_bundled = BundledResponse(
         final_chat_text=result.final_response_text,
         response_type=ResponseType.NORMAL,
         last_qa_state=LastQAState(
-            last_user_query=query,
+            last_user_query=draft_query,
             last_response=result.final_response_text,
             response_type=ResponseType.NORMAL,
         ),
@@ -278,13 +282,10 @@ def test_compound_email_and_attachment_keep_real_outputs_disjoint(
         llm=draft_llm,
         senders={"gmail": draft_sender},
     ).select(
-        bundled,
+        draft_bundled,
         ChatRequest(
             user_id="artifact-integration-user",
-            raw_query=(
-                "Draft an email about the Excel workbook to finance@example.com and "
-                "operations@example.com; do not send it."
-            ),
+            raw_query="RAW_DELIVERY_SENTINEL must not control the draft",
         ),
     )
 
@@ -301,17 +302,28 @@ def test_compound_email_and_attachment_keep_real_outputs_disjoint(
 
     send_sender = RecordingGmailSender()
     send_llm = ScriptedPlatformLLM(body=email_copy, mode="send")
+    send_query = (
+        "Email the Excel workbook to finance@example.com and "
+        "operations@example.com now."
+    )
+    send_bundled = BundledResponse(
+        final_chat_text=result.final_response_text,
+        response_type=ResponseType.NORMAL,
+        last_qa_state=LastQAState(
+            last_user_query=send_query,
+            last_response=result.final_response_text,
+            response_type=ResponseType.NORMAL,
+        ),
+        platform_payload={"artifacts": list(result.artifacts)},
+    )
     sent = PlatformSelector(
         llm=send_llm,
         senders={"gmail": send_sender},
     ).select(
-        bundled,
+        send_bundled,
         ChatRequest(
             user_id="artifact-integration-user",
-            raw_query=(
-                "Email the Excel workbook to finance@example.com and "
-                "operations@example.com now."
-            ),
+            raw_query="RAW_DELIVERY_SENTINEL must not authorize sending",
             platform_context={
                 "gmail_username": "sender@example.com",
                 "gmail_app_password": "test-app-password",

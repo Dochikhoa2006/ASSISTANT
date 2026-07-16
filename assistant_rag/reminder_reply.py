@@ -45,7 +45,7 @@ def build_reminder_reply_last_qa(context: dict[str, Any]) -> LastQAState:
     reminder_question = _question_from_value(context.get("supporting_question"), QuestionSource.REMINDER_SUPPORTING_QUESTION)
     response_type = _response_type(context.get("source_response_type"))
     return LastQAState(
-        last_user_query=str(context.get("source_rewritten_user_query") or context.get("source_raw_user_query") or ""),
+        last_user_query=str(context.get("source_rewritten_user_query") or ""),
         last_response=str(context.get("source_raw_response") or context.get("supporting_response") or ""),
         response_type=response_type,
         supporting_questions=supporting_questions,

@@ -14,6 +14,7 @@ from .contracts import (
 from .config import ContextFilterConfig
 from .llm import LLMClient
 from .prompts import PromptRegistry
+from .conversation_embedding import conversation_hop_semantic_payload
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +136,7 @@ class HardRuleContextFilter:
         rejected_conversation_ids: list[str] = []
         seen_conversation_ids: set[str] = set()
         for result in conversation_results:
-            payload = result.payload
+            payload = conversation_hop_semantic_payload(result.payload)
             payload_user_id = payload.get("user_id")
             if payload_user_id != user_id:
                 rejected_conversation_ids.append(result.entity_id)
@@ -179,7 +180,7 @@ class HardRuleContextFilter:
         
         seen_conversation_ids: set[str] = set()
         for result in conversation_results:
-            payload = result.payload
+            payload = conversation_hop_semantic_payload(result.payload)
             payload_user_id = payload.get("user_id")
             if payload_user_id != user_id:
                 rejected_conversation_ids.append(result.entity_id)

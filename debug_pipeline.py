@@ -22,7 +22,6 @@ from assistant_rag.branch_orchestration import (
     ReminderTargetResolver,
     ValidatedActionBuilder,
 )
-from assistant_rag.action_detection import DeterministicActionDetector
 from assistant_rag.branches import (
     BranchRouter,
     ClarificationBranch,
@@ -65,6 +64,13 @@ from assistant_rag.knowledge_mutation import (
     KnowledgeMutationPipeline,
     LLMKnowledgeActionDetector,
 )
+from assistant_rag.reminder_mutation import (
+    REMINDER_EDITABLE_FIELDS,
+    LLMReminderActionDetector,
+    ReminderActionValidationStrategy,
+    ReminderContentFinalizationStrategy,
+    ReminderMutationPipeline,
+)
 from assistant_rag.general_sub_branch import GeneralSubBranchDetector
 from assistant_rag.last_qa import InMemoryLastQAStore
 from assistant_rag.llm import (
@@ -79,6 +85,7 @@ from assistant_rag.llm import (
 )
 from assistant_rag.observability import JsonLogFormatter, current_trace, new_request_id, start_trace
 from assistant_rag.onnx_llm import ONNXLLMClient, _adaptive_max_new_tokens, _sentence_boundary_stop_reason
+from assistant_rag.ops_cli import LocalMemoryIndex
 from assistant_rag.platform import GmailSender, PlatformSelector
 from assistant_rag.production_factory import (
     build_assistant_config,
@@ -459,6 +466,11 @@ class DeterministicRetriever:
         self.conversation_min_score = conversation_min_score
         self.conversation_calls = 0
         self.knowledge_calls = 0
+        # The deterministic retriever still reads SQL directly, but exposing
+        # the two derived stores makes every scenario exercise the production
+        # request-scoped outbox fanout contract as well.
+        self.bm25 = LocalMemoryIndex()
+        self.chroma = LocalMemoryIndex()
 
     def retrieve_conversation(
         self, *, user_id: str, query: str
@@ -467,7 +479,7 @@ class DeterministicRetriever:
         query_norm = _normalize(query)
         rows = self.repository.connection.execute(
             """
-            SELECT h.hop_id, h.topic_id, h.user_id, h.raw_user_query,
+            SELECT h.hop_id, h.topic_id, h.user_id, h.rewritten_user_query,
                     h.raw_response, h.supporting_questions_json, h.entities_json
             FROM conversation_hops h
             WHERE h.user_id = ?
@@ -477,7 +489,10 @@ class DeterministicRetriever:
         ).fetchall()
         results: list[RetrievalResult] = []
         for row in rows:
-            text = f"User: {row['raw_user_query']}\nAssistant: {row['raw_response']}"
+            text = (
+                f"User: {row['rewritten_user_query']}\n"
+                f"Assistant: {row['raw_response']}"
+            )
             score = _token_overlap(query_norm, _normalize(text))
             payload = {
                 "hop_id": row["hop_id"],
@@ -566,61 +581,103 @@ class ScenarioLLM:
         prefix = "Runtime context:\n"
         payload = json.loads(prompt[len(prefix) :]) if prompt.startswith(prefix) else {}
         if task is LLMTask.KNOWLEDGE_ACTION_EXTRACTION:
-            request = ChatRequest(
-                user_id=str(payload.get("user_id") or DEBUG_USER),
-                raw_query=str(payload.get("raw_query") or ""),
+            raw_query = str(payload.get("raw_query") or "").strip()
+            extra = payload.get("extra") or {}
+            confirmed = list(
+                extra.get("trusted_confirmation_action_context") or []
             )
-            detected = DeterministicActionDetector().detect(
-                request,
-                str(payload.get("rewritten_query") or request.raw_query),
-                Intent.KNOWLEDGE_FACTS,
-            )
-            actions = list(detected.metadata.get("knowledge_actions") or [])
-            if len(actions) != 1:
-                return {
-                    "action": "add",
-                    "text_content": "",
-                    "original_text": "",
-                    "replacement_text": "",
-                    "confidence": 0.0,
-                    "missing_fields": list(detected.missing_fields or ["action_keyword"]),
-                    "reason_summary": "Debug extraction requires one complete action.",
-                }
-            action = actions[0]
-            action_name = str(action.get("action") or "")
+            confirmed_action = confirmed[0] if len(confirmed) == 1 else {}
+            if confirmed_action:
+                action_name = str(confirmed_action.get("action") or "")
+                if action_name == "add":
+                    text_content = str(
+                        confirmed_action.get("knowledge_text")
+                        or confirmed_action.get("new_text")
+                        or ""
+                    )
+                    original_text = ""
+                    replacement_text = ""
+                elif action_name == "delete":
+                    text_content = str(
+                        confirmed_action.get("target_description") or ""
+                    )
+                    original_text = ""
+                    replacement_text = ""
+                else:
+                    text_content = ""
+                    original_text = str(
+                        confirmed_action.get("target_description") or ""
+                    )
+                    replacement_text = str(
+                        confirmed_action.get("replacement_text")
+                        or confirmed_action.get("new_text")
+                        or ""
+                    )
+            else:
+                folded = raw_query.casefold()
+                if re.match(r"^(?:delete|remove|erase|forget)\b", folded):
+                    action_name = "delete"
+                elif re.match(
+                    r"^(?:change|modify|update|edit|replace|revise)\b",
+                    folded,
+                ):
+                    action_name = "modify"
+                else:
+                    action_name = "add"
+                body = re.sub(
+                    r"(?i)^(?:remember(?:\s+that)?|save|store|record|add)\s+",
+                    "",
+                    raw_query,
+                ).strip(" .")
+                text_content = body if action_name == "add" else ""
+                original_text = ""
+                replacement_text = ""
+                if action_name == "delete":
+                    text_content = re.sub(
+                        r"(?i)^(?:delete|remove|erase|forget)\s+",
+                        "",
+                        raw_query,
+                    ).strip(" .")
+                elif action_name == "modify":
+                    body = re.sub(
+                        r"(?i)^(?:change|modify|update|edit|replace|revise)\s+",
+                        "",
+                        raw_query,
+                    ).strip(" .")
+                    match = re.match(r"(?is)^(.+?)\s+(?:to|with)\s+(.+)$", body)
+                    original_text = match.group(1).strip() if match else body
+                    replacement_text = match.group(2).strip() if match else ""
             return {
                 "action": action_name,
-                "text_content": (
-                    str(action.get("text") or action.get("target_description") or "")
-                    if action_name in {"add", "delete"}
-                    else ""
-                ),
-                "original_text": (
-                    str(action.get("target_description") or "")
-                    if action_name == "modify"
-                    else ""
-                ),
-                "replacement_text": (
-                    str(action.get("replacement_text") or "")
-                    if action_name == "modify"
-                    else ""
-                ),
+                "text_content": text_content,
+                "original_text": original_text,
+                "replacement_text": replacement_text,
                 "confidence": 0.99,
                 "missing_fields": (
                     ["replacement_text"]
-                    if action_name == "modify" and not action.get("replacement_text")
+                    if action_name == "modify" and not replacement_text
+                    else ["text_content"]
+                    if action_name in {"add", "delete"} and not text_content
                     else []
                 ),
-                "reason_summary": "Deterministic debug extraction.",
+                "reason_summary": "Scenario LLM selected one knowledge action.",
             }
 
         if task is LLMTask.KNOWLEDGE_ACTION_VALIDATION:
-            extra = payload.get("extra") or {}
-            operation = str(extra.get("operation") or "")
-            target = str(extra.get("target_description") or "")
-            proposed = str(extra.get("proposed_content") or "")
-            replacement = str(extra.get("replacement_content") or "")
-            candidates = list(extra.get("candidate_chunks") or [])
+            first_response = payload.get("first_model_response") or {}
+            operation = str(first_response.get("action") or "")
+            proposed = (
+                str(first_response.get("text_content") or "")
+                if operation == "add"
+                else ""
+            )
+            target = (
+                str(first_response.get("text_content") or "")
+                if operation == "delete"
+                else str(first_response.get("original_text") or "")
+            )
+            replacement = str(first_response.get("replacement_text") or "")
+            candidates = list(payload.get("knowledge_retrieval") or [])
             assessments: list[dict[str, Any]] = []
             selected: list[str] = []
             for candidate in candidates:
@@ -635,9 +692,16 @@ class ScenarioLLM:
                     )
                     matched_text = text if matches else ""
                 elif operation == "modify":
-                    replacement_value = re.search(r"\b\d+\s+days?\b", replacement, re.I)
+                    replacement_value = re.search(
+                        r"\b\d+\s+days?\b", replacement, re.I
+                    )
                     old_value = re.search(r"\b\d+\s+days?\b", text, re.I)
-                    if replacement_value and old_value:
+                    replacement_is_only_value = bool(
+                        replacement_value
+                        and replacement.strip(" .").casefold()
+                        == replacement_value.group(0).casefold()
+                    )
+                    if replacement_is_only_value and old_value:
                         matched_text = old_value.group(0)
                         matches = True
                     elif target and target.casefold() in text.casefold():
@@ -661,7 +725,17 @@ class ScenarioLLM:
                             matches = True
                 elif target and target.casefold() in text.casefold():
                     start = text.casefold().index(target.casefold())
-                    matched_text = text[start : start + len(target)]
+                    target_key = " ".join(
+                        re.findall(r"[a-z0-9]+", target.casefold())
+                    )
+                    text_key = " ".join(
+                        re.findall(r"[a-z0-9]+", text.casefold())
+                    )
+                    matched_text = (
+                        text
+                        if operation == "delete" and target_key == text_key
+                        else text[start : start + len(target)]
+                    )
                     matches = True
                 if matches and operation in {"delete", "modify"} and not selected:
                     selected = [key]
@@ -678,24 +752,53 @@ class ScenarioLLM:
                 )
             if operation == "add":
                 duplicate = any(item["matches_target"] for item in assessments)
-                validation_result = "SKIP_ALREADY_EXISTS" if duplicate else "EXECUTE"
+                decision = "FAIL" if duplicate else "PASS"
+                clarification_question = (
+                    "That fact is already stored. What different fact should I add?"
+                    if duplicate
+                    else ""
+                )
                 selected = []
-                should_execute = not duplicate
-            elif selected:
-                validation_result = "EXECUTE"
-                should_execute = True
+            elif selected and not (
+                operation == "delete"
+                and " ".join(
+                    re.findall(
+                        r"[a-z0-9]+",
+                        next(
+                            item["matched_text"]
+                            for item in assessments
+                            if item["candidate_key"] == selected[0]
+                        ).casefold(),
+                    )
+                )
+                != " ".join(
+                    re.findall(
+                        r"[a-z0-9]+",
+                        next(
+                            str(candidate.get("text_excerpt") or "")
+                            for candidate in candidates
+                            if str(candidate.get("candidate_key") or "")
+                            == selected[0]
+                        ).casefold(),
+                    )
+                )
+            ):
+                decision = "PASS"
+                clarification_question = ""
             else:
-                validation_result = "SKIP_NOT_FOUND"
-                should_execute = False
+                decision = "FAIL"
+                selected = []
+                clarification_question = (
+                    "Which complete stored knowledge item should I delete?"
+                    if operation == "delete"
+                    else "Which stored fact should I modify, and what should replace it?"
+                )
             return {
                 "operation": operation,
-                "validation_result": validation_result,
+                "decision": decision,
                 "selected_candidate_keys": selected,
                 "confidence": 0.99,
-                "ambiguous": False,
-                "should_execute": should_execute,
-                "requires_hitl": False,
-                "factuality_concern": False,
+                "clarification_question": clarification_question,
                 "reason_summary": "Deterministic debug validation.",
                 "candidate_assessments": assessments,
             }
@@ -706,25 +809,404 @@ class ScenarioLLM:
             extracted = extra.get("extracted_action_content") or {}
             candidates = list(extra.get("validated_candidate_context") or [])
             validation = extra.get("validation_result") or {}
-            if operation == "add":
-                final_content = str(extracted.get("text_content") or "")
-            else:
-                selected = next(
-                    (item for item in candidates if item.get("selected")),
-                    {},
-                )
-                final_content = str(selected.get("text") or "")
-                if operation == "modify":
-                    assessments = list(validation.get("candidate_assessments") or [])
-                    matched_text = str(
-                        assessments[0].get("matched_text") if assessments else ""
-                    )
-                    replacement = str(extracted.get("replacement_text") or "")
-                    final_content = final_content.replace(matched_text, replacement, 1)
+            selected = next(
+                (item for item in candidates if item.get("selected")),
+                {},
+            )
+            final_content = str(selected.get("text") or "")
+            matched_text = str(selected.get("matched_text") or "")
+            replacement = str(extracted.get("replacement_text") or "")
+            if operation == "modify":
+                final_content = final_content.replace(matched_text, replacement, 1)
             return {
                 "final_content": final_content,
                 "confidence": 0.99,
                 "reason_summary": "Deterministic debug finalization.",
+            }
+
+        if task is LLMTask.REMINDER_ACTION_EXTRACTION:
+            raw_query = str(payload.get("raw_query") or "")
+            extra = payload.get("extra") or {}
+            confirmed = list(
+                extra.get("trusted_confirmation_action_context") or []
+            )
+            source = dict(confirmed[0]) if len(confirmed) == 1 else {}
+            if not source:
+                folded = raw_query.casefold()
+                if re.match(r"^\s*(?:turn|switch)\s+off\b", folded):
+                    action_name = "toggle"
+                    toggle_direction = "turn_off"
+                elif re.match(r"^\s*(?:turn|switch)\s+on\b", folded):
+                    action_name = "toggle"
+                    toggle_direction = "turn_on"
+                elif re.match(r"^\s*(?:delete|remove|cancel)\b", folded):
+                    action_name = "delete"
+                    toggle_direction = ""
+                elif re.match(
+                    r"^\s*(?:modify|change|update|edit|move)\b", folded
+                ):
+                    action_name = "modify"
+                    toggle_direction = ""
+                else:
+                    action_name = "add"
+                    toggle_direction = ""
+                source = {
+                    "action": action_name,
+                    "toggle_direction": toggle_direction,
+                }
+                if action_name == "add":
+                    subject = re.sub(
+                        r"(?i)^\s*(?:remind\s+me\s+to|set\s+a\s+reminder\s+to|add\s+a\s+reminder\s+to)\s+",
+                        "",
+                        raw_query,
+                    ).strip(" .")
+                    subject = re.split(
+                        r"(?i)\s+(?:tomorrow|at\s+\d{4}-\d{2}-\d{2}t)",
+                        subject,
+                        maxsplit=1,
+                    )[0].strip(" .")
+                    iso_match = re.search(
+                        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})",
+                        raw_query,
+                        re.I,
+                    )
+                    source.update(
+                        {
+                            "subject": subject,
+                            "reminder_summary": subject,
+                            "raw_reminder": subject,
+                            "notification_time": (
+                                iso_match.group(0)
+                                if iso_match
+                                else "2035-04-05T09:30:00+00:00"
+                                if "tomorrow" in folded
+                                else ""
+                            ),
+                            "user_timezone": "UTC",
+                            "original_time_text": (
+                                iso_match.group(0)
+                                if iso_match
+                                else "tomorrow"
+                                if "tomorrow" in folded
+                                else ""
+                            ),
+                        }
+                    )
+                elif action_name == "modify":
+                    target_match = re.search(
+                        r"(?i)^\s*(?:modify|change|update|edit|move)\s+(?:the\s+)?(.+?)\s+reminder(?:\s*:|\s+to|\s*$)",
+                        raw_query,
+                    )
+                    subject_match = re.search(
+                        r"(?i)(?:subject|title)\s+to\s+(.+?)(?:\s+and\s+the\s+notification|\s+and\s+notification|$)",
+                        raw_query,
+                    )
+                    time_match = re.search(
+                        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})",
+                        raw_query,
+                        re.I,
+                    )
+                    source["target_description"] = (
+                        target_match.group(1).strip() if target_match else ""
+                    )
+                    if subject_match:
+                        source["new_subject"] = subject_match.group(1).strip(" .")
+                    if time_match:
+                        source["new_reminder_time"] = time_match.group(0)
+                        source["original_time_text"] = time_match.group(0)
+                else:
+                    target = re.sub(
+                        r"(?i)^\s*(?:delete|remove|cancel|turn\s+on|turn\s+off|switch\s+on|switch\s+off)\s+(?:the\s+)?",
+                        "",
+                        raw_query,
+                    )
+                    source["target_description"] = re.sub(
+                        r"(?i)\s+reminder\s*$", "", target
+                    ).strip(" .")
+            stored_action = str(source.get("action") or "add")
+            if stored_action in {"turn_on", "turn_off"}:
+                action = "toggle"
+                toggle_direction = stored_action
+            else:
+                action = stored_action
+                toggle_direction = str(source.get("toggle_direction") or "")
+            record = {field: "" for field in REMINDER_EDITABLE_FIELDS}
+            retrieval_text = str(
+                source.get("retrieval_text")
+                or source.get("target_description")
+                or source.get("subject")
+                or source.get("reminder_summary")
+                or source.get("raw_reminder")
+                or ""
+            ).strip()
+            changed_fields = [str(item) for item in source.get("changed_fields") or []]
+
+            if action == "add":
+                record.update(
+                    {
+                        "subject": str(source.get("subject") or retrieval_text).strip(),
+                        "reminder_summary": str(
+                            source.get("reminder_summary")
+                            or source.get("subject")
+                            or retrieval_text
+                        ).strip(),
+                        "raw_reminder": str(source.get("raw_reminder") or raw_query).strip(),
+                        "notification_time": str(
+                            source.get("notification_time")
+                            or source.get("reminder_time")
+                            or ""
+                        ).strip(),
+                        "event_time": str(source.get("event_time") or "").strip(),
+                        "user_timezone": str(
+                            source.get("user_timezone")
+                            or (payload.get("platform_context") or {}).get("timezone")
+                            or "UTC"
+                        ).strip(),
+                        "original_time_text": str(
+                            source.get("original_time_text") or raw_query
+                        ).strip(),
+                        "recurrence_rule": str(source.get("recurrence_rule") or "").strip(),
+                        "recurrence_timezone": str(
+                            source.get("recurrence_timezone") or ""
+                        ).strip(),
+                        "supporting_question": str(
+                            source.get("supporting_question") or ""
+                        ).strip(),
+                        "supporting_response": str(
+                            source.get("supporting_response") or ""
+                        ).strip(),
+                    }
+                )
+                changed_fields = []
+            elif action == "modify":
+                replacement_keys = {
+                    "subject": ("subject", "new_subject", "replacement_subject"),
+                    "reminder_summary": (
+                        "reminder_summary",
+                        "new_summary",
+                        "replacement_summary",
+                    ),
+                    "raw_reminder": ("raw_reminder", "replacement_raw_reminder"),
+                    "notification_time": (
+                        "notification_time",
+                        "new_reminder_time",
+                        "replacement_time",
+                    ),
+                    "event_time": ("event_time", "new_event_time"),
+                    "user_timezone": ("user_timezone",),
+                    "original_time_text": ("original_time_text",),
+                    "recurrence_rule": (
+                        "recurrence_rule",
+                        "replacement_recurrence_rule",
+                    ),
+                    "recurrence_timezone": (
+                        "recurrence_timezone",
+                        "replacement_recurrence_timezone",
+                    ),
+                    "supporting_question": ("supporting_question",),
+                    "supporting_response": ("supporting_response",),
+                }
+                for field, keys in replacement_keys.items():
+                    present_key = next((key for key in keys if key in source), None)
+                    if present_key is None:
+                        continue
+                    record[field] = str(source.get(present_key) or "").strip()
+                    if field not in changed_fields:
+                        changed_fields.append(field)
+                if record["notification_time"] or record["event_time"]:
+                    record["original_time_text"] = str(
+                        source.get("original_time_text") or raw_query
+                    ).strip()
+                    if "original_time_text" not in changed_fields:
+                        changed_fields.append("original_time_text")
+
+            time_fields = {
+                field for field in ("notification_time", "event_time") if record[field]
+            }
+            time_semantics = (
+                "both"
+                if len(time_fields) == 2
+                else next(iter(time_fields))
+                if time_fields
+                else "unchanged"
+            )
+            missing_fields: list[str] = []
+            if not retrieval_text:
+                missing_fields.append("retrieval_text")
+            if action == "add":
+                if not record["subject"]:
+                    missing_fields.append("subject")
+                if not (record["notification_time"] or record["event_time"]):
+                    missing_fields.append("notification_time")
+            elif action == "modify" and not changed_fields:
+                missing_fields.append("changed_fields")
+            return {
+                "action": action,
+                "toggle_direction": toggle_direction,
+                "retrieval_text": retrieval_text,
+                "changed_fields": changed_fields,
+                **record,
+                "time_semantics": time_semantics,
+                "confidence": 0.99 if not missing_fields else 0.0,
+                "missing_fields": missing_fields,
+                "reason_summary": "Scenario LLM selected one reminder action.",
+            }
+
+        if task is LLMTask.REMINDER_ACTION_VALIDATION:
+            extra = payload.get("extra") or {}
+            operation = str(extra.get("operation") or "")
+            extracted = extra.get("extracted_action") or {}
+            target = str(extracted.get("retrieval_text") or "").strip()
+            candidates = list(extra.get("candidate_reminders") or [])
+            allowed_statuses = set(
+                (extra.get("validation_policy") or {}).get("allowed_statuses") or []
+            )
+            no_op_statuses = set(
+                (extra.get("validation_policy") or {}).get("no_op_statuses") or []
+            )
+            assessments: list[dict[str, Any]] = []
+            compatible_matches: list[str] = []
+            no_op_matches: list[str] = []
+            semantic_matches: list[str] = []
+            for candidate in candidates:
+                candidate_key = str(candidate.get("candidate_key") or "")
+                matched_field = ""
+                matched_text = ""
+                for field in REMINDER_EDITABLE_FIELDS:
+                    value = str(candidate.get(field) or "")
+                    if not value or not target:
+                        continue
+                    folded_value = value.casefold()
+                    folded_target = target.casefold()
+                    if folded_target in folded_value:
+                        start = folded_value.index(folded_target)
+                        matched_field = field
+                        matched_text = value[start : start + len(target)]
+                        break
+                    target_terms = set(re.findall(r"[a-z0-9]+", folded_target))
+                    value_terms = set(re.findall(r"[a-z0-9]+", folded_value))
+                    if target_terms and len(target_terms & value_terms) / len(target_terms) >= 0.6:
+                        matched_field = field
+                        matched_text = value
+                        break
+                matches = bool(matched_field)
+                compatible = str(candidate.get("status") or "") in allowed_statuses
+                if matches:
+                    semantic_matches.append(candidate_key)
+                if matches and compatible:
+                    compatible_matches.append(candidate_key)
+                if matches and str(candidate.get("status") or "") in no_op_statuses:
+                    no_op_matches.append(candidate_key)
+                assessments.append(
+                    {
+                        "candidate_key": candidate_key,
+                        "matches_target": matches,
+                        "action_compatible": compatible,
+                        "confidence": 0.99 if matches else 0.95,
+                        "matched_fields": [matched_field] if matches else [],
+                        "matched_text": matched_text,
+                        "reason_summary": "Deterministic complete SQL reminder assessment.",
+                    }
+                )
+
+            asserted_fields = (
+                REMINDER_EDITABLE_FIELDS
+                if operation == "add"
+                else tuple(str(item) for item in extracted.get("changed_fields") or [])
+            )
+            asserted_text = " ".join(str(extracted.get(field) or "") for field in asserted_fields)
+            factuality_concern = bool(
+                re.search(r"\b1\s*\+\s*1\s*=\s*3\b", asserted_text)
+            )
+            selected: list[str] = []
+            ambiguous = False
+            requires_hitl = False
+            hitl_reason = ""
+            if factuality_concern:
+                result = "CLARIFY_MISSING_FIELDS"
+                should_execute = False
+                requires_hitl = True
+                hitl_reason = "factuality_concern"
+            elif operation == "add":
+                result = "SKIP_ALREADY_EXISTS" if compatible_matches else "EXECUTE"
+                should_execute = not compatible_matches
+            elif len(semantic_matches) > 1:
+                result = "CLARIFY_AMBIGUOUS_TARGET"
+                should_execute = False
+                ambiguous = True
+                requires_hitl = True
+                hitl_reason = "ambiguous_target"
+            elif len(compatible_matches) == 1:
+                candidate = next(
+                    item
+                    for item in candidates
+                    if str(item.get("candidate_key") or "") == compatible_matches[0]
+                )
+                changed_fields = {
+                    str(item) for item in extracted.get("changed_fields") or []
+                }
+                compared_fields = set(changed_fields)
+                if changed_fields & {"notification_time", "event_time"}:
+                    compared_fields.discard("original_time_text")
+                same_modify = operation == "modify" and compared_fields and all(
+                    str(extracted.get(field) or "").strip()
+                    == str(candidate.get(field) or "").strip()
+                    for field in compared_fields
+                )
+                if same_modify:
+                    result = "SKIP_ALREADY_EXISTS"
+                    selected = compatible_matches
+                    should_execute = False
+                else:
+                    result = "EXECUTE"
+                    selected = compatible_matches
+                    should_execute = True
+            elif len(no_op_matches) == 1:
+                result = "SKIP_ALREADY_EXISTS"
+                selected = no_op_matches
+                should_execute = False
+            else:
+                result = "SKIP_NOT_FOUND"
+                should_execute = False
+            return {
+                "operation": operation,
+                "validation_result": result,
+                "selected_candidate_keys": selected,
+                "confidence": 0.99,
+                "ambiguous": ambiguous,
+                "should_execute": should_execute,
+                "requires_hitl": requires_hitl,
+                "factuality_concern": factuality_concern,
+                "hitl_reason": hitl_reason,
+                "reason_summary": "Deterministic debug reminder validation.",
+                "candidate_assessments": assessments,
+            }
+
+        if task is LLMTask.REMINDER_CONTENT_FINALIZATION:
+            extra = payload.get("extra") or {}
+            operation = str(extra.get("operation") or "")
+            extracted = extra.get("extracted_action_manifest") or {}
+            selected = extra.get("selected_candidate_manifest") or {}
+            changed_fields = {
+                str(field) for field in extracted.get("changed_fields") or []
+            }
+            field_bindings = []
+            for field in REMINDER_EDITABLE_FIELDS:
+                source = (
+                    "extracted_action"
+                    if operation == "add"
+                    or (operation == "modify" and field in changed_fields)
+                    else "selected_candidate"
+                )
+                field_bindings.append({"field": field, "source": source})
+            return {
+                "operation": operation,
+                "selected_candidate_key": str(
+                    (selected or {}).get("candidate_key") or ""
+                ),
+                "field_bindings": field_bindings,
+                "confidence": 0.99,
+                "reason_summary": "Deterministic debug reminder finalization.",
             }
 
         raise AssertionError("deterministic content composer must not request a ReAct decision")
@@ -806,6 +1288,23 @@ def build_scenario_state(settings: ProductionSettings) -> ScenarioState:
             ),
         ),
     )
+    reminder_llm = ScenarioLLM()
+    reminder_validator = ReminderActionValidationStrategy(
+        config=config,
+        llm=reminder_llm,
+        prompts=DEFAULT_PROMPT_REGISTRY,
+    )
+    reminder_pipeline = ReminderMutationPipeline(
+        config=config,
+        validator=reminder_validator,
+        finalizer=ReminderContentFinalizationStrategy(
+            llm=reminder_llm,
+            prompts=DEFAULT_PROMPT_REGISTRY,
+            min_confidence=(
+                config.retrieval_validation.reminder_llm_validation_min_confidence
+            ),
+        ),
+    )
     gp_config = GeneralPurposeConfig(
         general_sub_branch_detector_enabled=True,
         content_composer_enabled=False,
@@ -847,14 +1346,20 @@ def build_scenario_state(settings: ProductionSettings) -> ScenarioState:
             ),
             Intent.REMINDER: ReminderBranch(
                 config=config,
-                action_detector=None,
+                action_detector=LLMReminderActionDetector(
+                    llm=reminder_llm,
+                    prompts=DEFAULT_PROMPT_REGISTRY,
+                    min_confidence=debug_settings.prompt_policy.action_min_confidence,
+                    default_timezone=config.default_timezone,
+                ),
                 clarification_strategy=clarification_strategy,
                 reminder_supporting_strategy=OptionalReminderSupportingStrategy(),
                 prompt_registry=DEFAULT_PROMPT_REGISTRY,
                 validated_action_builder=validated_builder,
                 retriever=retriever,
                 context_filter=context_filter,
-                llm=None,
+                llm=reminder_llm,
+                reminder_mutation_pipeline=reminder_pipeline,
             ),
         }
     )
@@ -889,15 +1394,77 @@ def run_request(
     metadata: dict[str, Any] | None = None,
     platform_context: dict[str, Any] | None = None,
 ) -> BundledResponse:
-    return state.pipeline.handle(
+    request_metadata = metadata or {}
+    response = state.pipeline.handle(
         ChatRequest(
             user_id=state.user_id,
             raw_query=query,
-            metadata=metadata or {},
+            metadata=request_metadata,
             platform_context=platform_context or {},
         ),
         state.repository,
     )
+    selected_intent = Intent(
+        request_metadata.get("intent", Intent.GENERAL_RESPONSE.value)
+    )
+    if selected_intent is Intent.CLARIFICATION:
+        if response.conversation_hop_id is not None:
+            raise AssertionError(
+                "the clarification branch unexpectedly persisted a conversation hop"
+            )
+        return response
+
+    if selected_intent not in {
+        Intent.GENERAL_RESPONSE,
+        Intent.KNOWLEDGE_FACTS,
+        Intent.REMINDER,
+    }:
+        return response
+    if not response.conversation_topic_id or not response.conversation_hop_id:
+        raise AssertionError(
+            f"{selected_intent.value} returned without a persisted conversation hop"
+        )
+    persisted = state.repository.connection.execute(
+        """
+        SELECT topic_id, intent, response_type
+        FROM conversation_hops
+        WHERE user_id = ? AND hop_id = ?
+        """,
+        (state.user_id, response.conversation_hop_id),
+    ).fetchone()
+    if persisted is None:
+        raise AssertionError(
+            f"{selected_intent.value} hop is missing from SQL source truth"
+        )
+    if (
+        str(persisted["topic_id"]) != response.conversation_topic_id
+        or str(persisted["intent"]) != selected_intent.value
+    ):
+        raise AssertionError(
+            f"{selected_intent.value} hop identity does not match SQL source truth"
+        )
+    for store_name, store in (
+        ("OpenSearch", state.retriever.bm25),
+        ("ChromaDB", state.retriever.chroma),
+    ):
+        indexed = store.get_document(entity_id=response.conversation_hop_id)
+        if indexed is None or indexed.get("entity_type") != "conversation_hop":
+            raise AssertionError(
+                f"{selected_intent.value} hop was not synchronized to {store_name}"
+            )
+    outbox = state.repository.connection.execute(
+        """
+        SELECT status FROM indexing_outbox
+        WHERE entity_type = 'conversation_hop' AND entity_id = ?
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (response.conversation_hop_id,),
+    ).fetchone()
+    if outbox is None or str(outbox["status"]) != "completed":
+        raise AssertionError(
+            f"{selected_intent.value} hop outbox job was not completed"
+        )
+    return response
 
 
 def seed_conversation(
@@ -993,6 +1560,40 @@ def assert_response(
     if expected_text and expected_text.casefold() not in response.final_chat_text.casefold():
         raise AssertionError(
             f"expected text containing {expected_text!r}, got {response.final_chat_text!r}"
+        )
+
+
+def assert_knowledge_audit_binding(
+    state: ScenarioState,
+    response: BundledResponse,
+    *,
+    action: str,
+    knowledge_topic_id: str,
+    knowledge_chunk_id: str,
+) -> None:
+    row = state.repository.connection.execute(
+        """
+        SELECT entities_json FROM conversation_hops
+        WHERE user_id = ? AND hop_id = ?
+        """,
+        (state.user_id, response.conversation_hop_id),
+    ).fetchone()
+    if row is None:
+        raise AssertionError("knowledge audit hop is missing from SQL")
+    entities = json.loads(str(row["entities_json"] or "{}"))
+    knowledge_entities = entities.get("knowledge") or []
+    if len(knowledge_entities) != 1:
+        raise AssertionError(
+            f"knowledge audit hop must bind exactly one action: {knowledge_entities!r}"
+        )
+    binding = knowledge_entities[0]
+    if (
+        binding.get("action") != action
+        or binding.get("knowledge_topic_id") != knowledge_topic_id
+        or binding.get("knowledge_chunk_id") != knowledge_chunk_id
+    ):
+        raise AssertionError(
+            f"knowledge audit binding does not match its SQL mutation: {binding!r}"
         )
 
 
@@ -1867,9 +2468,12 @@ def scenario_last_qa_mandatory_before_classification(settings: ProductionSetting
     )
 
 
-def scenario_deterministic_action_detection(settings: ProductionSettings) -> ScenarioResult:
-    """Action selection must use exact raw-query keywords without a model."""
-    detector = DeterministicActionDetector()
+def scenario_llm_first_action_extraction(settings: ProductionSettings) -> ScenarioResult:
+    """The selected knowledge branch must begin with its extraction model."""
+    detector = LLMKnowledgeActionDetector(
+        llm=ScenarioLLM(),
+        prompts=DEFAULT_PROMPT_REGISTRY,
+    )
     result = detector.detect(
         ChatRequest(
             user_id=DEBUG_USER,
@@ -1880,32 +2484,36 @@ def scenario_deterministic_action_detection(settings: ProductionSettings) -> Sce
     )
     actions = result.metadata.get("knowledge_actions") or []
     if len(actions) != 1 or actions[0].get("action") != "add":
-        raise AssertionError(f"deterministic action detection selected the wrong action: {actions}")
+        raise AssertionError(f"LLM extraction selected the wrong action: {actions}")
     if "weekly release note" not in str(actions[0].get("text")):
-        raise AssertionError(f"deterministic add extraction lost supplied content: {actions}")
+        raise AssertionError(f"LLM add extraction lost supplied content: {actions}")
     if result.requires_clarification:
         raise AssertionError(f"explicit single action was incorrectly rejected: {result}")
     return ScenarioResult(
-        "deterministic_action_detection",
+        "llm_first_action_extraction",
         True,
-        "raw-query keywords select one knowledge action without an LLM",
+        "the knowledge extraction LLM selected exactly one grounded action",
     )
 
 
-def scenario_multi_action_detection_fails_closed(settings: ProductionSettings) -> ScenarioResult:
-    """Two independently requested action categories must never produce executable actions."""
-    result = DeterministicActionDetector().detect(
+def scenario_llm_extraction_owns_single_action(settings: ProductionSettings) -> ScenarioResult:
+    """Raw keyword multiplicity must not override the model's one-action schema."""
+    detector = LLMKnowledgeActionDetector(
+        llm=ScenarioLLM(),
+        prompts=DEFAULT_PROMPT_REGISTRY,
+    )
+    result = detector.detect(
         ChatRequest(user_id=DEBUG_USER, raw_query="Delete the old policy and add a new policy."),
         "Delete the old policy and add a new policy.",
         Intent.KNOWLEDGE_FACTS,
     )
     actions = result.metadata.get("knowledge_actions") or []
-    if actions or not result.requires_clarification or "ambiguous_action_keywords" not in result.risk_flags:
-        raise AssertionError(f"multi-action request did not fail closed: {result}")
+    if result.requires_clarification or len(actions) != 1 or actions[0].get("action") != "delete":
+        raise AssertionError(f"LLM extraction did not retain exactly one action: {result}")
     return ScenarioResult(
-        "multi_action_detection_fails_closed",
+        "llm_extraction_owns_single_action",
         True,
-        "independent action categories produce no executable action",
+        "one schema-valid LLM action was not vetoed by raw keyword counting",
     )
 
 
@@ -1925,9 +2533,9 @@ def scenario_read_only_knowledge_general_route(settings: ProductionSettings) -> 
         state,
         "What is the stored infrastructure locality preference?",
         metadata={
-            # Even a stale/incorrect caller hint may not force a read into the
-            # mutation-only branch.
-            "intent": Intent.KNOWLEDGE_FACTS.value,
+            # The intent detector owns the read-versus-mutation distinction;
+            # the router must dispatch its selected general branch directly.
+            "intent": Intent.GENERAL_RESPONSE.value,
             "normal_response_text": fact,
         },
     )
@@ -1981,7 +2589,7 @@ def scenario_read_only_reminder_general_route(settings: ProductionSettings) -> S
         state,
         "When is my Submit payroll reminder?",
         metadata={
-            "intent": Intent.REMINDER.value,
+            "intent": Intent.GENERAL_RESPONSE.value,
             "normal_response_text": answer,
         },
     )
@@ -1996,37 +2604,34 @@ def scenario_read_only_reminder_general_route(settings: ProductionSettings) -> S
     )
 
 
-def scenario_deterministic_knowledge_update(settings: ProductionSettings) -> ScenarioResult:
-    """A complete update instruction must retain both its target and replacement."""
-    detector = DeterministicActionDetector()
+def scenario_llm_first_knowledge_update(settings: ProductionSettings) -> ScenarioResult:
+    """A complete update must be extracted by the branch model before retrieval."""
     request = ChatRequest(user_id=DEBUG_USER, raw_query="Update the primary data-store policy to the new source-of-truth statement.")
-    result = detector.detect(request, request.raw_query, Intent.KNOWLEDGE_FACTS)
-    actions = result.metadata.get("knowledge_actions") or []
-    if result.requires_clarification:
-        raise AssertionError(f"complete update was not accepted by deterministic detection: {result}")
-    expected = {
-        "action": "modify",
-        "target_description": "the primary data-store policy",
-        "replacement_text": "the new source-of-truth statement",
-    }
-    if len(actions) != 1 or any(actions[0].get(key) != value for key, value in expected.items()):
-        raise AssertionError(f"update extraction lost target or replacement: {actions}")
-
     state = build_scenario_state(settings)
     seed_knowledge(state, title="Data policy", text="The primary data store is under review.")
     response = run_request(
         state,
         request.raw_query,
-        metadata={"intent": Intent.KNOWLEDGE_FACTS.value, "knowledge_actions": actions},
+        metadata={"intent": Intent.KNOWLEDGE_FACTS.value},
     )
-    assert_response(response, ResponseType.KNOWLEDGE_ACTION, "confirm")
-    if not response.actions_pending_confirmation:
-        raise AssertionError("validated knowledge update must require confirmation before writing")
-    return ScenarioResult("deterministic_knowledge_update", True, "deterministic updates preserve target and replacement, then require confirmation")
+    assert_response(response, ResponseType.KNOWLEDGE_ACTION)
+    if response.actions_pending_confirmation:
+        raise AssertionError("knowledge PASS created a forbidden downstream confirmation")
+    active = state.repository.connection.execute(
+        "SELECT raw_text FROM knowledge_chunks WHERE user_id = ? AND is_deleted = 0",
+        (state.user_id,),
+    ).fetchall()
+    if len(active) != 1 or "new source-of-truth statement" not in active[0]["raw_text"]:
+        raise AssertionError("validated knowledge update did not commit directly")
+    return ScenarioResult(
+        "llm_first_knowledge_update",
+        True,
+        "the branch models preserved the update and LLM2 PASS committed it directly",
+    )
 
 
 def scenario_shared_confirmation_lifecycle(settings: ProductionSettings) -> ScenarioResult:
-    """Debug and Streamlit confirmation semantics commit and replay exactly once."""
+    """Knowledge PASS commits directly while request replay stays idempotent."""
 
     state = build_scenario_state(settings)
     seed_knowledge(
@@ -2039,42 +2644,27 @@ def scenario_shared_confirmation_lifecycle(settings: ProductionSettings) -> Scen
         repository=state.repository,
     )
     query = "Change Project Atlas retention to 45 days"
+    request = ChatRequest(
+        user_id=state.user_id,
+        raw_query=query,
+        idempotency_key="scenario-direct-knowledge-pass",
+        metadata={"intent": Intent.KNOWLEDGE_FACTS.value},
+    )
     initial = lifecycle.execute(
+        request,
+        fallback_request_id="scenario-direct-knowledge-pass",
+    )
+    # The pipeline enriches request metadata in place. Replay with a fresh,
+    # semantically identical request so the lifecycle compares the original
+    # client payload instead of its runtime-enriched object.
+    replayed = lifecycle.execute(
         ChatRequest(
             user_id=state.user_id,
             raw_query=query,
-            idempotency_key="scenario-confirmation-initial",
-            metadata={
-                "intent": Intent.KNOWLEDGE_FACTS.value,
-                "knowledge_actions": [
-                    {
-                        "action": "modify",
-                        "target_description": "Project Atlas retention 30 days",
-                        "replacement_text": "Project Atlas retention is 45 days.",
-                    }
-                ],
-            },
+            idempotency_key="scenario-direct-knowledge-pass",
+            metadata={"intent": Intent.KNOWLEDGE_FACTS.value},
         ),
-        fallback_request_id="scenario-confirmation-initial",
-    )
-    if initial.response is None or not initial.response.actions_pending_confirmation:
-        raise AssertionError("knowledge modify did not produce a pending confirmation")
-    token = str(
-        initial.response.actions_pending_confirmation[0]["confirmation_token"]
-    )
-    confirmed_request = ChatRequest(
-        user_id=state.user_id,
-        raw_query=query,
-        confirmation_token=token,
-        idempotency_key=f"scenario-confirmation:{token}",
-    )
-    confirmed = lifecycle.execute(
-        confirmed_request,
-        fallback_request_id="scenario-confirmation-first",
-    )
-    replayed = lifecycle.execute(
-        confirmed_request,
-        fallback_request_id="scenario-confirmation-replay",
+        fallback_request_id="scenario-direct-knowledge-replay",
     )
     active = state.repository.connection.execute(
         """
@@ -2083,29 +2673,25 @@ def scenario_shared_confirmation_lifecycle(settings: ProductionSettings) -> Scen
         """,
         (state.user_id,),
     ).fetchall()
-    confirmation_status = state.repository.connection.execute(
-        """
-        SELECT status FROM pending_action_confirmations
-        WHERE confirmation_token = ?
-        """,
-        (token,),
-    ).fetchone()["status"]
-    if confirmed.response is None or not confirmed.response.actions_committed:
-        raise AssertionError("confirmed knowledge action did not commit")
+    pending_count = state.repository.connection.execute(
+        "SELECT COUNT(*) FROM pending_action_confirmations"
+    ).fetchone()[0]
+    if initial.response is None or not initial.response.actions_committed:
+        raise AssertionError("knowledge PASS did not commit directly")
+    if initial.response.actions_pending_confirmation:
+        raise AssertionError("knowledge PASS created a pending confirmation")
     if not replayed.replayed or replayed.response is not None:
-        raise AssertionError("repeated confirmation did not use idempotent replay")
+        raise AssertionError("repeated direct mutation did not use idempotent replay")
     if [row["raw_text"] for row in active] != [
         "Project Atlas retention is 45 days."
     ]:
-        raise AssertionError(f"confirmation mutated knowledge incorrectly: {active!r}")
-    if confirmation_status != "confirmed":
-        raise AssertionError(
-            f"pending confirmation did not reach confirmed: {confirmation_status}"
-        )
+        raise AssertionError(f"direct mutation produced incorrect knowledge: {active!r}")
+    if pending_count != 0:
+        raise AssertionError("direct knowledge mutation persisted a confirmation row")
     return ScenarioResult(
         "shared_confirmation_lifecycle",
         True,
-        "pending confirmation committed once and repeated confirmation replayed safely",
+        "knowledge PASS committed once without confirmation and replayed safely",
     )
 
 
@@ -2291,6 +2877,9 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         LLMTask.KNOWLEDGE_ACTION_EXTRACTION: "qwen3.5:4b",
         LLMTask.KNOWLEDGE_ACTION_VALIDATION: "microsoft/Phi-4-mini-instruct-onnx",
         LLMTask.KNOWLEDGE_CONTENT_FINALIZATION: "microsoft/Phi-4-mini-instruct-onnx",
+        LLMTask.REMINDER_ACTION_EXTRACTION: "qwen3.5:4b",
+        LLMTask.REMINDER_ACTION_VALIDATION: "microsoft/Phi-4-mini-instruct-onnx",
+        LLMTask.REMINDER_CONTENT_FINALIZATION: "microsoft/Phi-4-mini-instruct-onnx",
         LLMTask.GENERATE_CLARIFICATION: "qwen3.5:4b",
         LLMTask.GENERATE_HUMAN_SUPPORTING: "qwen3.5:4b",
         LLMTask.GENERATE_REMINDER_SUPPORTING: "qwen3.5:4b",
@@ -2329,6 +2918,7 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         "conversation_followup_min_score": default_settings.general_purpose.conversation_followup_min_score,
         "action_min_confidence": default_settings.prompt_policy.action_min_confidence,
         "knowledge_validation_candidate_limit": default_settings.retrieval_validation.knowledge_llm_validation_max_candidates,
+        "reminder_validation_candidate_limit": default_settings.retrieval_validation.reminder_llm_validation_max_candidates,
         "risky_action_confidence_threshold": default_settings.prompt_policy.risky_action_confidence_threshold,
         "reminder_candidate_limit": default_settings.reminder_resolver.reminder_target_candidate_limit,
         "reminder_target_min_score": default_settings.reminder_resolver.reminder_target_relevance_threshold,
@@ -2364,6 +2954,7 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         "conversation_followup_min_score": 0.65,
         "action_min_confidence": 0.76,
         "knowledge_validation_candidate_limit": 5,
+        "reminder_validation_candidate_limit": 3,
         "risky_action_confidence_threshold": 0.90,
         "reminder_candidate_limit": 12,
         "reminder_target_min_score": 0.78,
@@ -2414,6 +3005,18 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
                 f"{task.value} capacity mismatch: "
                 f"{(decision.num_ctx, decision.num_predict)}"
             )
+    reminder_capacity = {
+        LLMTask.REMINDER_ACTION_EXTRACTION: (8192, 2048),
+        LLMTask.REMINDER_ACTION_VALIDATION: (16384, 2048),
+        LLMTask.REMINDER_CONTENT_FINALIZATION: (16384, 2048),
+    }
+    for task, expected in reminder_capacity.items():
+        decision = router.decision_for_task(task)
+        if (decision.num_ctx, decision.num_predict) != expected:
+            raise AssertionError(
+                f"{task.value} capacity mismatch: "
+                f"{(decision.num_ctx, decision.num_predict)}"
+            )
     if default_settings.ollama.model_intent != "qwen3.5:4b":
         raise AssertionError("intent must use the validated semantic routing model")
     if default_settings.ollama.model_intent_fallback != "qwen3.5:4b":
@@ -2429,6 +3032,9 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         LLMTask.KNOWLEDGE_ACTION_EXTRACTION: 24.0,
         LLMTask.KNOWLEDGE_ACTION_VALIDATION: 45.0,
         LLMTask.KNOWLEDGE_CONTENT_FINALIZATION: 90.0,
+        LLMTask.REMINDER_ACTION_EXTRACTION: 24.0,
+        LLMTask.REMINDER_ACTION_VALIDATION: 45.0,
+        LLMTask.REMINDER_CONTENT_FINALIZATION: 90.0,
         LLMTask.RISKY_ACTION: 35.0,
         LLMTask.RETRIEVAL_VALIDATION: 35.0,
         LLMTask.ANSWER: 75.0,
@@ -3113,6 +3719,7 @@ def scenario_knowledge_add(settings: ProductionSettings) -> ScenarioResult:
         "Remember Atlas retention is 30 days",
         metadata={
             "intent": Intent.KNOWLEDGE_FACTS.value,
+            "topic_title": "Project Atlas",
             "knowledge_actions": [
                 {
                     "action": "add",
@@ -3125,6 +3732,42 @@ def scenario_knowledge_add(settings: ProductionSettings) -> ScenarioResult:
     assert_response(response, ResponseType.KNOWLEDGE_ACTION, "Added new knowledge")
     if state.repository.table_count("knowledge_chunks") != 1:
         raise AssertionError("knowledge add did not create a chunk")
+    chunk = state.repository.connection.execute(
+        """
+        SELECT chunk_id, knowledge_topic_id, raw_text, is_deleted
+        FROM knowledge_chunks WHERE user_id = ?
+        """,
+        (state.user_id,),
+    ).fetchone()
+    topic = state.repository.connection.execute(
+        """
+        SELECT title, version FROM knowledge_topics
+        WHERE user_id = ? AND knowledge_topic_id = ?
+        """,
+        (state.user_id, chunk["knowledge_topic_id"]),
+    ).fetchone()
+    if (
+        chunk is None
+        or topic is None
+        or str(topic["title"]) != "Project Atlas"
+        or int(topic["version"]) != 2
+        or bool(chunk["is_deleted"])
+    ):
+        raise AssertionError("knowledge add did not update its exact SQL topic/chunk")
+    assert_knowledge_audit_binding(
+        state,
+        response,
+        action="add",
+        knowledge_topic_id=str(chunk["knowledge_topic_id"]),
+        knowledge_chunk_id=str(chunk["chunk_id"]),
+    )
+    for store_name, store in (
+        ("OpenSearch", state.retriever.bm25),
+        ("ChromaDB", state.retriever.chroma),
+    ):
+        indexed = store.get_document(entity_id=str(chunk["chunk_id"]))
+        if indexed is None or indexed.get("entity_type") != "knowledge_chunk":
+            raise AssertionError(f"knowledge add was not synchronized to {store_name}")
     entities = state.repository.list_all_outbox_entities()
     for entity_type, entity_id in entities:
         state.repository.load_outbox_entity(entity_type=entity_type, entity_id=entity_id)
@@ -3133,7 +3776,11 @@ def scenario_knowledge_add(settings: ProductionSettings) -> ScenarioResult:
 
 def scenario_knowledge_modify(settings: ProductionSettings) -> ScenarioResult:
     state = build_scenario_state(settings)
-    seed_knowledge(state, title="Project Atlas", text="Project Atlas retention is 30 days.")
+    original_chunk_id = seed_knowledge(
+        state,
+        title="Project Atlas",
+        text="Project Atlas retention is 30 days.",
+    )
     response = run_request(
         state,
         "Change Project Atlas retention to 45 days",
@@ -3148,16 +3795,111 @@ def scenario_knowledge_modify(settings: ProductionSettings) -> ScenarioResult:
             ],
         },
     )
-    assert_response(response, ResponseType.KNOWLEDGE_ACTION, "confirm")
-    if not response.actions_pending_confirmation:
-        raise AssertionError("knowledge modify should require confirmation before mutating")
+    assert_response(response, ResponseType.KNOWLEDGE_ACTION)
+    if response.actions_pending_confirmation:
+        raise AssertionError("knowledge modify PASS created a confirmation gate")
     active = state.repository.connection.execute(
-        "SELECT raw_text FROM knowledge_chunks WHERE user_id = ? AND is_deleted = 0",
+        """
+        SELECT chunk_id, knowledge_topic_id, raw_text, replaces_chunk_id
+        FROM knowledge_chunks WHERE user_id = ? AND is_deleted = 0
+        """,
         (state.user_id,),
     ).fetchall()
-    if [row["raw_text"] for row in active] != ["Project Atlas retention is 30 days."]:
-        raise AssertionError("knowledge modify mutated before confirmation")
-    return ScenarioResult("knowledge_modify", True, "knowledge modify requires confirmation before replacing the active chunk")
+    if len(active) != 1 or active[0]["raw_text"] != "Project Atlas retention is 45 days.":
+        raise AssertionError("knowledge modify PASS did not commit the finalized chunk")
+    replacement = active[0]
+    original = state.repository.connection.execute(
+        """
+        SELECT knowledge_topic_id, is_deleted, replaced_by_chunk_id
+        FROM knowledge_chunks WHERE user_id = ? AND chunk_id = ?
+        """,
+        (state.user_id, original_chunk_id),
+    ).fetchone()
+    if (
+        original is None
+        or not bool(original["is_deleted"])
+        or str(original["knowledge_topic_id"])
+        != str(replacement["knowledge_topic_id"])
+        or str(original["replaced_by_chunk_id"]) != str(replacement["chunk_id"])
+        or str(replacement["replaces_chunk_id"]) != original_chunk_id
+        or state.repository.table_count("knowledge_topics") != 1
+    ):
+        raise AssertionError("knowledge modify changed topic identity or version linkage")
+    assert_knowledge_audit_binding(
+        state,
+        response,
+        action="modify",
+        knowledge_topic_id=str(replacement["knowledge_topic_id"]),
+        knowledge_chunk_id=str(replacement["chunk_id"]),
+    )
+    for store_name, store in (
+        ("OpenSearch", state.retriever.bm25),
+        ("ChromaDB", state.retriever.chroma),
+    ):
+        if store.get_document(entity_id=original_chunk_id) is not None:
+            raise AssertionError(f"modified knowledge remained active in {store_name}")
+        if store.get_document(entity_id=str(replacement["chunk_id"])) is None:
+            raise AssertionError(f"modified knowledge was not synchronized to {store_name}")
+    return ScenarioResult(
+        "knowledge_modify",
+        True,
+        "knowledge modify PASS committed immediately after finalization",
+    )
+
+
+def scenario_knowledge_delete(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    chunk_id = seed_knowledge(
+        state,
+        title="Project Atlas",
+        text="Project Atlas retention is 30 days.",
+    )
+    before = state.repository.connection.execute(
+        """
+        SELECT knowledge_topic_id FROM knowledge_chunks
+        WHERE user_id = ? AND chunk_id = ?
+        """,
+        (state.user_id, chunk_id),
+    ).fetchone()
+    response = run_request(
+        state,
+        "Delete Project Atlas retention is 30 days",
+        metadata={"intent": Intent.KNOWLEDGE_FACTS.value},
+    )
+    assert_response(response, ResponseType.KNOWLEDGE_ACTION, "Deleted knowledge")
+    deleted = state.repository.connection.execute(
+        """
+        SELECT knowledge_topic_id, is_deleted FROM knowledge_chunks
+        WHERE user_id = ? AND chunk_id = ?
+        """,
+        (state.user_id, chunk_id),
+    ).fetchone()
+    if (
+        before is None
+        or deleted is None
+        or not bool(deleted["is_deleted"])
+        or str(deleted["knowledge_topic_id"]) != str(before["knowledge_topic_id"])
+        or state.repository.table_count("knowledge_topics") != 1
+    ):
+        raise AssertionError("knowledge delete did not update its exact SQL topic/chunk")
+    assert_knowledge_audit_binding(
+        state,
+        response,
+        action="delete",
+        knowledge_topic_id=str(deleted["knowledge_topic_id"]),
+        knowledge_chunk_id=chunk_id,
+    )
+    for store_name, store in (
+        ("OpenSearch", state.retriever.bm25),
+        ("ChromaDB", state.retriever.chroma),
+    ):
+        if store.get_document(entity_id=chunk_id) is not None:
+            raise AssertionError(f"deleted knowledge remained active in {store_name}")
+    return ScenarioResult(
+        "knowledge_delete",
+        True,
+        "knowledge delete preserved topic identity and removed both derived chunks",
+    )
 
 
 def scenario_knowledge_delete_not_found(settings: ProductionSettings) -> ScenarioResult:
@@ -3172,8 +3914,16 @@ def scenario_knowledge_delete_not_found(settings: ProductionSettings) -> Scenari
             ],
         },
     )
-    assert_response(response, ResponseType.KNOWLEDGE_ACTION, "No matching knowledge")
-    return ScenarioResult("knowledge_delete_not_found", True, "missing target produced safe no-op")
+    assert_response(
+        response,
+        ResponseType.CLARIFICATION,
+        "Which complete stored knowledge item",
+    )
+    return ScenarioResult(
+        "knowledge_delete_not_found",
+        True,
+        "validator FAIL returned its immediate target clarification",
+    )
 
 
 def scenario_knowledge_modify_missing_replacement(settings: ProductionSettings) -> ScenarioResult:
@@ -3219,13 +3969,10 @@ def scenario_knowledge_three_llm_pipeline(settings: ProductionSettings) -> Scena
                 },
                 {
                     "operation": "modify",
-                    "validation_result": "EXECUTE",
+                    "decision": "PASS",
                     "selected_candidate_keys": [chunk_id],
                     "confidence": 0.99,
-                    "ambiguous": False,
-                    "should_execute": True,
-                    "requires_hitl": False,
-                    "factuality_concern": False,
+                    "clarification_question": "",
                     "reason_summary": "One SQL candidate contains the target.",
                     "candidate_assessments": [
                         {
@@ -3249,7 +3996,7 @@ def scenario_knowledge_three_llm_pipeline(settings: ProductionSettings) -> Scena
         def generate_json(self, **kwargs: Any) -> dict[str, Any]:
             self.calls.append(dict(kwargs))
             if not self.responses:
-                raise AssertionError("confirmation replay called a knowledge model")
+                raise AssertionError("unexpected extra knowledge model call")
             return self.responses.pop(0)
 
         def chat(self, **_kwargs: Any) -> str:
@@ -3303,9 +4050,9 @@ def scenario_knowledge_three_llm_pipeline(settings: ProductionSettings) -> Scena
     )
     if initial.response is None:
         raise AssertionError("initial knowledge mutation unexpectedly replayed")
-    assert_response(initial.response, ResponseType.KNOWLEDGE_ACTION, "confirm")
-    if not initial.response.actions_pending_confirmation:
-        raise AssertionError("validated modify did not require confirmation")
+    assert_response(initial.response, ResponseType.KNOWLEDGE_ACTION)
+    if initial.response.actions_pending_confirmation:
+        raise AssertionError("validated modify created a forbidden confirmation")
     expected_tasks = [
         LLMTask.KNOWLEDGE_ACTION_EXTRACTION,
         LLMTask.KNOWLEDGE_ACTION_VALIDATION,
@@ -3318,37 +4065,28 @@ def scenario_knowledge_three_llm_pipeline(settings: ProductionSettings) -> Scena
         for call in llm.calls
     ]
     canonical_history = prompt_payloads[0]["chat_history"]
-    for payload in prompt_payloads:
+    for payload in (prompt_payloads[0], prompt_payloads[2]):
         if payload["raw_query"] != query or payload["chat_history"] != canonical_history:
-            raise AssertionError("knowledge stages did not share query/history")
+            raise AssertionError("knowledge extraction/finalization lost query/history")
+    if set(prompt_payloads[1]) != {
+        "first_model_response",
+        "knowledge_retrieval",
+    }:
+        raise AssertionError("knowledge validation prompt was not strictly isolated")
+    if query in json.dumps(prompt_payloads[1]) or "chat_history" in prompt_payloads[1]:
+        raise AssertionError("knowledge validation received forbidden query/history")
     if "Preserve this tail marker." not in json.dumps(prompt_payloads[1:]):
         raise AssertionError("long SQL chunk tail was truncated before validation/finalization")
-
-    token = initial.response.actions_pending_confirmation[0]["confirmation_token"]
-    confirmed = lifecycle.execute(
-        ChatRequest(
-            user_id=state.user_id,
-            raw_query="Confirm",
-            confirmation_token=token,
-            idempotency_key="knowledge-three-llm-confirm",
-        ),
-        fallback_request_id="knowledge-three-llm-confirm",
-    )
-    if confirmed.response is None:
-        raise AssertionError("confirmation unexpectedly replayed")
-    assert_response(confirmed.response, ResponseType.KNOWLEDGE_ACTION)
-    if len(llm.calls) != 3:
-        raise AssertionError("confirmation replay re-ran a knowledge model")
     active = state.repository.connection.execute(
         "SELECT raw_text FROM knowledge_chunks WHERE user_id = ? AND is_deleted = 0",
         (state.user_id,),
     ).fetchall()
     if [row["raw_text"] for row in active] != [final_content]:
-        raise AssertionError("confirmed modify did not preserve the full finalized chunk")
+        raise AssertionError("direct modify did not preserve the full finalized chunk")
     return ScenarioResult(
         "knowledge_three_llm_pipeline",
         True,
-        "three dedicated knowledge LLM stages, threshold bypass, full text, and confirmation replay passed",
+        "isolated validation and direct post-finalization commit passed",
     )
 
 
@@ -3414,7 +4152,7 @@ def scenario_reminder_modify(settings: ProductionSettings) -> ScenarioResult:
     )
     response = run_request(
         state,
-        "Move tax form reminder",
+        "Modify the Submit tax form reminder: change the subject to Submit tax form final and the notification time to 2026-07-11T10:00:00+00:00",
         metadata={
             "intent": Intent.REMINDER.value,
             "reminder_actions": [
@@ -3445,7 +4183,7 @@ def scenario_reminder_turn_off(settings: ProductionSettings) -> ScenarioResult:
     )
     response = run_request(
         state,
-        "Turn off finance reminder",
+        "Turn off the Call finance reminder",
         metadata={
             "intent": Intent.REMINDER.value,
             "reminder_actions": [
@@ -3471,7 +4209,7 @@ def scenario_reminder_turn_on(settings: ProductionSettings) -> ScenarioResult:
     )
     response = run_request(
         state,
-        "Turn on license reminder",
+        "Turn on the Renew license reminder",
         metadata={
             "intent": Intent.REMINDER.value,
             "reminder_actions": [
@@ -3496,7 +4234,7 @@ def scenario_reminder_delete(settings: ProductionSettings) -> ScenarioResult:
     )
     response = run_request(
         state,
-        "Delete legacy reminder",
+        "Delete the Legacy review reminder",
         metadata={
             "intent": Intent.REMINDER.value,
             "reminder_actions": [
@@ -3575,12 +4313,12 @@ SCENARIOS: tuple[ScenarioFn, ...] = (
     scenario_structured_clarification_fallback_policy,
     scenario_mutation_clarification_fast_path,
     scenario_last_qa_mandatory_before_classification,
-    scenario_deterministic_action_detection,
-    scenario_multi_action_detection_fails_closed,
+    scenario_llm_first_action_extraction,
+    scenario_llm_extraction_owns_single_action,
     scenario_read_only_knowledge_general_route,
     scenario_general_sql_knowledge_fallback,
     scenario_read_only_reminder_general_route,
-    scenario_deterministic_knowledge_update,
+    scenario_llm_first_knowledge_update,
     scenario_shared_confirmation_lifecycle,
     scenario_clarification_schema_echo_recovery,
     scenario_content_composer_react_structured_policy,
@@ -3598,6 +4336,7 @@ SCENARIOS: tuple[ScenarioFn, ...] = (
     scenario_lastqa_support_below_resolution_gate,
     scenario_knowledge_add,
     scenario_knowledge_modify,
+    scenario_knowledge_delete,
     scenario_knowledge_delete_not_found,
     scenario_knowledge_modify_missing_replacement,
     scenario_knowledge_three_llm_pipeline,

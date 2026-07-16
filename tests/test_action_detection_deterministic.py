@@ -4,236 +4,79 @@ from types import SimpleNamespace
 
 import pytest
 
-from assistant_rag.action_keywords import (
-    ADD_ACTION_KEYWORDS,
-    DELETE_ACTION_KEYWORDS,
-    MODIFY_ACTION_KEYWORDS,
-    TURN_OFF_ACTION_KEYWORDS,
-    TURN_ON_ACTION_KEYWORDS,
-)
-from assistant_rag.action_detection import (
-    DeterministicActionDetector,
-    action_payload_is_authorized,
-    classify_action_request,
-)
+import assistant_rag.action_detection as action_detection
+from assistant_rag.action_detection import ActionDetectionResult
 from assistant_rag.branch_orchestration import ValidatedActionBuilder
 from assistant_rag.branches import KnowledgeFactsBranch, ReminderBranch
-from assistant_rag.contracts import ChatRequest, Intent, ResponseType
+from assistant_rag.contracts import (
+    ActionValidationResult,
+    ChatRequest,
+    Intent,
+    KnowledgeAction,
+    ResponseType,
+    ValidatedKnowledgeAction,
+)
 from assistant_rag.settings import MutationPartialExecutionPolicy
 
 
-ALL_ACTION_CASES = (
-    *((Intent.KNOWLEDGE_FACTS, keyword, "delete") for keyword in DELETE_ACTION_KEYWORDS),
-    *((Intent.KNOWLEDGE_FACTS, keyword, "modify") for keyword in MODIFY_ACTION_KEYWORDS),
-    *((Intent.KNOWLEDGE_FACTS, keyword, "add") for keyword in ADD_ACTION_KEYWORDS),
-    *((Intent.REMINDER, keyword, "delete") for keyword in DELETE_ACTION_KEYWORDS),
-    *((Intent.REMINDER, keyword, "modify") for keyword in MODIFY_ACTION_KEYWORDS),
-    *((Intent.REMINDER, keyword, "add") for keyword in ADD_ACTION_KEYWORDS),
-    *((Intent.REMINDER, keyword, "turn_on") for keyword in TURN_ON_ACTION_KEYWORDS),
-    *((Intent.REMINDER, keyword, "turn_off") for keyword in TURN_OFF_ACTION_KEYWORDS),
-)
+class ScriptedExtractionDetector:
+    def __init__(
+        self,
+        *,
+        metadata: dict | None = None,
+        missing_fields: list[str] | None = None,
+    ) -> None:
+        self.metadata = dict(metadata or {})
+        self.missing_fields = list(missing_fields or [])
+        self.calls: list[tuple[ChatRequest, str, Intent]] = []
+
+    def detect(
+        self,
+        request: ChatRequest,
+        rewritten_query: str,
+        intent: Intent,
+    ) -> ActionDetectionResult:
+        self.calls.append((request, rewritten_query, intent))
+        return ActionDetectionResult(
+            intent=intent,
+            confidence=0.0 if self.missing_fields else 1.0,
+            metadata=dict(self.metadata),
+            missing_fields=list(self.missing_fields),
+            risk_flags=(
+                ["scripted_extraction_failure"] if self.missing_fields else []
+            ),
+        )
 
 
-@pytest.mark.parametrize(("intent", "keyword", "expected"), ALL_ACTION_CASES)
-def test_every_configured_keyword_maps_to_its_single_action(
-    intent: Intent,
-    keyword: str,
-    expected: str,
-) -> None:
-    decision = classify_action_request(f"Please {keyword} the requested item.", intent)
-
-    assert decision.selected_action == expected, (keyword, decision)
-
-
-@pytest.mark.parametrize(
-    ("intent", "query", "expected"),
-    (
-        (Intent.KNOWLEDGE_FACTS, "Forget the Atlas retention fact.", "delete"),
-        (Intent.KNOWLEDGE_FACTS, "Revise Atlas retention to 45 days.", "modify"),
-        (Intent.KNOWLEDGE_FACTS, "Remember that Atlas retention is 30 days.", "add"),
-        (Intent.REMINDER, "Delete the payroll reminder.", "delete"),
-        (Intent.REMINDER, "Move the payroll reminder to Friday.", "modify"),
-        (Intent.REMINDER, "Set a reminder for payroll.", "add"),
-        (Intent.REMINDER, "Turn back on the payroll reminder.", "turn_on"),
-        (Intent.REMINDER, "Temporarily turn off the payroll reminder.", "turn_off"),
-    ),
-)
-def test_explicit_keyword_selects_one_supported_branch_action(
-    intent: Intent,
-    query: str,
-    expected: str,
-) -> None:
-    decision = classify_action_request(query, intent)
-
-    assert decision.selected_action == expected
-    assert decision.matched_actions == (expected,)
-
-
-@pytest.mark.parametrize(
-    ("query", "expected"),
-    (
-        ("Cancel and delete the legacy reminder.", "delete"),
-        ("Set to inactive the payroll reminder.", "turn_off"),
-        ("Set to active the payroll reminder.", "turn_on"),
-    ),
-)
-def test_longer_explicit_phrase_owns_contained_cross_category_keyword(
-    query: str,
-    expected: str,
-) -> None:
-    decision = classify_action_request(query, Intent.REMINDER)
-
-    assert decision.selected_action == expected
-    assert decision.matched_actions == (expected,)
-
-
-def test_independent_multi_action_request_fails_closed() -> None:
-    result = DeterministicActionDetector().detect(
-        ChatRequest(
-            user_id="user",
-            raw_query="Delete the old reminder and create a new reminder.",
-        ),
-        "Delete the old reminder and create a new reminder.",
-        Intent.REMINDER,
+def test_action_detection_surface_contains_only_neutral_extraction_contracts() -> None:
+    prohibited_keyword_detectors = (
+        "ActionKeywordDecision",
+        "ActionKeywordMatch",
+        "DeterministicActionDetector",
+        "NoOpActionDetector",
+        "action_payload_is_authorized",
+        "classify_action_request",
+        "enforce_mutation_only_intent",
+        "request_has_explicit_mutation",
     )
 
-    assert result.requires_clarification
-    assert result.metadata == {}
-    assert result.missing_fields == ["single_action"]
-    assert result.risk_flags == ["ambiguous_action_keywords"]
-
-
-def test_multiple_payload_actions_are_rejected_even_for_one_keyword_category() -> None:
-    result = DeterministicActionDetector().detect(
-        ChatRequest(
-            user_id="user",
-            raw_query="Add these facts.",
-            metadata={
-                "knowledge_actions": [
-                    {"action": "add", "text": "one"},
-                    {"action": "add", "text": "two"},
-                ]
-            },
-        ),
-        "Add these facts.",
-        Intent.KNOWLEDGE_FACTS,
+    assert hasattr(action_detection, "ActionDetectionResult")
+    assert hasattr(action_detection, "ActionDetector")
+    assert all(
+        not hasattr(action_detection, name) for name in prohibited_keyword_detectors
     )
 
-    assert result.requires_clarification
-    assert not result.metadata
-    assert result.risk_flags == ["multiple_action_payloads_rejected"]
 
-
-def test_metadata_action_must_match_the_raw_query_keyword() -> None:
-    result = DeterministicActionDetector().detect(
-        ChatRequest(
-            user_id="user",
-            raw_query="Delete the Atlas fact.",
-            metadata={"knowledge_actions": [{"action": "add", "text": "Atlas"}]},
-        ),
-        "Delete the Atlas fact.",
-        Intent.KNOWLEDGE_FACTS,
+def test_action_detection_result_requires_clarification_only_from_model_contract() -> None:
+    complete = ActionDetectionResult(intent=Intent.KNOWLEDGE_FACTS, confidence=1.0)
+    incomplete = ActionDetectionResult(
+        intent=Intent.REMINDER,
+        confidence=1.0,
+        missing_fields=["action_content"],
     )
 
-    assert result.requires_clarification
-    assert result.risk_flags == ["action_payload_keyword_mismatch"]
-
-
-def test_malformed_action_metadata_fails_closed() -> None:
-    result = DeterministicActionDetector().detect(
-        ChatRequest(
-            user_id="user",
-            raw_query="Delete the Atlas fact.",
-            metadata={"knowledge_actions": ["delete"]},
-        ),
-        "Delete the Atlas fact.",
-        Intent.KNOWLEDGE_FACTS,
-    )
-
-    assert result.requires_clarification
-    assert result.risk_flags == ["invalid_action_payload_rejected"]
-
-
-def test_rewritten_query_cannot_inject_an_action() -> None:
-    result = DeterministicActionDetector().detect(
-        ChatRequest(user_id="user", raw_query="What is the Atlas retention policy?"),
-        "Delete the Atlas retention policy.",
-        Intent.KNOWLEDGE_FACTS,
-    )
-
-    assert result.requires_clarification
-    assert result.metadata == {}
-    assert result.missing_fields == ["action_keyword"]
-    assert result.risk_flags == ["missing_action_keyword"]
-
-
-def test_hyphenated_noun_does_not_create_a_second_action() -> None:
-    decision = classify_action_request(
-        "Update the primary data-store policy to the approved statement.",
-        Intent.KNOWLEDGE_FACTS,
-    )
-
-    assert decision.selected_action == "modify"
-    assert decision.matched_actions == ("modify",)
-
-
-def test_branch_payload_authorization_requires_exactly_one_matching_action() -> None:
-    request = ChatRequest(user_id="user", raw_query="Turn off the payroll reminder.")
-
-    assert action_payload_is_authorized(
-        request,
-        Intent.REMINDER,
-        [{"action": "turn_off", "target_description": "payroll"}],
-    )[0]
-    assert not action_payload_is_authorized(
-        request,
-        Intent.REMINDER,
-        [{"action": "delete", "target_description": "payroll"}],
-    )[0]
-    assert not action_payload_is_authorized(
-        request,
-        Intent.REMINDER,
-        [
-            {"action": "turn_off", "target_description": "payroll"},
-            {"action": "delete", "target_description": "payroll"},
-        ],
-    )[0]
-
-
-def test_confirmation_replay_requires_matching_stored_authorization() -> None:
-    action = {"action": "delete", "target_description": "Atlas"}
-    base_metadata = {
-        "confirmation_approved": True,
-        "validated_knowledge_actions": [action],
-        "knowledge_actions": [action],
-    }
-    valid_request = ChatRequest(
-        user_id="user",
-        raw_query="yes",
-        confirmation_token="verified-token",
-        metadata={
-            **base_metadata,
-            "action_authorization": {
-                "intent": Intent.KNOWLEDGE_FACTS.value,
-                "action": "delete",
-            },
-        },
-    )
-    invalid_request = ChatRequest(
-        user_id="user",
-        raw_query="yes",
-        confirmation_token="verified-token",
-        metadata={
-            **base_metadata,
-            "action_authorization": {
-                "intent": Intent.KNOWLEDGE_FACTS.value,
-                "action": "modify",
-            },
-        },
-    )
-
-    assert action_payload_is_authorized(valid_request, Intent.KNOWLEDGE_FACTS, [action])[0]
-    assert not action_payload_is_authorized(invalid_request, Intent.KNOWLEDGE_FACTS, [action])[0]
+    assert not complete.requires_clarification
+    assert incomplete.requires_clarification
 
 
 def test_validated_action_builder_refuses_multi_action_lists() -> None:
@@ -249,44 +92,49 @@ def test_validated_action_builder_refuses_multi_action_lists() -> None:
 
 
 @pytest.mark.parametrize(
-    ("branch", "intent", "query", "metadata"),
+    ("branch_type", "intent", "query", "action_key"),
     (
         (
-            KnowledgeFactsBranch(config=SimpleNamespace()),
+            KnowledgeFactsBranch,
             Intent.KNOWLEDGE_FACTS,
-            "Add these facts.",
-            {
-                "knowledge_actions": [
-                    {"action": "add", "text": "one"},
-                    {"action": "add", "text": "two"},
-                ]
-            },
+            "Atlas has a blue retention label.",
+            "knowledge_actions",
         ),
         (
-            ReminderBranch(config=SimpleNamespace()),
+            ReminderBranch,
             Intent.REMINDER,
-            "Turn off these reminders.",
-            {
-                "reminder_actions": [
-                    {"action": "turn_off", "target_description": "one"},
-                    {"action": "turn_off", "target_description": "two"},
-                ]
-            },
+            "The Payroll reminder.",
+            "reminder_actions",
         ),
     ),
 )
-def test_branch_rejects_multi_action_payload_before_repository_execution(
-    branch: object,
+def test_poisoned_multi_action_metadata_cannot_bypass_failed_extraction(
+    branch_type: type,
     intent: Intent,
     query: str,
-    metadata: dict,
+    action_key: str,
 ) -> None:
+    detector = ScriptedExtractionDetector(missing_fields=["action_content"])
+    branch = branch_type(
+        config=SimpleNamespace(),
+        action_detector=detector,
+    )
+
     class FailingRepository:
         def __getattr__(self, name: str):
-            raise AssertionError(f"multi-action request reached repository method {name}")
+            raise AssertionError(f"failed extraction reached repository method {name}")
 
     context = SimpleNamespace(
-        request=ChatRequest(user_id="user", raw_query=query, metadata=metadata),
+        request=ChatRequest(
+            user_id="user",
+            raw_query=query,
+            metadata={
+                action_key: [
+                    {"action": "delete", "target_description": "poison-one"},
+                    {"action": "add", "text": "poison-two"},
+                ]
+            },
+        ),
         rewritten_query=query,
         intent=intent,
         approved_conversation_context=None,
@@ -295,9 +143,146 @@ def test_branch_rejects_multi_action_payload_before_repository_execution(
     result = branch.execute(context, FailingRepository())
 
     assert result.response_type is ResponseType.CLARIFICATION
+    assert len(detector.calls) == 1
+    assert detector.calls[0][0] is context.request
 
 
-def test_knowledge_branch_executes_one_matching_prevalidated_confirmation() -> None:
+@pytest.mark.parametrize(
+    (
+        "branch_type",
+        "intent",
+        "query",
+        "action_key",
+        "extracted_action",
+        "repository_method",
+    ),
+    (
+        (
+            KnowledgeFactsBranch,
+            Intent.KNOWLEDGE_FACTS,
+            "Atlas has a blue retention label.",
+            "knowledge_actions",
+            {"action": "add", "text": "Atlas has a blue retention label."},
+            "transactional_knowledge_actions",
+        ),
+        (
+            ReminderBranch,
+            Intent.REMINDER,
+            "The Payroll reminder.",
+            "reminder_actions",
+            {"action": "turn_on", "target_description": "Payroll"},
+            "transactional_reminder_actions",
+        ),
+    ),
+)
+def test_branch_executes_only_the_extractor_action_not_poisoned_metadata(
+    branch_type: type,
+    intent: Intent,
+    query: str,
+    action_key: str,
+    extracted_action: dict,
+    repository_method: str,
+) -> None:
+    detector = ScriptedExtractionDetector(
+        metadata={action_key: [extracted_action]},
+    )
+    config = SimpleNamespace(
+        default_timezone="UTC",
+        confirmation_high_confidence_threshold=0.92,
+    )
+    branch_kwargs = {"config": config, "action_detector": detector}
+    if branch_type is KnowledgeFactsBranch:
+        class StaticKnowledgePipeline:
+            def build_action(self, **kwargs):
+                assert kwargs["action_payload"] == extracted_action
+                return ValidatedKnowledgeAction(
+                    action=KnowledgeAction.ADD,
+                    validation_result=ActionValidationResult.EXECUTE,
+                    knowledge_text=str(extracted_action["text"]),
+                    new_text=str(extracted_action["text"]),
+                    confidence=1.0,
+                )
+
+        branch_kwargs["knowledge_mutation_pipeline"] = StaticKnowledgePipeline()
+    branch = branch_type(**branch_kwargs)
+
+    class RecordingRepository:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, list[dict]]] = []
+
+        def transactional_knowledge_actions(self, **kwargs):
+            self.calls.append(("transactional_knowledge_actions", kwargs["actions"]))
+            return SimpleNamespace(committed=True, results=(), audit_hop_id="hop")
+
+        def transactional_reminder_actions(self, **kwargs):
+            self.calls.append(("transactional_reminder_actions", kwargs["actions"]))
+            return SimpleNamespace(committed=True, results=(), audit_hop_id="hop")
+
+    repository = RecordingRepository()
+    context = SimpleNamespace(
+        request=ChatRequest(
+            user_id="user",
+            raw_query=query,
+            metadata={
+                action_key: [
+                    {"action": "delete", "target_description": "poison-one"},
+                    {"action": "modify", "target_description": "poison-two"},
+                ]
+            },
+        ),
+        rewritten_query=query,
+        intent=intent,
+        approved_conversation_context=None,
+    )
+
+    result = branch.execute(context, repository)
+
+    expected_response = (
+        ResponseType.KNOWLEDGE_ACTION
+        if intent is Intent.KNOWLEDGE_FACTS
+        else ResponseType.REMINDER_ACTION
+    )
+    assert result.response_type is expected_response
+    assert len(detector.calls) == 1
+    assert len(repository.calls) == 1
+    assert repository.calls[0][0] == repository_method
+    committed_action = repository.calls[0][1][0]
+    if intent is Intent.KNOWLEDGE_FACTS:
+        assert committed_action.action is KnowledgeAction.ADD
+        assert committed_action.knowledge_text == extracted_action["text"]
+    else:
+        assert committed_action == extracted_action
+
+
+def test_knowledge_branch_cannot_execute_without_three_stage_pipeline() -> None:
+    extracted_action = {"action": "add", "text": "Atlas is blue."}
+    detector = ScriptedExtractionDetector(
+        metadata={"knowledge_actions": [extracted_action]}
+    )
+    branch = KnowledgeFactsBranch(
+        config=SimpleNamespace(),
+        action_detector=detector,
+    )
+
+    class MustNotWrite:
+        def __getattr__(self, name: str):
+            raise AssertionError(f"pipeline bypass reached repository method {name}")
+
+    result = branch.execute(
+        SimpleNamespace(
+            request=ChatRequest(user_id="user", raw_query="Remember Atlas is blue."),
+            rewritten_query="Remember Atlas is blue.",
+            intent=Intent.KNOWLEDGE_FACTS,
+            approved_conversation_context=None,
+        ),
+        MustNotWrite(),
+    )
+
+    assert result.response_type is ResponseType.ERROR
+    assert len(detector.calls) == 1
+
+
+def test_knowledge_branch_revalidates_matching_legacy_confirmation_before_execution() -> None:
     action = {
         "action": "delete",
         "validation_result": "execute",
@@ -334,18 +319,40 @@ def test_knowledge_branch_executes_one_matching_prevalidated_confirmation() -> N
             return SimpleNamespace(committed=True, results=(), audit_hop_id="hop")
 
     repository = RecordingRepository()
+
+    class RevalidatingPipeline:
+        calls = 0
+
+        def build_action(self, **kwargs):
+            self.calls += 1
+            assert kwargs["action_payload"]["action"] == "delete"
+            return ValidatedKnowledgeAction(
+                action=KnowledgeAction.DELETE,
+                validation_result=ActionValidationResult.EXECUTE,
+                target_chunk_ids=("chunk-1",),
+                confidence=1.0,
+            )
+
+    pipeline = RevalidatingPipeline()
+    detector = ScriptedExtractionDetector(
+        metadata={"knowledge_actions": [action]},
+    )
     branch = KnowledgeFactsBranch(
         config=SimpleNamespace(
             mutation_policy=SimpleNamespace(
                 partial_execution_policy=MutationPartialExecutionPolicy.ALL_OR_NOTHING
             )
         ),
-        validated_action_builder=SimpleNamespace(),
+        action_detector=detector,
+        knowledge_mutation_pipeline=pipeline,
     )
 
     result = branch.execute(context, repository)
 
     assert result.response_type is ResponseType.KNOWLEDGE_ACTION
+    assert len(detector.calls) == 1
+    assert detector.calls[0][0] is request
+    assert pipeline.calls == 1
     assert repository.calls == 1
 
 
@@ -386,6 +393,9 @@ def test_reminder_branch_executes_one_matching_prevalidated_confirmation() -> No
             return SimpleNamespace(committed=True, results=(), audit_hop_id="hop")
 
     repository = RecordingRepository()
+    detector = ScriptedExtractionDetector(
+        metadata={"reminder_actions": [action]},
+    )
     branch = ReminderBranch(
         config=SimpleNamespace(
             mutation_policy=SimpleNamespace(
@@ -394,10 +404,13 @@ def test_reminder_branch_executes_one_matching_prevalidated_confirmation() -> No
             default_timezone="UTC",
             confirmation_high_confidence_threshold=0.92,
         ),
+        action_detector=detector,
         validated_action_builder=SimpleNamespace(),
     )
 
     result = branch.execute(context, repository)
 
     assert result.response_type is ResponseType.REMINDER_ACTION
+    assert len(detector.calls) == 1
+    assert detector.calls[0][0] is request
     assert repository.calls == 1

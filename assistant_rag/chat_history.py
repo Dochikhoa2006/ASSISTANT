@@ -23,6 +23,37 @@ _CANONICAL_CHAT_HISTORY: ContextVar[tuple[dict[str, Any], ...]] = ContextVar(
     "assistant_canonical_chat_history",
     default=(),
 )
+_RAW_USER_QUERY_KEYS = frozenset(
+    {
+        "raw_query",
+        "raw_user_query",
+        "source_raw_user_query",
+        "summarized_user_query",
+    }
+)
+
+
+def _without_raw_user_queries(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _without_raw_user_queries(item)
+            for key, item in value.items()
+            if str(key).casefold() not in _RAW_USER_QUERY_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_raw_user_queries(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_without_raw_user_queries(item) for item in value)
+    return value
+
+
+def rewritten_only_chat_history(
+    chat_history: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Quarantine audit-only raw user queries from semantic history."""
+
+    sanitized = _without_raw_user_queries(deepcopy(chat_history))
+    return [dict(item) for item in sanitized if isinstance(item, Mapping)]
 
 
 def _enum_value(value: Any) -> Any:
@@ -58,7 +89,7 @@ def last_qa_chat_history(state: LastQAState | None) -> list[dict[str, Any]]:
         {
             "source": "last_qa",
             "role": "conversation_hop",
-            "raw_user_query": state.last_user_query,
+            "rewritten_user_query": state.last_user_query,
             "raw_response": state.last_response,
             "response_type": _enum_value(state.response_type),
             "supporting_questions": supporting_questions,
@@ -89,7 +120,9 @@ def select_chat_history(
     if conversation_retrieval:
         if approved_conversation_context is None:
             return []
-        return deepcopy(approved_conversation_context.approved_conversation_history)
+        return rewritten_only_chat_history(
+            approved_conversation_context.approved_conversation_history
+        )
     return last_qa_chat_history(last_qa_state)
 
 
@@ -99,7 +132,9 @@ def canonical_chat_history_scope(
 ) -> Iterator[None]:
     """Expose one immutable-per-request history value to every prompt builder."""
 
-    token = _CANONICAL_CHAT_HISTORY.set(tuple(deepcopy(chat_history)))
+    token = _CANONICAL_CHAT_HISTORY.set(
+        tuple(rewritten_only_chat_history(chat_history))
+    )
     try:
         yield
     finally:
@@ -112,8 +147,49 @@ def current_chat_history() -> list[dict[str, Any]]:
     return deepcopy(list(_CANONICAL_CHAT_HISTORY.get()))
 
 
+def supporting_question_context(
+    chat_history: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Expose question-bearing continuity without bypassing history precedence.
+
+    This projection is deliberately derived only from the already-resolved
+    canonical history.  In particular, an authoritative empty history remains
+    empty instead of falling back to stale Last-QA or rejected retrieval data.
+    """
+
+    projected: list[dict[str, Any]] = []
+    for hop in deepcopy(chat_history):
+        if not isinstance(hop, Mapping):
+            continue
+        questions = hop.get("supporting_questions")
+        if not isinstance(questions, list):
+            questions = []
+        clarification = hop.get("clarification_question")
+        reminder_question = hop.get("reminder_supporting_question")
+        expected_response_type = hop.get("expected_response_type")
+        if not (
+            questions
+            or clarification
+            or reminder_question
+            or expected_response_type
+        ):
+            continue
+        projected.append(
+            {
+                "source": hop.get("source"),
+                "topic_id": hop.get("topic_id"),
+                "hop_id": hop.get("hop_id"),
+                "supporting_questions": questions,
+                "clarification_question": clarification,
+                "reminder_supporting_question": reminder_question,
+                "expected_response_type": expected_response_type,
+            }
+        )
+    return projected
+
+
 def inject_chat_history(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Attach canonical history to raw JSON prompts that bypass PromptRegistry."""
+    """Attach canonical history to direct JSON prompts that bypass PromptRegistry."""
 
     enriched = dict(payload)
     enriched["chat_history"] = current_chat_history()

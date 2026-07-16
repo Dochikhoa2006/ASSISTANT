@@ -27,6 +27,22 @@ from .context_filter import TwoLayerContextFilter
 from .metrics import GLOBAL_METRICS
 from .observability import StageTimer, current_trace
 from .chat_history import canonical_chat_history_scope, select_chat_history
+from .indexing import BackgroundIndexer
+
+
+def _branch_outbox_job_ids(branch_result: Any) -> list[str]:
+    payload = dict(getattr(branch_result, "indexing_job_result", {}) or {})
+    values = payload.get("outbox_job_ids") or []
+    if isinstance(values, str):
+        values = [values]
+    fallback = payload.get("conversation_hop_job_id")
+    return list(
+        dict.fromkeys(
+            str(job_id)
+            for job_id in [*values, fallback]
+            if job_id
+        )
+    )
 
 @dataclass
 class AssistantPipeline:
@@ -55,6 +71,10 @@ class AssistantPipeline:
             resolution = self.last_qa_resolver.resolve(request, rewritten, last_state)
             last_qa_stage.metadata["path"] = resolution.path.value
         
+        # Semantic authority boundary: after Last-QA resolution, every
+        # downstream consumer must use this rewritten value. The request's
+        # original text remains available only to quarantined audit/control
+        # paths and must not influence retrieval, routing, prompts, or tools.
         retrieval_query = resolution.rewritten_query
         intent_classifier_query = resolution.rewritten_query
         
@@ -239,6 +259,29 @@ class AssistantPipeline:
         )
         with StageTimer("branch_execution", {"intent": intent.value}):
             branch_result = self.router.route(context, repository)
+        outbox_job_ids = _branch_outbox_job_ids(branch_result)
+        with StageTimer(
+            "branch_index_sync",
+            {"requested_job_count": len(outbox_job_ids)},
+        ) as index_stage:
+            processed_jobs = 0
+            bm25 = getattr(self.retriever, "bm25", None)
+            chroma = getattr(self.retriever, "chroma", None)
+            outbox_config = getattr(self.config, "outbox", None)
+            if outbox_job_ids and bm25 is not None and chroma is not None and outbox_config is not None:
+                processed_jobs = BackgroundIndexer(
+                    repository=repository,
+                    bm25=bm25,
+                    chroma=chroma,
+                    config=outbox_config,
+                ).process_job_ids(outbox_job_ids)
+                index_stage.metadata["sync_mode"] = "request_scoped"
+            elif outbox_job_ids:
+                # Deterministic/unit-injected retrievers may intentionally have
+                # no derived stores. Keep the durable jobs pending for the
+                # normal background worker instead of losing the branch result.
+                index_stage.metadata["sync_mode"] = "durable_outbox_deferred"
+            index_stage.metadata["claimed_job_count"] = processed_jobs
         with StageTimer("bundling"):
             bundled = self.bundler.bundle(
                 request=request,

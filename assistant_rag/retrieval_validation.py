@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from math import isfinite
 from typing import Any
 
@@ -46,16 +46,22 @@ class KnowledgeRetrievalValidationStrategy:
         proposed_content: str | None = None,
         replacement_content: str | None = None,
         chat_history: list[dict[str, Any]] | None = None,
+        user_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        platform_context: dict[str, Any] | None = None,
+        first_model_response: dict[str, Any] | None = None,
     ) -> LLMRetrievalValidationResult | None:
         if not self.config.knowledge_llm_validation_enabled:
             return None
 
         if operation not in {"add", "delete", "modify"}:
-            return self._build_clarification_result(operation=operation)
-
-        candidates = candidates[
-            : self.config.knowledge_llm_validation_max_candidates
-        ]
+            return self._build_internal_failure_result(operation)
+        isolated_first_response = self._validate_first_model_response(
+            first_model_response,
+            requested_operation=operation,
+        )
+        if isolated_first_response is None:
+            return self._build_internal_failure_result(operation)
 
         payloads = []
         candidate_map = {}
@@ -81,20 +87,9 @@ class KnowledgeRetrievalValidationStrategy:
         user_prompt = self.prompts.user(
             PromptContext(
                 stage="knowledge_action_validation",
-                raw_query=user_query,
-                rewritten_query=rewritten_query,
-                intent="knowledge_facts",
-                chat_history=chat_history,
                 extra={
-                    "operation": operation,
-                    "target_description": target_description,
-                    "proposed_content": proposed_content,
-                    "replacement_content": replacement_content,
-                    "candidate_chunks": payloads,
-                    "validation_policy": {
-                        "min_confidence": self.config.knowledge_llm_validation_min_confidence,
-                        "destructive_action_requires_unambiguous_target": self.config.destructive_action_requires_unambiguous_target,
-                    },
+                    "first_model_response": isolated_first_response,
+                    "knowledge_retrieval": payloads,
                 },
             )
         )
@@ -116,6 +111,61 @@ class KnowledgeRetrievalValidationStrategy:
             logger.error(f"Knowledge LLM validation failed: {e}")
             return self._handle_failure()
 
+    @staticmethod
+    def _validate_first_model_response(
+        response: dict[str, Any] | None,
+        *,
+        requested_operation: str,
+    ) -> dict[str, Any] | None:
+        expected_fields = {
+            "action",
+            "text_content",
+            "original_text",
+            "replacement_text",
+            "confidence",
+            "missing_fields",
+            "reason_summary",
+        }
+        if not isinstance(response, dict) or set(response) != expected_fields:
+            return None
+        action = response["action"]
+        text_content = response["text_content"]
+        original_text = response["original_text"]
+        replacement_text = response["replacement_text"]
+        confidence = response["confidence"]
+        missing_fields = response["missing_fields"]
+        reason_summary = response["reason_summary"]
+        if (
+            action != requested_operation
+            or not isinstance(action, str)
+            or not isinstance(text_content, str)
+            or not isinstance(original_text, str)
+            or not isinstance(replacement_text, str)
+            or isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not isfinite(float(confidence))
+            or not 0.0 <= float(confidence) <= 1.0
+            or not isinstance(missing_fields, list)
+            or missing_fields
+            or not isinstance(reason_summary, str)
+            or not reason_summary.strip()
+        ):
+            return None
+        if action in {"add", "delete"}:
+            if not text_content or original_text or replacement_text:
+                return None
+        elif text_content or not original_text or not replacement_text:
+            return None
+        return {
+            "action": action,
+            "text_content": text_content,
+            "original_text": original_text,
+            "replacement_text": replacement_text,
+            "confidence": float(confidence),
+            "missing_fields": [],
+            "reason_summary": reason_summary,
+        }
+
     def _parse_and_validate_result(
         self,
         raw_response: dict[str, Any],
@@ -123,55 +173,117 @@ class KnowledgeRetrievalValidationStrategy:
         *,
         requested_operation: str,
     ) -> LLMRetrievalValidationResult:
+        expected_fields = {
+            "operation",
+            "decision",
+            "selected_candidate_keys",
+            "confidence",
+            "clarification_question",
+            "reason_summary",
+            "candidate_assessments",
+        }
+        assessment_fields = {
+            "candidate_key",
+            "matches_target",
+            "action_compatible",
+            "confidence",
+            "matched_fields",
+            "reason_summary",
+            "matched_text",
+        }
+        if not isinstance(raw_response, dict) or set(raw_response) != expected_fields:
+            return self._build_internal_failure_result(requested_operation)
         try:
-            assessments = tuple(
-                RetrievalCandidateAssessment(
-                    candidate_key=str(item["candidate_key"]),
-                    matches_target=bool(item["matches_target"]),
-                    action_compatible=bool(item["action_compatible"]),
-                    confidence=float(item["confidence"]),
-                    matched_fields=tuple(str(value) for value in item["matched_fields"]),
-                    reason_summary=str(item["reason_summary"]),
-                    matched_text=str(item["matched_text"]),
+            raw_operation = raw_response["operation"]
+            raw_decision = raw_response["decision"]
+            raw_selected = raw_response["selected_candidate_keys"]
+            raw_confidence = raw_response["confidence"]
+            raw_question = raw_response["clarification_question"]
+            raw_reason = raw_response["reason_summary"]
+            raw_assessments = raw_response["candidate_assessments"]
+            if (
+                not isinstance(raw_operation, str)
+                or raw_decision not in {"PASS", "FAIL"}
+                or not isinstance(raw_selected, list)
+                or not all(isinstance(value, str) for value in raw_selected)
+                or isinstance(raw_confidence, bool)
+                or not isinstance(raw_confidence, (int, float))
+                or not isinstance(raw_question, str)
+                or not isinstance(raw_reason, str)
+                or not raw_reason.strip()
+                or not isinstance(raw_assessments, list)
+            ):
+                return self._build_internal_failure_result(requested_operation)
+
+            assessments_list: list[RetrievalCandidateAssessment] = []
+            for item in raw_assessments:
+                if not isinstance(item, dict) or set(item) != assessment_fields:
+                    return self._build_internal_failure_result(requested_operation)
+                item_confidence = item["confidence"]
+                if (
+                    not isinstance(item["candidate_key"], str)
+                    or not isinstance(item["matches_target"], bool)
+                    or not isinstance(item["action_compatible"], bool)
+                    or isinstance(item_confidence, bool)
+                    or not isinstance(item_confidence, (int, float))
+                    or not isinstance(item["matched_fields"], list)
+                    or not all(
+                        isinstance(value, str) for value in item["matched_fields"]
+                    )
+                    or not isinstance(item["reason_summary"], str)
+                    or not isinstance(item["matched_text"], str)
+                ):
+                    return self._build_internal_failure_result(requested_operation)
+                assessments_list.append(
+                    RetrievalCandidateAssessment(
+                        candidate_key=item["candidate_key"],
+                        matches_target=item["matches_target"],
+                        action_compatible=item["action_compatible"],
+                        confidence=float(item_confidence),
+                        matched_fields=tuple(item["matched_fields"]),
+                        reason_summary=item["reason_summary"],
+                        matched_text=item["matched_text"],
+                    )
                 )
-                for item in raw_response.get("candidate_assessments", [])
-            )
+            assessments = tuple(assessments_list)
             res = LLMRetrievalValidationResult(
-                operation=str(raw_response["operation"]).lower(),
-                validation_result=ActionValidationResult(
-                    str(raw_response["validation_result"]).lower()
+                operation=raw_operation.lower(),
+                validation_result=(
+                    ActionValidationResult.EXECUTE
+                    if raw_decision == "PASS"
+                    else ActionValidationResult.CLARIFY_MISSING_FIELDS
                 ),
-                selected_candidate_keys=tuple(
-                    str(value) for value in raw_response["selected_candidate_keys"]
-                ),
-                confidence=float(raw_response["confidence"]),
-                ambiguous=bool(raw_response["ambiguous"]),
-                reason_summary=str(raw_response["reason_summary"]),
+                selected_candidate_keys=tuple(raw_selected),
+                confidence=float(raw_confidence),
+                ambiguous=False,
+                reason_summary=raw_reason,
                 candidate_assessments=assessments,
-                should_execute=bool(raw_response["should_execute"]),
-                requires_hitl=bool(raw_response["requires_hitl"]),
-                factuality_concern=bool(raw_response["factuality_concern"]),
+                should_execute=raw_decision == "PASS",
+                requires_hitl=raw_decision == "FAIL",
+                factuality_concern=False,
+                hitl_reason=(
+                    "knowledge_validation_fail" if raw_decision == "FAIL" else None
+                ),
+                clarification_question=raw_question,
             )
         except (KeyError, TypeError, ValueError):
-            return self._build_clarification_result(operation=requested_operation)
+            return self._build_internal_failure_result(requested_operation)
 
         if res.operation != requested_operation:
-            return self._build_clarification_result(operation=requested_operation)
+            return self._build_internal_failure_result(requested_operation)
         if not isfinite(res.confidence) or not 0.0 <= res.confidence <= 1.0:
-            return self._build_clarification_result(operation=requested_operation)
-        if res.confidence < self.config.knowledge_llm_validation_min_confidence:
-            return self._build_clarification_result(operation=requested_operation)
+            return self._build_internal_failure_result(requested_operation)
         if len(set(res.selected_candidate_keys)) != len(res.selected_candidate_keys):
-            return self._build_clarification_result(operation=requested_operation)
+            return self._build_internal_failure_result(requested_operation)
         if any(key not in candidate_map for key in res.selected_candidate_keys):
-            return self._build_clarification_result(operation=requested_operation)
+            return self._build_internal_failure_result(requested_operation)
         if any(
             assessment.candidate_key not in candidate_map
             or not isfinite(assessment.confidence)
             or not 0.0 <= assessment.confidence <= 1.0
             for assessment in res.candidate_assessments
         ):
-            return self._build_clarification_result(operation=requested_operation)
+            return self._build_internal_failure_result(requested_operation)
         assessment_keys = [
             assessment.candidate_key for assessment in res.candidate_assessments
         ]
@@ -179,161 +291,104 @@ class KnowledgeRetrievalValidationStrategy:
             len(set(assessment_keys)) != len(assessment_keys)
             or set(assessment_keys) != set(candidate_map)
         ):
-            return self._build_clarification_result(operation=requested_operation)
+            return self._build_internal_failure_result(requested_operation)
         for assessment in res.candidate_assessments:
             candidate_text = candidate_map[assessment.candidate_key].text
             if assessment.matches_target:
                 if (
                     not assessment.matched_text
                     or assessment.matched_text not in candidate_text
+                    or assessment.matched_fields != ("text",)
                 ):
-                    return self._build_clarification_result(
-                        operation=requested_operation
+                    return self._build_internal_failure_result(
+                        requested_operation
                     )
-            elif assessment.matched_text:
-                return self._build_clarification_result(
-                    operation=requested_operation
-                )
+            elif assessment.matched_text or assessment.matched_fields:
+                return self._build_internal_failure_result(requested_operation)
 
-        is_execute = res.validation_result == ActionValidationResult.EXECUTE
-        is_clarification = res.validation_result in {
-            ActionValidationResult.CLARIFY_AMBIGUOUS_TARGET,
-            ActionValidationResult.CLARIFY_MISSING_FIELDS,
-        }
-        if res.should_execute != is_execute or res.requires_hitl != is_clarification:
-            return self._build_clarification_result(operation=requested_operation)
-        if res.factuality_concern and not is_clarification:
-            return self._build_clarification_result(operation=requested_operation)
-        if res.factuality_concern:
-            res = replace(res, hitl_reason="factuality_concern")
+        if res.validation_result is ActionValidationResult.CLARIFY_MISSING_FIELDS:
+            if res.selected_candidate_keys or not (res.clarification_question or "").strip():
+                return self._build_internal_failure_result(requested_operation)
+            return res
 
-        allowed_results = (
-            {
-                ActionValidationResult.EXECUTE,
-                ActionValidationResult.SKIP_ALREADY_EXISTS,
-                ActionValidationResult.CLARIFY_AMBIGUOUS_TARGET,
-                ActionValidationResult.CLARIFY_MISSING_FIELDS,
-            }
-            if requested_operation == "add"
-            else {
-                ActionValidationResult.EXECUTE,
-                ActionValidationResult.SKIP_NOT_FOUND,
-                ActionValidationResult.CLARIFY_AMBIGUOUS_TARGET,
-                ActionValidationResult.CLARIFY_MISSING_FIELDS,
-            }
-        )
-        if res.validation_result not in allowed_results:
-            return self._build_clarification_result(operation=requested_operation)
-
-        if is_execute:
-            if res.ambiguous:
-                return self._build_clarification_result(operation=requested_operation)
-            if requested_operation == "add":
-                if res.selected_candidate_keys or any(
-                    assessment.matches_target
-                    and assessment.confidence
-                    >= self.config.knowledge_llm_validation_min_confidence
-                    for assessment in res.candidate_assessments
-                ):
-                    return self._build_clarification_result(operation=requested_operation)
-            else:
-                if len(res.selected_candidate_keys) != 1:
-                    return self._build_clarification_result(operation=requested_operation)
-                selected_key = res.selected_candidate_keys[0]
-                selected_assessment = next(
-                    (
-                        assessment
-                        for assessment in res.candidate_assessments
-                        if assessment.candidate_key == selected_key
-                    ),
-                    None,
-                )
-                if (
-                    selected_assessment is None
-                    or not selected_assessment.matches_target
-                    or not selected_assessment.action_compatible
-                    or selected_assessment.confidence
-                    < self.config.knowledge_llm_validation_min_confidence
-                    or candidate_map[selected_key].text.count(
-                        selected_assessment.matched_text
-                    ) != 1
-                ):
-                    return self._build_clarification_result(operation=requested_operation)
-                strong_compatible_matches = {
-                    assessment.candidate_key
-                    for assessment in res.candidate_assessments
-                    if assessment.matches_target
-                    and assessment.action_compatible
-                    and assessment.confidence
-                    >= self.config.knowledge_llm_validation_min_confidence
-                }
-                if strong_compatible_matches != {selected_key}:
-                    return self._build_clarification_result(
-                        operation=requested_operation
-                    )
-                if (
-                    requested_operation == "delete"
-                    and " ".join(selected_assessment.matched_text.split())
-                    != " ".join(candidate_map[selected_key].text.split())
-                ):
-                    return self._build_clarification_result(
-                        operation=requested_operation,
-                        reason_summary=(
-                            "A partial-chunk delete would remove unrelated knowledge."
-                        ),
-                        hitl_reason="partial_chunk_delete",
-                    )
-
-        if res.validation_result == ActionValidationResult.CLARIFY_AMBIGUOUS_TARGET:
-            if not res.ambiguous:
-                return self._build_clarification_result(operation=requested_operation)
-
-        if res.validation_result == ActionValidationResult.SKIP_NOT_FOUND:
+        if res.clarification_question != "":
+            return self._build_internal_failure_result(requested_operation)
+        if res.confidence < self.config.knowledge_llm_validation_min_confidence:
+            return self._build_internal_failure_result(requested_operation)
+        if requested_operation == "add":
             if res.selected_candidate_keys or any(
                 assessment.matches_target
                 and assessment.confidence
                 >= self.config.knowledge_llm_validation_min_confidence
                 for assessment in res.candidate_assessments
             ):
-                return self._build_clarification_result(operation=requested_operation)
-
-        if res.validation_result == ActionValidationResult.SKIP_ALREADY_EXISTS:
-            if requested_operation != "add" or not any(
-                assessment.matches_target
+                return self._build_internal_failure_result(requested_operation)
+        else:
+            if len(res.selected_candidate_keys) != 1:
+                return self._build_internal_failure_result(requested_operation)
+            selected_key = res.selected_candidate_keys[0]
+            selected_assessment = next(
+                (
+                    assessment
+                    for assessment in res.candidate_assessments
+                    if assessment.candidate_key == selected_key
+                ),
+                None,
+            )
+            if (
+                selected_assessment is None
+                or not selected_assessment.matches_target
+                or not selected_assessment.action_compatible
+                or selected_assessment.confidence
+                < self.config.knowledge_llm_validation_min_confidence
+                or candidate_map[selected_key].text.count(
+                    selected_assessment.matched_text
+                ) != 1
+            ):
+                return self._build_internal_failure_result(requested_operation)
+            strong_compatible_matches = {
+                assessment.candidate_key
+                for assessment in res.candidate_assessments
+                if assessment.matches_target
+                and assessment.action_compatible
                 and assessment.confidence
                 >= self.config.knowledge_llm_validation_min_confidence
-                for assessment in res.candidate_assessments
+            }
+            if strong_compatible_matches != {selected_key}:
+                return self._build_internal_failure_result(requested_operation)
+            if (
+                requested_operation == "delete"
+                and " ".join(selected_assessment.matched_text.split())
+                != " ".join(candidate_map[selected_key].text.split())
             ):
-                return self._build_clarification_result(operation=requested_operation)
+                return self._build_internal_failure_result(requested_operation)
 
         return res
 
     def _handle_failure(self) -> LLMRetrievalValidationResult | None:
         if self.config.knowledge_llm_validation_failure_policy == "fail_closed":
-            return self._build_clarification_result()
+            return self._build_internal_failure_result("unknown")
         return None
 
-    def _build_clarification_result(
+    def _build_internal_failure_result(
         self,
-        *,
-        operation: str = "unknown",
-        reason_summary: str = (
-            "Fallback to clarification due to validation limits or failure."
-        ),
-        hitl_reason: str | None = None,
+        operation: str,
     ) -> LLMRetrievalValidationResult:
         return LLMRetrievalValidationResult(
             operation=operation,
-            validation_result=ActionValidationResult.CLARIFY_AMBIGUOUS_TARGET,
+            validation_result=ActionValidationResult.REJECT_UNSAFE_TRANSITION,
             selected_candidate_keys=(),
-            confidence=1.0,
-            ambiguous=True,
-            reason_summary=reason_summary,
+            confidence=0.0,
+            ambiguous=False,
+            reason_summary=(
+                "Knowledge validation failed its strict response or evidence contract."
+            ),
             candidate_assessments=(),
             should_execute=False,
-            requires_hitl=True,
+            requires_hitl=False,
             factuality_concern=False,
-            hitl_reason=hitl_reason,
+            hitl_reason="internal_validation_failure",
+            clarification_question=None,
         )
 
     def _schema(self) -> dict[str, Any]:
@@ -384,7 +439,6 @@ class ReminderRetrievalValidationStrategy:
 
         prompt_input = {
             "operation": operation,
-            "user_query": user_query,
             "rewritten_query": rewritten_query,
             "target_description": target_description,
             "target_time_signals": target_time_signals,

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 
-from assistant_rag.action_detection import DeterministicActionDetector
 from assistant_rag.action_keywords import (
     ADD_ACTION_KEYWORDS,
     DELETE_ACTION_KEYWORDS,
@@ -12,37 +11,43 @@ from assistant_rag.action_keywords import (
 )
 from assistant_rag.contracts import ChatRequest, Intent
 from assistant_rag.request_lifecycle import looks_destructive, looks_like_mutation
-
-
-ACTION_KEYWORD_CASES = (
-    *((Intent.KNOWLEDGE_FACTS, keyword, "delete") for keyword in DELETE_ACTION_KEYWORDS),
-    *((Intent.KNOWLEDGE_FACTS, keyword, "modify") for keyword in MODIFY_ACTION_KEYWORDS),
-    *((Intent.KNOWLEDGE_FACTS, keyword, "add") for keyword in ADD_ACTION_KEYWORDS),
-    *((Intent.REMINDER, keyword, "delete") for keyword in DELETE_ACTION_KEYWORDS),
-    *((Intent.REMINDER, keyword, "modify") for keyword in MODIFY_ACTION_KEYWORDS),
-    *((Intent.REMINDER, keyword, "add") for keyword in ADD_ACTION_KEYWORDS),
-    *((Intent.REMINDER, keyword, "turn_on") for keyword in TURN_ON_ACTION_KEYWORDS),
-    *((Intent.REMINDER, keyword, "turn_off") for keyword in TURN_OFF_ACTION_KEYWORDS),
+from assistant_rag.request_policy import (
+    has_destructive_mutation_policy_signal,
+    has_explicit_mutation_policy_signal,
 )
 
 
-@pytest.mark.parametrize(("intent", "keyword", "expected_action"), ACTION_KEYWORD_CASES)
-def test_every_authorized_action_keyword_enters_the_matching_request_lifecycle(
+REQUEST_POLICY_KEYWORD_CASES = (
+    *((Intent.KNOWLEDGE_FACTS, keyword, True) for keyword in DELETE_ACTION_KEYWORDS),
+    *((Intent.KNOWLEDGE_FACTS, keyword, True) for keyword in MODIFY_ACTION_KEYWORDS),
+    *((Intent.KNOWLEDGE_FACTS, keyword, False) for keyword in ADD_ACTION_KEYWORDS),
+    *((Intent.REMINDER, keyword, True) for keyword in DELETE_ACTION_KEYWORDS),
+    *((Intent.REMINDER, keyword, True) for keyword in MODIFY_ACTION_KEYWORDS),
+    *((Intent.REMINDER, keyword, False) for keyword in ADD_ACTION_KEYWORDS),
+    *((Intent.REMINDER, keyword, False) for keyword in TURN_ON_ACTION_KEYWORDS),
+    *((Intent.REMINDER, keyword, True) for keyword in TURN_OFF_ACTION_KEYWORDS),
+)
+
+
+@pytest.mark.parametrize(
+    ("intent", "keyword", "expected_destructive"),
+    REQUEST_POLICY_KEYWORD_CASES,
+)
+def test_every_policy_keyword_sets_only_request_lifecycle_signals(
     intent: Intent,
     keyword: str,
-    expected_action: str,
+    expected_destructive: bool,
 ) -> None:
     query = f"Please {keyword} the requested item."
     request = ChatRequest(user_id="lifecycle-matrix", raw_query=query)
 
-    detection = DeterministicActionDetector().detect(request, query, intent)
-
-    action_key = "knowledge_actions" if intent is Intent.KNOWLEDGE_FACTS else "reminder_actions"
-    assert not detection.requires_clarification, (intent, keyword, detection)
-    assert detection.metadata[action_key][0]["action"] == expected_action
-    assert looks_like_mutation(request), (intent, keyword, expected_action)
-    if expected_action in {"delete", "modify", "turn_off"}:
-        assert looks_destructive(request), (intent, keyword, expected_action)
+    assert has_explicit_mutation_policy_signal(request, intent), (intent, keyword)
+    assert has_destructive_mutation_policy_signal(
+        request, intent
+    ) is expected_destructive
+    assert looks_like_mutation(request), (intent, keyword)
+    if expected_destructive:
+        assert looks_destructive(request), (intent, keyword)
 
 
 @pytest.mark.parametrize(

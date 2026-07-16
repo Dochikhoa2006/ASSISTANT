@@ -51,7 +51,11 @@ from .reminder_safety import normalize_subject, token_similarity, utc_minute, wi
 from .recurrence import calculate_next_fire_time
 from .lifecycle import is_artifact_downloadable, is_indexable_conversation_hop, is_indexable_knowledge_chunk
 from .metrics import GLOBAL_METRICS
-from .conversation_embedding import conversation_hop_embedding_metadata, serialize_conversation_hop
+from .conversation_embedding import (
+    conversation_hop_embedding_metadata,
+    conversation_hop_semantic_payload,
+    serialize_conversation_hop,
+)
 
 
 def now_iso() -> str:
@@ -332,7 +336,30 @@ class SQLiteRepository(AssistantRepository):
         self._ensure_release3_sqlite_columns()
         self._ensure_release4_sqlite_columns()
         self._ensure_release5_reminder_source_bindings()
+        self._ensure_unique_knowledge_topic_titles()
         self.connection.commit()
+
+    def _ensure_unique_knowledge_topic_titles(self) -> None:
+        duplicate = self.connection.execute(
+            """
+            SELECT user_id, title, COUNT(*) AS duplicate_count
+            FROM knowledge_topics
+            GROUP BY user_id, title
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """
+        ).fetchone()
+        if duplicate is not None:
+            raise RepositoryValidationError(
+                "Cannot enforce unique knowledge topic titles because legacy "
+                "duplicate (user_id, title) rows exist. Repair them before startup."
+            )
+        self.connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_knowledge_topics_user_title
+            ON knowledge_topics(user_id, title)
+            """
+        )
 
     def _ensure_release2_sqlite_columns(self) -> None:
         def columns(table_name: str) -> set[str]:
@@ -643,7 +670,7 @@ class SQLiteRepository(AssistantRepository):
                 raw_user_query,
                 rewritten_user_query,
                 raw_response,
-                raw_user_query,
+                rewritten_user_query,
                 raw_response,
                 state_summary,
                 entities_json,
@@ -826,7 +853,6 @@ class SQLiteRepository(AssistantRepository):
                 n.source_hop_id,
                 n.ui_status,
                 h.topic_id,
-                h.raw_user_query AS source_raw_user_query,
                 h.rewritten_user_query AS source_rewritten_user_query,
                 h.raw_response AS source_raw_response,
                 h.supporting_questions_json,
@@ -862,6 +888,45 @@ class SQLiteRepository(AssistantRepository):
                 (now_iso(), max_attempts, retry_cutoff, batch_size),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def claim_outbox_jobs_by_ids(
+        self,
+        *,
+        job_ids: list[str],
+        max_attempts: int,
+    ) -> list[dict[str, Any]]:
+        unique_ids = list(dict.fromkeys(job_id for job_id in job_ids if job_id))
+        if not unique_ids:
+            return []
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self.transaction() as cursor:
+            rows = cursor.execute(
+                f"""
+                UPDATE indexing_outbox
+                SET status = 'processing', updated_at = ?
+                WHERE job_id IN ({placeholders})
+                  AND retry_count < ?
+                  AND status IN ('pending', 'failed')
+                RETURNING *
+                """,
+                (now_iso(), *unique_ids, max_attempts),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_outbox_job_statuses(
+        self,
+        *,
+        job_ids: list[str],
+    ) -> dict[str, str]:
+        unique_ids = list(dict.fromkeys(job_id for job_id in job_ids if job_id))
+        if not unique_ids:
+            return {}
+        placeholders = ",".join("?" for _ in unique_ids)
+        rows = self.connection.execute(
+            f"SELECT job_id, status FROM indexing_outbox WHERE job_id IN ({placeholders})",
+            tuple(unique_ids),
+        ).fetchall()
+        return {str(row["job_id"]): str(row["status"]) for row in rows}
 
     def release_stale_processing_jobs(self, *, max_attempts: int, timeout_cutoff: str) -> None:
         with self.transaction() as cursor:
@@ -1034,9 +1099,10 @@ class SQLiteRepository(AssistantRepository):
             hop = hop_map.get(result.entity_id)
             if not hop:
                 continue
-            payload = dict(result.payload)
-            payload.update(hop)
-            payload["text"] = serialize_conversation_hop(hop)
+            semantic_hop = conversation_hop_semantic_payload(hop)
+            payload = conversation_hop_semantic_payload(result.payload)
+            payload.update(semantic_hop)
+            payload["text"] = serialize_conversation_hop(semantic_hop)
             hydrated.append(
                 RetrievalResult(
                     entity_type=result.entity_type,
@@ -1079,8 +1145,27 @@ class SQLiteRepository(AssistantRepository):
         replaces_chunk_id: str | None = None,
         change_reason: str | None = None,
         modified_by_user_query: str | None = None,
+        knowledge_topic_id: str | None = None,
     ) -> tuple[str, str, str | None]:
-        topic_id = self.ensure_knowledge_topic(cursor, user_id=user_id, title=title)
+        if knowledge_topic_id is not None:
+            topic = cursor.execute(
+                """
+                SELECT knowledge_topic_id FROM knowledge_topics
+                WHERE user_id = ? AND knowledge_topic_id = ?
+                """,
+                (user_id, knowledge_topic_id),
+            ).fetchone()
+            if not topic:
+                raise KnowledgeConflictError(
+                    "Knowledge topic not found for user"
+                )
+            topic_id = str(topic["knowledge_topic_id"])
+        else:
+            topic_id = self.ensure_knowledge_topic(
+                cursor,
+                user_id=user_id,
+                title=title,
+            )
         normalized = " ".join(text.split())
         c_hash = content_hash(user_id, normalized)
         
@@ -1182,10 +1267,40 @@ class SQLiteRepository(AssistantRepository):
                 knowledge_topic_id, user_id, title, description, entities_json,
                 created_at, updated_at, version
             ) VALUES (?, ?, ?, '', '{}', ?, ?, 1)
+            ON CONFLICT(user_id, title) DO NOTHING
             """,
             (topic_id, user_id, title, timestamp, timestamp),
         )
-        return topic_id
+        resolved = cursor.execute(
+            """
+            SELECT knowledge_topic_id FROM knowledge_topics
+            WHERE user_id = ? AND title = ?
+            """,
+            (user_id, title),
+        ).fetchone()
+        if not resolved:
+            raise KnowledgeConflictError("Knowledge topic could not be resolved")
+        return str(resolved["knowledge_topic_id"])
+
+    @staticmethod
+    def _touch_knowledge_topic(
+        cursor: sqlite3.Cursor,
+        *,
+        user_id: str,
+        knowledge_topic_id: str,
+    ) -> None:
+        cursor.execute(
+            """
+            UPDATE knowledge_topics
+            SET updated_at = ?, version = version + 1
+            WHERE user_id = ? AND knowledge_topic_id = ?
+            """,
+            (now_iso(), user_id, knowledge_topic_id),
+        )
+        if cursor.rowcount != 1:
+            raise KnowledgeConflictError(
+                "Knowledge topic changed before mutation completion"
+            )
 
     def get_knowledge_chunks_by_ids(
         self, user_id: str, chunk_ids: list[str], include_deleted: bool = False
@@ -1823,6 +1938,7 @@ class SQLiteRepository(AssistantRepository):
                 return RepositoryTransactionResult(
                     committed=True,
                     results=(result,),
+                    audit_topic_id=hop.topic_id,
                     audit_hop_id=hop.hop_id,
                     indexing_outbox_ids=(hop.outbox_job_id,),
                 )
@@ -1853,10 +1969,38 @@ class SQLiteRepository(AssistantRepository):
                 topic_id = self.ensure_topic(cursor, user_id=user_id, title=topic_title)
                 results: list[RepositoryActionResult] = []
                 outbox_jobs: list[str] = []
+                knowledge_entities: list[dict[str, Any]] = []
                 for action in actions:
                     result = self._apply_knowledge_action(cursor, user_id=user_id, action=action)
                     results.append(result)
                     outbox_jobs.extend(result.indexing_outbox_ids)
+                    if not result.domain_entity_id:
+                        raise KnowledgeConflictError(
+                            "Knowledge mutation did not resolve a chunk"
+                        )
+                    entity_row = cursor.execute(
+                        """
+                        SELECT knowledge_topic_id FROM knowledge_chunks
+                        WHERE user_id = ? AND chunk_id = ?
+                        """,
+                        (user_id, result.domain_entity_id),
+                    ).fetchone()
+                    if not entity_row:
+                        raise KnowledgeConflictError(
+                            "Knowledge mutation chunk was not persisted"
+                        )
+                    knowledge_entities.append(
+                        {
+                            "entity_type": "knowledge_chunk",
+                            "action": action.action.value,
+                            "knowledge_topic_id": str(
+                                entity_row["knowledge_topic_id"]
+                            ),
+                            "knowledge_chunk_id": result.domain_entity_id,
+                            "target_chunk_ids": list(action.target_chunk_ids),
+                            "status": result.status,
+                        }
+                    )
                 hop = self.append_conversation_hop(
                     cursor,
                     topic_id=topic_id,
@@ -1867,6 +2011,7 @@ class SQLiteRepository(AssistantRepository):
                     raw_response=response_text,
                     response_type="knowledge_action",
                     parent_hop_id=parent_hop_id,
+                    entities={"knowledge": knowledge_entities},
                 )
                 outbox_jobs.append(hop.outbox_job_id)
                 updated_results = []
@@ -1887,6 +2032,7 @@ class SQLiteRepository(AssistantRepository):
                 return RepositoryTransactionResult(
                     committed=True,
                     results=tuple(updated_results),
+                    audit_topic_id=hop.topic_id,
                     audit_hop_id=hop.hop_id,
                     indexing_outbox_ids=tuple(outbox_jobs),
                 )
@@ -1974,6 +2120,7 @@ class SQLiteRepository(AssistantRepository):
                 return RepositoryTransactionResult(
                     committed=True,
                     results=tuple(updated_results),
+                    audit_topic_id=hop.topic_id,
                     audit_hop_id=hop.hop_id,
                     indexing_outbox_ids=(hop.outbox_job_id,),
                 )
@@ -1998,13 +2145,18 @@ class SQLiteRepository(AssistantRepository):
     ) -> RepositoryActionResult:
         action_type = action.action
         if action_type is KnowledgeAction.ADD:
-            _, chunk_id, outbox_job_id = self.add_knowledge_chunk(
+            topic_id, chunk_id, outbox_job_id = self.add_knowledge_chunk(
                 cursor,
                 user_id=user_id,
                 title=action.topic_title or "Knowledge",
                 text=action.knowledge_text or action.new_text or "",
                 source_id=None,
                 metadata=None,
+            )
+            self._touch_knowledge_topic(
+                cursor,
+                user_id=user_id,
+                knowledge_topic_id=topic_id,
             )
             return RepositoryActionResult(
                 action_id=new_id(),
@@ -2017,6 +2169,54 @@ class SQLiteRepository(AssistantRepository):
             )
         if action_type in {KnowledgeAction.DELETE, KnowledgeAction.MODIFY}:
             chunk_id = action.target_chunk_ids[0]
+            target = cursor.execute(
+                """
+                SELECT knowledge_topic_id, normalized_text FROM knowledge_chunks
+                WHERE user_id = ? AND chunk_id = ? AND is_deleted = 0
+                """,
+                (user_id, chunk_id),
+            ).fetchone()
+            if not target:
+                raise KnowledgeConflictError(
+                    "Active knowledge target was not found"
+                )
+            target_topic_id = str(target["knowledge_topic_id"])
+            if action.target_topic_ids and set(action.target_topic_ids) != {
+                target_topic_id
+            }:
+                raise KnowledgeConflictError(
+                    "Knowledge target topic no longer matches"
+                )
+            if action_type is KnowledgeAction.MODIFY:
+                replacement_text = " ".join(
+                    (action.replacement_text or action.new_text or "").split()
+                )
+                if not replacement_text:
+                    raise KnowledgeConflictError(
+                        "Knowledge replacement text is empty"
+                    )
+                if replacement_text == str(target["normalized_text"]):
+                    raise KnowledgeConflictError(
+                        "Knowledge replacement already matches the active target"
+                    )
+                duplicate_replacement = cursor.execute(
+                    """
+                    SELECT chunk_id FROM knowledge_chunks
+                    WHERE user_id = ? AND knowledge_topic_id = ?
+                      AND content_hash = ? AND chunk_id != ?
+                    LIMIT 1
+                    """,
+                    (
+                        user_id,
+                        target_topic_id,
+                        content_hash(user_id, replacement_text),
+                        chunk_id,
+                    ),
+                ).fetchone()
+                if duplicate_replacement:
+                    raise KnowledgeConflictError(
+                        "Knowledge replacement already exists in the target topic"
+                    )
             expected_version = action.observed_versions.get(chunk_id)
             del_outbox_job_id = self.soft_delete_knowledge_chunk(
                 cursor,
@@ -2037,6 +2237,7 @@ class SQLiteRepository(AssistantRepository):
                     replaces_chunk_id=chunk_id,
                     change_reason=action.reason_summary or "modify",
                     modified_by_user_query=action.target_description,
+                    knowledge_topic_id=target_topic_id,
                 )
                 cursor.execute(
                     """
@@ -2045,6 +2246,11 @@ class SQLiteRepository(AssistantRepository):
                     WHERE user_id = ? AND chunk_id = ?
                     """,
                     (new_chunk_id, user_id, chunk_id),
+                )
+                self._touch_knowledge_topic(
+                    cursor,
+                    user_id=user_id,
+                    knowledge_topic_id=target_topic_id,
                 )
                 
                 outbox_jobs = [del_outbox_job_id]
@@ -2060,6 +2266,11 @@ class SQLiteRepository(AssistantRepository):
                     indexing_outbox_ids=tuple(outbox_jobs),
                     user_safe_summary="Modified knowledge.",
                 )
+            self._touch_knowledge_topic(
+                cursor,
+                user_id=user_id,
+                knowledge_topic_id=target_topic_id,
+            )
             return RepositoryActionResult(
                 action_id=new_id(),
                 action_type=action_type.value,
@@ -2126,6 +2337,30 @@ class SQLiteRepository(AssistantRepository):
         audit_hop_id: str,
     ) -> RepositoryActionResult:
         action_type = action.action
+
+        def preserve_explicit_notification_time(reminder_id: str) -> None:
+            if action.timing_plan_required:
+                return
+            timestamp = now_iso()
+            cursor.execute(
+                """
+                UPDATE reminders
+                SET timing_plan_status = 'planned', timing_planned_at = ?,
+                    timing_plan_reason = ?
+                WHERE user_id = ? AND reminder_id = ?
+                """,
+                (
+                    timestamp,
+                    "Explicit notification time preserved from validated reminder mutation.",
+                    user_id,
+                    reminder_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ReminderConflictError(
+                    "Explicit reminder timing state could not be preserved"
+                )
+
         if action_type is ReminderAction.ADD:
             if action.reminder_time:
                 duplicate = self.find_active_reminder_duplicates(
@@ -2149,10 +2384,20 @@ class SQLiteRepository(AssistantRepository):
                 source_topic_id=source_topic_id,
                 source_hop_id=audit_hop_id,
                 reminder_time=action.reminder_time.isoformat() if action.reminder_time else "",
-                event_time=(action.event_time or action.reminder_time).isoformat() if (action.event_time or action.reminder_time) else None,
+                event_time=(
+                    action.event_time
+                    or (action.reminder_time if action.timing_plan_required else None)
+                ).isoformat()
+                if (
+                    action.event_time
+                    or (action.reminder_time if action.timing_plan_required else None)
+                )
+                else None,
                 raw_reminder=action.raw_reminder or "",
                 reminder_summary=action.reminder_summary or "",
                 subject=action.subject or "",
+                supporting_question=action.supporting_question,
+                supporting_response=action.supporting_response,
                 user_timezone=action.user_timezone or "UTC",
                 original_time_text=action.original_time_text,
                 recurrence_rule=action.recurrence_rule,
@@ -2160,6 +2405,7 @@ class SQLiteRepository(AssistantRepository):
                 next_fire_time=action.next_fire_time.isoformat() if action.next_fire_time else (action.reminder_time.isoformat() if action.recurrence_rule and action.reminder_time else None),
                 parent_recurring_reminder_id=action.parent_recurring_reminder_id,
             )
+            preserve_explicit_notification_time(reminder_id)
             return RepositoryActionResult(
                 action_id=new_id(),
                 action_type=action_type.value,
@@ -2168,7 +2414,12 @@ class SQLiteRepository(AssistantRepository):
                 domain_entity_id=reminder_id,
                 indexing_outbox_ids=(),
                 user_safe_summary=(
-                    f"Added reminder '{action.subject}'. Timing will be finalized by autoscan before it can notify you."
+                    f"Added reminder '{action.subject}'. "
+                    + (
+                        "Timing will be finalized by autoscan before it can notify you."
+                        if action.timing_plan_required
+                        else "The validated notification time was preserved."
+                    )
                 ),
             )
         elif action_type is ReminderAction.MODIFY:
@@ -2193,6 +2444,21 @@ class SQLiteRepository(AssistantRepository):
                 expected_version=action.observed_version,
                 expected_status=action.observed_status,
             )
+            replacement_summary = (
+                action.replacement_summary
+                if action.replacement_summary is not None
+                else action.reminder_summary
+            )
+            replacement_recurrence_rule = (
+                action.replacement_recurrence_rule
+                if action.replacement_recurrence_rule is not None
+                else action.recurrence_rule
+            )
+            replacement_recurrence_timezone = (
+                action.replacement_recurrence_timezone
+                if action.replacement_recurrence_timezone is not None
+                else action.recurrence_timezone or action.user_timezone
+            )
             new_reminder_id = self.add_reminder(
                 cursor,
                 user_id=user_id,
@@ -2202,17 +2468,28 @@ class SQLiteRepository(AssistantRepository):
                 source_topic_id=original_source["source_topic_id"] or source_topic_id,
                 source_hop_id=original_source["source_hop_id"] or audit_hop_id,
                 reminder_time=replacement_time.isoformat(),
-                event_time=(action.event_time or replacement_time).isoformat(),
+                event_time=(
+                    action.event_time
+                    or (replacement_time if action.timing_plan_required else None)
+                ).isoformat()
+                if (
+                    action.event_time
+                    or (replacement_time if action.timing_plan_required else None)
+                )
+                else None,
                 raw_reminder=action.raw_reminder or "",
-                reminder_summary=action.replacement_summary or action.reminder_summary or "",
+                reminder_summary=replacement_summary or "",
                 subject=action.replacement_subject or action.subject or "",
+                supporting_question=action.supporting_question,
+                supporting_response=action.supporting_response,
                 user_timezone=action.user_timezone or "UTC",
                 original_time_text=action.original_time_text,
-                recurrence_rule=action.replacement_recurrence_rule or action.recurrence_rule,
-                recurrence_timezone=action.replacement_recurrence_timezone or action.recurrence_timezone or action.user_timezone,
-                next_fire_time=action.next_fire_time.isoformat() if action.next_fire_time else (replacement_time.isoformat() if (action.replacement_recurrence_rule or action.recurrence_rule) else None),
+                recurrence_rule=replacement_recurrence_rule,
+                recurrence_timezone=replacement_recurrence_timezone,
+                next_fire_time=action.next_fire_time.isoformat() if action.next_fire_time else (replacement_time.isoformat() if replacement_recurrence_rule else None),
                 parent_recurring_reminder_id=reminder_id,
             )
+            preserve_explicit_notification_time(new_reminder_id)
             return RepositoryActionResult(
                 action_id=new_id(),
                 action_type=action_type.value,
@@ -2221,7 +2498,12 @@ class SQLiteRepository(AssistantRepository):
                 domain_entity_id=new_reminder_id,
                 indexing_outbox_ids=(),
                 user_safe_summary=(
-                    f"Modified reminder '{action.replacement_subject or action.subject}'. Timing will be recalculated by autoscan."
+                    f"Modified reminder '{action.replacement_subject or action.subject}'. "
+                    + (
+                        "Timing will be recalculated by autoscan."
+                        if action.timing_plan_required
+                        else "The validated notification time was preserved."
+                    )
                 ),
             )
         else:

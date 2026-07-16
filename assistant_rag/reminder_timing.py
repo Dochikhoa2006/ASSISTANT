@@ -37,7 +37,7 @@ class ReminderTimingPlanner:
         *,
         event_time: datetime,
         subject: str,
-        raw_query: str,
+        reminder_context: str,
         user_timezone: str,
         now: datetime | None = None,
     ) -> ReminderTimingDecision:
@@ -78,7 +78,9 @@ class ReminderTimingPlanner:
                 ),
                 user_prompt=json.dumps(
                     inject_chat_history({
-                        "user_query": raw_query,
+                        # This is structured reminder content produced by the
+                        # rewritten-query pipeline, never the original request.
+                        "reminder_context": reminder_context,
                         "subject": subject,
                         "event_time_utc": event_time.isoformat(),
                         "user_timezone": user_timezone,

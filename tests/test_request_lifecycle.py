@@ -26,6 +26,8 @@ from assistant_rag.request_lifecycle import (
 def _response(
     text: str = "Request completed.",
     response_type: ResponseType = ResponseType.KNOWLEDGE_ACTION,
+    *,
+    committed_action: str | None = "delete",
 ) -> BundledResponse:
     return BundledResponse(
         final_chat_text=text,
@@ -35,7 +37,9 @@ def _response(
             last_response=text,
             response_type=response_type,
         ),
-        actions_committed=[{"action_type": "delete"}],
+        actions_committed=(
+            [{"action_type": committed_action}] if committed_action else []
+        ),
     )
 
 
@@ -310,7 +314,13 @@ def test_reminder_confirmation_hydrates_reminder_branch_metadata(
     )
     token = str(confirmation["confirmation_token"])
     pipeline = RecordingPipeline(
-        [_response("Turned off the reminder.", ResponseType.REMINDER_ACTION)]
+        [
+            _response(
+                "Turned off the reminder.",
+                ResponseType.REMINDER_ACTION,
+                committed_action="turn_off",
+            )
+        ]
     )
     executor = ChatRequestLifecycleExecutor(
         pipeline=pipeline,  # type: ignore[arg-type]
@@ -445,6 +455,82 @@ def test_error_response_does_not_consume_pending_confirmation(
     assert retried.response is not None
     assert _confirmation_status(repository, token) == "confirmed"
     assert _mutation_status(repository, f"error:{token}") == "completed"
+
+
+@pytest.mark.parametrize(
+    "response_type",
+    (ResponseType.CLARIFICATION, ResponseType.KNOWLEDGE_ACTION),
+)
+def test_uncommitted_confirmation_response_keeps_token_pending_and_retryable(
+    repository: SQLiteRepository,
+    response_type: ResponseType,
+) -> None:
+    token = _pending_confirmation(repository)
+    pipeline = RecordingPipeline(
+        [
+            _response(
+                "No mutation committed.",
+                response_type,
+                committed_action=None,
+            ),
+            _response("Deleted after a safe retry."),
+        ]
+    )
+    executor = ChatRequestLifecycleExecutor(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        repository=repository,
+    )
+
+    first = executor.execute(
+        ChatRequest(
+            user_id="user-1",
+            raw_query="Confirm the pending action.",
+            confirmation_token=token,
+            idempotency_key=f"uncommitted:{response_type.value}:{token}",
+        ),
+        fallback_request_id="uncommitted",
+    )
+
+    assert first.response is not None
+    assert _confirmation_status(repository, token) == "pending"
+
+    retried = executor.execute(
+        ChatRequest(
+            user_id="user-1",
+            raw_query="Confirm the pending action.",
+            confirmation_token=token,
+            idempotency_key=f"committed:{response_type.value}:{token}",
+        ),
+        fallback_request_id="committed",
+    )
+
+    assert retried.response is not None
+    assert _confirmation_status(repository, token) == "confirmed"
+
+
+def test_mismatched_committed_action_does_not_consume_confirmation(
+    repository: SQLiteRepository,
+) -> None:
+    token = _pending_confirmation(repository)
+    executor = ChatRequestLifecycleExecutor(
+        pipeline=RecordingPipeline(
+            [_response("A different action committed.", committed_action="modify")]
+        ),  # type: ignore[arg-type]
+        repository=repository,
+    )
+
+    result = executor.execute(
+        ChatRequest(
+            user_id="user-1",
+            raw_query="Confirm the pending action.",
+            confirmation_token=token,
+            idempotency_key=f"mismatched:{token}",
+        ),
+        fallback_request_id="mismatched",
+    )
+
+    assert result.response is not None
+    assert _confirmation_status(repository, token) == "pending"
 
 
 def test_expired_confirmation_fails_closed_and_marks_request_failed(

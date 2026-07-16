@@ -19,10 +19,11 @@ from assistant_rag.platform import GmailSender, PlatformSelector
 
 
 _RECIPIENTS = ["alice@example.com", "bob@example.com"]
+_RAW_QUERY_SENTINEL = "RAW_SENTINEL audit-only ingress text."
 
 
 class IncompletePlatformLLM:
-    """Omit Bob and invent Mallory so raw-query authority is exercised."""
+    """Omit Bob and invent Mallory so rewritten-query authority is exercised."""
 
     def __init__(self, mode: str = "send") -> None:
         self.mode = mode
@@ -58,13 +59,17 @@ class RecordingSender:
         return {"status": "draft_saved", "provider": "gmail"}
 
 
-def _bundled(artifact: dict[str, Any] | None) -> BundledResponse:
+def _bundled(
+    artifact: dict[str, Any] | None,
+    *,
+    rewritten_query: str = "Create and deliver the artifact.",
+) -> BundledResponse:
     text = "Subject: Generated Microsoft artifact\n\nThe generated artifact is ready."
     return BundledResponse(
         final_chat_text=text,
         response_type=ResponseType.NORMAL,
         last_qa_state=LastQAState(
-            last_user_query="Create and deliver the artifact.",
+            last_user_query=rewritten_query,
             last_response=text,
             response_type=ResponseType.NORMAL,
         ),
@@ -103,8 +108,8 @@ def test_microsoft_artifact_email_phrases_route_to_gmail_deterministically(
     query: str,
 ) -> None:
     result = PlatformSelector(llm=None).select(
-        _bundled(None),
-        ChatRequest(user_id="user-1", raw_query=query),
+        _bundled(None, rewritten_query=query),
+        ChatRequest(user_id="user-1", raw_query=_RAW_QUERY_SENTINEL),
     )
 
     assert result["platform_selection"] == {
@@ -116,11 +121,12 @@ def test_microsoft_artifact_email_phrases_route_to_gmail_deterministically(
 
 
 def test_email_address_question_does_not_route_to_gmail() -> None:
+    rewritten_query = "Is alice@example.com an email address?"
     result = PlatformSelector(llm=None).select(
-        _bundled(None),
+        _bundled(None, rewritten_query=rewritten_query),
         ChatRequest(
             user_id="user-1",
-            raw_query="Is alice@example.com an email address?",
+            raw_query="RAW_SENTINEL Send an email to raw-only@example.com now.",
         ),
     )
 
@@ -140,8 +146,11 @@ def test_negative_email_delivery_language_never_authorizes_send(query: str) -> N
         llm=IncompletePlatformLLM("send"),
         senders={"gmail": sender},
     ).select(
-        _bundled(None),
-        ChatRequest(user_id="user-1", raw_query=query),
+        _bundled(None, rewritten_query=query),
+        ChatRequest(
+            user_id="user-1",
+            raw_query="RAW_SENTINEL Send an email to raw-only@example.com now.",
+        ),
     )
 
     assert result["platform_selection"]["channel"] == "gmail"
@@ -192,6 +201,37 @@ def test_error_response_keeps_ui_artifact_but_blocks_external_delivery(
     assert sender.draft_calls == []
 
 
+def test_platform_delivery_authorization_uses_only_rewritten_query() -> None:
+    selector = PlatformSelector(llm=None)
+
+    authorized = selector.select(
+        _bundled(
+            None,
+            rewritten_query=(
+                "REWRITTEN_SENTINEL Email it to alice@example.com and bob@example.com."
+            ),
+        ),
+        ChatRequest(user_id="user-1", raw_query=_RAW_QUERY_SENTINEL),
+    )
+    blocked = selector.select(
+        _bundled(
+            None,
+            rewritten_query="REWRITTEN_SENTINEL Explain the completed artifact.",
+        ),
+        ChatRequest(
+            user_id="user-1",
+            raw_query=(
+                "RAW_SENTINEL Send the artifact to alice@example.com and bob@example.com."
+            ),
+        ),
+    )
+
+    assert authorized["platform_selection"]["channel"] == "gmail"
+    assert authorized["draft"]["recipients"] == _RECIPIENTS
+    assert blocked["platform_selection"]["channel"] == "none"
+    assert blocked["delivery"] == {"channel": "none", "status": "not_requested"}
+
+
 @pytest.mark.parametrize(
     ("file_phrase", "suffix", "mime_type"),
     (
@@ -217,17 +257,18 @@ def test_local_gmail_draft_automatically_includes_every_microsoft_artifact(
     del mime_type
     artifact = _artifact(tmp_path, suffix=suffix, payload=f"bytes-{suffix}".encode())
     sender = RecordingSender()
+    rewritten_query = (
+        f"Create a {file_phrase} and draft an email to "
+        "alice@example.com; bob@example.com; and ALICE@example.com."
+    )
     result = PlatformSelector(
         llm=IncompletePlatformLLM("draft"),
         senders={"gmail": sender},
     ).select(
-        _bundled(artifact),
+        _bundled(artifact, rewritten_query=rewritten_query),
         ChatRequest(
             user_id="user-1",
-            raw_query=(
-                f"Create a {file_phrase} and draft an email to "
-                "alice@example.com; bob@example.com; and ALICE@example.com."
-            ),
+            raw_query=_RAW_QUERY_SENTINEL,
         ),
     )
 
@@ -355,14 +396,14 @@ def test_multi_recipient_gmail_wire_payload_contains_generated_artifact(
         )
 
     result = PlatformSelector(
-        # The query, not an under-authorizing model extraction, owns send mode.
+        # The rewritten query, not an under-authorizing model extraction, owns send mode.
         llm=IncompletePlatformLLM("draft"),
         senders={"gmail": GmailSender()},
     ).select(
-        _bundled(artifact),
+        _bundled(artifact, rewritten_query=query),
         ChatRequest(
             user_id="user-1",
-            raw_query=query,
+            raw_query=_RAW_QUERY_SENTINEL,
             platform_context=credentials,
         ),
     )
@@ -412,10 +453,10 @@ def test_unavailable_declared_artifact_blocks_gmail_before_dispatch(
         llm=IncompletePlatformLLM("send"),
         senders={"gmail": sender},
     ).select(
-        _bundled(artifact),
+        _bundled(artifact, rewritten_query=query),
         ChatRequest(
             user_id="user-1",
-            raw_query=query,
+            raw_query=_RAW_QUERY_SENTINEL,
             platform_context={
                 "gmail_username": "sender@example.com",
                 "gmail_app_password": "app-password",

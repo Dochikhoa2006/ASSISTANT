@@ -3,19 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 import json
 from math import isfinite
 from typing import Any
 import unicodedata
 
-from .action_detection import (
-    ActionDetectionResult,
-    DeterministicActionDetector,
-    classify_action_request,
-    request_has_explicit_mutation,
-)
+from .action_detection import ActionDetectionResult
 from .canonical_retrieval import retrieve_knowledge
-from .chat_history import current_chat_history
+from .chat_history import current_chat_history, supporting_question_context
 from .config import AssistantConfig
 from .contracts import (
     ActionValidationResult,
@@ -38,8 +34,88 @@ from .retrieval import HybridRetriever
 from .retrieval_validation import KnowledgeRetrievalValidationStrategy
 
 
+_KNOWLEDGE_MUTATION_CONTROL_METADATA_KEYS = frozenset(
+    {
+        "intent",
+        "knowledge_actions",
+        "knowledge_action_extraction_response",
+        "validated_knowledge_actions",
+        "action_authorization",
+        "confirmation_approved",
+    }
+)
+
+
+def _knowledge_prompt_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Keep metadata as context without letting it compete for action authority."""
+
+    return {
+        key: value
+        for key, value in metadata.items()
+        if key not in _KNOWLEDGE_MUTATION_CONTROL_METADATA_KEYS
+    }
+
+
+@dataclass(frozen=True)
+class _KnowledgeActionExtraction:
+    """One schema-complete first-stage knowledge extraction."""
+
+    action: str
+    text_content: str
+    original_text: str
+    replacement_text: str
+    confidence: float
+    missing_fields: tuple[str, ...]
+    reason_summary: str
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> _KnowledgeActionExtraction | None:
+        expected_fields = {
+            "action",
+            "text_content",
+            "original_text",
+            "replacement_text",
+            "confidence",
+            "missing_fields",
+            "reason_summary",
+        }
+        if not isinstance(payload, dict) or set(payload) != expected_fields:
+            return None
+        if not all(
+            isinstance(payload[field], str)
+            for field in (
+                "action",
+                "text_content",
+                "original_text",
+                "replacement_text",
+                "reason_summary",
+            )
+        ):
+            return None
+        raw_confidence = payload["confidence"]
+        if isinstance(raw_confidence, bool) or not isinstance(
+            raw_confidence,
+            (int, float),
+        ):
+            return None
+        raw_missing_fields = payload["missing_fields"]
+        if not isinstance(raw_missing_fields, list) or not all(
+            isinstance(value, str) for value in raw_missing_fields
+        ):
+            return None
+        return cls(
+            action=payload["action"].casefold(),
+            text_content=payload["text_content"].strip(),
+            original_text=payload["original_text"].strip(),
+            replacement_text=payload["replacement_text"].strip(),
+            confidence=float(raw_confidence),
+            missing_fields=tuple(raw_missing_fields),
+            reason_summary=payload["reason_summary"].strip(),
+        )
+
+
 class LLMKnowledgeActionDetector:
-    """Extract one knowledge action while retaining deterministic authorization."""
+    """Extract exactly one knowledge action from an intent-selected request."""
 
     def __init__(
         self,
@@ -53,7 +129,6 @@ class LLMKnowledgeActionDetector:
         self.llm = llm
         self.prompts = prompts
         self.min_confidence = min_confidence
-        self._confirmation_detector = DeterministicActionDetector()
 
     def detect(
         self,
@@ -61,19 +136,15 @@ class LLMKnowledgeActionDetector:
         rewritten_query: str,
         intent: Intent,
     ) -> ActionDetectionResult:
-        if intent is not Intent.KNOWLEDGE_FACTS:
-            return ActionDetectionResult(intent=intent, confidence=0.0)
-
-        # Confirmation replay is bound to a previously validated immutable
-        # action. Re-extracting from a message such as "confirm" would discard
-        # the stored target and violate exactly-once confirmation semantics.
-        if (
+        confirmation_replay = bool(
             request.confirmation_token
             and request.metadata.get("confirmation_approved")
-            and request.metadata.get("validated_knowledge_actions")
-        ):
-            return self._confirmation_detector.detect(request, rewritten_query, intent)
-
+        )
+        validated_confirmation_actions = list(
+            request.metadata.get("validated_knowledge_actions") or []
+        )
+        extraction_metadata = _knowledge_prompt_metadata(request.metadata)
+        chat_history = current_chat_history()
         try:
             payload = self.llm.generate_json(
                 task=LLMTask.KNOWLEDGE_ACTION_EXTRACTION,
@@ -82,14 +153,56 @@ class LLMKnowledgeActionDetector:
                     PromptContext(
                         stage="knowledge_action_extraction",
                         user_id=request.user_id,
-                        raw_query=request.raw_query,
                         rewritten_query=rewritten_query,
                         intent=intent.value,
-                        metadata=request.metadata,
+                        metadata=extraction_metadata,
                         platform_context=request.platform_context,
+                        chat_history=chat_history,
                         extra={
                             "allowed_actions": ["add", "delete", "modify"],
                             "cardinality": "exactly_one",
+                            "action_content_contract": {
+                                "add": {
+                                    "required_non_empty": ["text_content"],
+                                    "required_empty": [
+                                        "original_text",
+                                        "replacement_text",
+                                    ],
+                                },
+                                "delete": {
+                                    "required_non_empty": ["text_content"],
+                                    "required_empty": [
+                                        "original_text",
+                                        "replacement_text",
+                                    ],
+                                },
+                                "modify": {
+                                    "required_non_empty": [
+                                        "original_text",
+                                        "replacement_text",
+                                    ],
+                                    "required_empty": ["text_content"],
+                                },
+                            },
+                            "context_policy": {
+                                "current_turn_defines_action": True,
+                                "history_resolves_existing_fact_references": True,
+                                "history_cannot_invent_add_or_replacement_content": True,
+                                "platform_context_is_supporting_context_only": True,
+                                "non_action_metadata_is_supporting_context_only": True,
+                            },
+                            "supporting_question_context": supporting_question_context(
+                                chat_history
+                            ),
+                            "confirmation_replay": confirmation_replay,
+                            # This is prompt context only. Trust and consistency
+                            # are evaluated after the extraction call so no
+                            # semantic guard can precede the first model stage.
+                            "trusted_confirmation_action_context": (
+                                validated_confirmation_actions
+                                if confirmation_replay
+                                else []
+                            ),
                         },
                     )
                 ),
@@ -99,21 +212,36 @@ class LLMKnowledgeActionDetector:
             return self._failed(
                 intent,
                 "knowledge_action_extraction_failed",
-                ["action_keyword"],
+                ["action"],
             )
 
-        try:
-            action_name = str(payload["action"]).casefold()
-            text_content = str(payload["text_content"]).strip()
-            original_text = str(payload["original_text"]).strip()
-            replacement_text = str(payload["replacement_text"]).strip()
-            confidence = float(payload["confidence"])
-            missing_fields = [str(value) for value in payload["missing_fields"]]
-        except (KeyError, TypeError, ValueError):
+        extraction = _KnowledgeActionExtraction.from_payload(payload)
+        if extraction is None:
             return self._failed(
                 intent,
                 "invalid_knowledge_action_extraction",
-                ["action_keyword"],
+                ["action"],
+            )
+        action_name = extraction.action
+        text_content = extraction.text_content
+        original_text = extraction.original_text
+        replacement_text = extraction.replacement_text
+        confidence = extraction.confidence
+        missing_fields = list(extraction.missing_fields)
+
+        if intent is not Intent.KNOWLEDGE_FACTS:
+            return self._failed(
+                intent,
+                "knowledge_extraction_called_for_non_knowledge_intent",
+                ["knowledge_intent"],
+            )
+
+        trusted_confirmation_action = self._trusted_confirmation_action(request)
+        if confirmation_replay and trusted_confirmation_action is None:
+            return self._failed(
+                intent,
+                "invalid_knowledge_confirmation_context",
+                ["confirmed_action"],
             )
 
         normalized_missing = self._normalize_missing_fields(
@@ -131,7 +259,7 @@ class LLMKnowledgeActionDetector:
             return ActionDetectionResult(
                 intent=intent,
                 confidence=0.0,
-                missing_fields=normalized_missing or ["action_keyword"],
+                missing_fields=normalized_missing or ["action"],
                 risk_flags=["low_confidence_or_incomplete_knowledge_extraction"],
             )
 
@@ -169,12 +297,24 @@ class LLMKnowledgeActionDetector:
                 "confidence": confidence,
             }
 
-        current_turn_sources = [
-            request.raw_query,
-            rewritten_query,
-        ]
+        current_turn_sources = [rewritten_query]
+        trusted_confirmation_source = (
+            json.dumps(
+                trusted_confirmation_action,
+                default=str,
+                ensure_ascii=False,
+            )
+            if trusted_confirmation_action
+            else ""
+        )
+        if trusted_confirmation_source:
+            # A verified confirmation message normally contains only "confirm".
+            # Its immutable action content was already validated and hydrated by
+            # the request lifecycle, so it is the only additional grounding
+            # source permitted for this replay extraction.
+            current_turn_sources.append(trusted_confirmation_source)
         history_source = json.dumps(
-            current_chat_history(),
+            chat_history,
             default=str,
             ensure_ascii=False,
         )
@@ -214,17 +354,17 @@ class LLMKnowledgeActionDetector:
                 ungrounded_fields,
             )
 
-        # The model extracts semantics but never authorizes a mutation. The raw
-        # current query must independently contain exactly the same one action.
-        raw_decision = classify_action_request(request.raw_query, intent)
-        if (
-            not request_has_explicit_mutation(request, intent)
-            or raw_decision.selected_action != action_name
+        if trusted_confirmation_action and not self._matches_confirmation_action(
+            action_name=action_name,
+            text_content=text_content,
+            original_text=original_text,
+            replacement_text=replacement_text,
+            trusted_action=trusted_confirmation_action,
         ):
             return self._failed(
                 intent,
-                "llm_action_not_authorized_by_raw_query",
-                ["action_keyword"],
+                "knowledge_confirmation_extraction_mismatch",
+                ["confirmed_action"],
             )
 
         trusted_topic_title = request.metadata.get("topic_title")
@@ -236,13 +376,90 @@ class LLMKnowledgeActionDetector:
             confidence=confidence,
             metadata={
                 "knowledge_actions": [action_payload],
+                "knowledge_action_extraction_response": {
+                    "action": action_name,
+                    "text_content": text_content,
+                    "original_text": original_text,
+                    "replacement_text": replacement_text,
+                    "confidence": confidence,
+                    "missing_fields": list(extraction.missing_fields),
+                    "reason_summary": extraction.reason_summary,
+                },
                 "action_authorization": {
                     "intent": intent.value,
                     "action": action_name,
-                    "matched_keywords": list(raw_decision.matched_keywords),
-                    "reason_summary": raw_decision.reason_summary,
+                    "reason_summary": "selected_by_knowledge_action_extraction_llm",
+                    "source": "knowledge_action_extraction_llm",
                 },
             },
+        )
+
+    @staticmethod
+    def _trusted_confirmation_action(request: ChatRequest) -> dict[str, Any] | None:
+        if not (
+            request.confirmation_token
+            and request.metadata.get("confirmation_approved")
+        ):
+            return None
+        actions = list(request.metadata.get("validated_knowledge_actions") or [])
+        if len(actions) != 1 or not isinstance(actions[0], dict):
+            return None
+        action = dict(actions[0])
+        action_name = str(action.get("action") or "").casefold()
+        authorization = request.metadata.get("action_authorization") or {}
+        if (
+            action_name not in {"add", "delete", "modify"}
+            or authorization.get("intent") != Intent.KNOWLEDGE_FACTS.value
+            or str(authorization.get("action") or "").casefold() != action_name
+        ):
+            return None
+        return action
+
+    @classmethod
+    def _matches_confirmation_action(
+        cls,
+        *,
+        action_name: str,
+        text_content: str,
+        original_text: str,
+        replacement_text: str,
+        trusted_action: dict[str, Any],
+    ) -> bool:
+        trusted_name = str(trusted_action.get("action") or "").casefold()
+        if action_name != trusted_name:
+            return False
+
+        if action_name == "add":
+            expected_text = str(
+                trusted_action.get("knowledge_text")
+                or trusted_action.get("new_text")
+                or ""
+            )
+            extracted_values = (text_content, original_text, replacement_text)
+            expected_values = (expected_text, "", "")
+        elif action_name == "delete":
+            expected_target = str(trusted_action.get("target_description") or "")
+            extracted_values = (text_content, original_text, replacement_text)
+            expected_values = (expected_target, "", "")
+        else:
+            expected_target = str(trusted_action.get("target_description") or "")
+            expected_replacement = str(
+                trusted_action.get("replacement_text")
+                or trusted_action.get("new_text")
+                or ""
+            )
+            return (
+                not text_content
+                and cls._grounding_text(original_text)
+                == cls._grounding_text(expected_target)
+                and bool(cls._grounding_text(replacement_text))
+                and cls._grounding_text(replacement_text)
+                in cls._grounding_text(expected_replacement)
+            )
+
+        return all(
+            cls._grounding_text(extracted) == cls._grounding_text(expected)
+            for extracted, expected in zip(extracted_values, expected_values)
         )
 
     @staticmethod
@@ -334,9 +551,41 @@ class KnowledgeContentFinalizationStrategy:
         selected_candidates: list[KnowledgeValidationCandidate],
         validation_result: Any,
     ) -> KnowledgeFinalizationResult | None:
-        selected_keys = {
-            candidate.candidate_key for candidate in selected_candidates
-        }
+        # LLM3 has exactly one responsibility: rewrite one validated existing
+        # chunk for MODIFY. ADD and DELETE are structurally unable to call it.
+        if action is not KnowledgeAction.MODIFY or len(selected_candidates) != 1:
+            return None
+        selected_candidate = selected_candidates[0]
+        if (
+            validation_result.validation_result is not ActionValidationResult.EXECUTE
+            or tuple(validation_result.selected_candidate_keys)
+            != (selected_candidate.candidate_key,)
+            or sum(
+                candidate.candidate_key == selected_candidate.candidate_key
+                for candidate in all_candidates
+            )
+            != 1
+        ):
+            return None
+        assessment = next(
+            (
+                item
+                for item in validation_result.candidate_assessments
+                if item.candidate_key == selected_candidate.candidate_key
+            ),
+            None,
+        )
+        matched_text = str(getattr(assessment, "matched_text", "") or "")
+        replacement = str(action_payload.get("replacement_text") or "").strip()
+        candidate_text = selected_candidate.text
+        if (
+            assessment is None
+            or not matched_text
+            or not replacement
+            or candidate_text.count(matched_text) != 1
+        ):
+            return None
+
         try:
             payload = self.llm.generate_json(
                 task=LLMTask.KNOWLEDGE_CONTENT_FINALIZATION,
@@ -345,39 +594,48 @@ class KnowledgeContentFinalizationStrategy:
                     PromptContext(
                         stage="knowledge_content_finalization",
                         user_id=context.request.user_id,
-                        raw_query=context.request.raw_query,
                         rewritten_query=context.rewritten_query,
                         intent=Intent.KNOWLEDGE_FACTS.value,
-                        metadata=context.request.metadata,
+                        metadata=_knowledge_prompt_metadata(
+                            context.request.metadata
+                        ),
                         platform_context=context.request.platform_context,
                         chat_history=context.chat_history,
                         extra={
-                            "operation": action.value,
+                            "operation": KnowledgeAction.MODIFY.value,
                             "extracted_action_content": {
-                                "text_content": (
-                                    action_payload.get("text")
-                                    if action is KnowledgeAction.ADD
-                                    else action_payload.get("target_description")
-                                    if action is KnowledgeAction.DELETE
-                                    else None
+                                "text_content": None,
+                                "original_text": action_payload.get(
+                                    "target_description"
                                 ),
-                                "original_text": (
-                                    action_payload.get("target_description")
-                                    if action is KnowledgeAction.MODIFY
-                                    else None
-                                ),
-                                "replacement_text": action_payload.get("replacement_text"),
+                                "replacement_text": replacement,
                             },
                             "validated_candidate_context": [
                                 {
-                                    "candidate_key": candidate.candidate_key,
-                                    "text": candidate.text,
-                                    "source_title": candidate.source_title,
-                                    "selected": candidate.candidate_key in selected_keys,
+                                    "candidate_key": selected_candidate.candidate_key,
+                                    "text": selected_candidate.text,
+                                    "source_title": selected_candidate.source_title,
+                                    "selected": True,
+                                    "matched_text": matched_text,
                                 }
-                                for candidate in all_candidates
                             ],
-                            "validation_result": asdict(validation_result),
+                            "validation_result": {
+                                "operation": validation_result.operation,
+                                "decision": "PASS",
+                                "selected_candidate_keys": list(
+                                    validation_result.selected_candidate_keys
+                                ),
+                                "confidence": validation_result.confidence,
+                                "clarification_question": "",
+                                "reason_summary": validation_result.reason_summary,
+                                "candidate_assessments": [
+                                    asdict(item)
+                                    for item in validation_result.candidate_assessments
+                                ],
+                            },
+                            "supporting_question_context": supporting_question_context(
+                                context.chat_history
+                            ),
                         },
                     )
                 ),
@@ -397,50 +655,13 @@ class KnowledgeContentFinalizationStrategy:
         ):
             return None
 
-        if action is KnowledgeAction.DELETE:
-            if len(selected_candidates) != 1:
-                return None
-            # Delete does not index new content. Requiring an exact copy here
-            # makes the third model an integrity check without changing the
-            # repository's established soft-delete/outbox behavior.
-            if final_content != selected_candidates[0].text.strip():
-                return None
-        elif action is KnowledgeAction.ADD:
-            proposed = str(action_payload.get("text") or "").strip()
-            if self._compact(proposed) != self._compact(final_content):
-                return None
-        elif action is KnowledgeAction.MODIFY:
-            if len(selected_candidates) != 1:
-                return None
-            selected_key = selected_candidates[0].candidate_key
-            assessment = next(
-                (
-                    item
-                    for item in validation_result.candidate_assessments
-                    if item.candidate_key == selected_key
-                ),
-                None,
-            )
-            matched_text = str(
-                getattr(assessment, "matched_text", "") or ""
-            )
-            replacement = str(
-                action_payload.get("replacement_text") or ""
-            ).strip()
-            candidate_text = selected_candidates[0].text
-            if (
-                not matched_text
-                or not replacement
-                or candidate_text.count(matched_text) != 1
-            ):
-                return None
-            expected_content = candidate_text.replace(
-                matched_text,
-                replacement,
-                1,
-            )
-            if self._compact(final_content) != self._compact(expected_content):
-                return None
+        expected_content = candidate_text.replace(
+            matched_text,
+            replacement,
+            1,
+        )
+        if self._compact(final_content) != self._compact(expected_content):
+            return None
 
         return KnowledgeFinalizationResult(
             final_content=final_content,
@@ -518,16 +739,13 @@ class KnowledgeMutationPipeline:
                 enforce_min_score=False,
             )
         except Exception:
-            return self._clarification_action(
+            return self._technical_failure_action(
                 action,
                 action_payload,
                 "Knowledge mutation retrieval failed safely.",
             )
 
         try:
-            results = results[
-                : self.config.retrieval_validation.knowledge_llm_validation_max_candidates
-            ]
             chunk_ids = [result.entity_id for result in results]
             sql_chunks = repository.get_knowledge_chunks_by_ids(
                 context.request.user_id,
@@ -546,8 +764,8 @@ class KnowledgeMutationPipeline:
                         chunk_map[result.entity_id].get("knowledge_topic_id") or ""
                     ),
                     text=str(
-                        chunk_map[result.entity_id].get("normalized_text")
-                        or chunk_map[result.entity_id].get("raw_text")
+                        chunk_map[result.entity_id].get("raw_text")
+                        or chunk_map[result.entity_id].get("normalized_text")
                         or ""
                     ),
                     source_title=result.payload.get("source_title"),
@@ -561,33 +779,56 @@ class KnowledgeMutationPipeline:
                 for result in active_results
             ]
         except Exception:
-            return self._clarification_action(
+            return self._technical_failure_action(
                 action,
                 action_payload,
                 "Knowledge candidate hydration failed safely.",
             )
         candidate_map = {candidate.candidate_key: candidate for candidate in candidates}
+        first_model_response = context.request.metadata.get(
+            "knowledge_action_extraction_response"
+        )
 
         validation = self.validator.validate(
             operation=action.value,
-            user_query=context.request.raw_query,
-            rewritten_query=context.rewritten_query,
-            target_description=retrieval_query,
-            proposed_content=proposed_content or None,
-            replacement_content=replacement_content or None,
+            # The validator's retained compatibility parameters are
+            # intentionally blank. LLM2 receives only first_model_response and
+            # knowledge_retrieval in its isolated prompt.
+            user_query="",
+            rewritten_query="",
+            target_description="",
             candidates=candidates,
-            chat_history=context.chat_history,
+            first_model_response=(
+                dict(first_model_response)
+                if isinstance(first_model_response, dict)
+                else None
+            ),
         )
         if validation is None:
-            return self._clarification_action(
+            return self._technical_failure_action(
                 action,
                 action_payload,
                 "Knowledge validation model did not return a safe decision.",
             )
+        if validation.hitl_reason == "internal_validation_failure":
+            return self._technical_failure_action(
+                action,
+                action_payload,
+                "Knowledge validation model failed safely.",
+            )
         if validation.validation_result is not ActionValidationResult.EXECUTE:
+            if (
+                validation.hitl_reason != "knowledge_validation_fail"
+                or not (validation.clarification_question or "").strip()
+            ):
+                return self._technical_failure_action(
+                    action,
+                    action_payload,
+                    "Knowledge validation returned an unusable FAIL decision.",
+                )
             return ValidatedKnowledgeAction(
                 action=action,
-                validation_result=validation.validation_result,
+                validation_result=ActionValidationResult.CLARIFY_MISSING_FIELDS,
                 target_chunk_ids=(),
                 knowledge_text=proposed_content or None,
                 replacement_text=replacement_content or None,
@@ -598,8 +839,9 @@ class KnowledgeMutationPipeline:
                 confidence=validation.confidence,
                 reason_summary=validation.reason_summary,
                 requires_hitl=validation.requires_hitl,
-                factuality_concern=validation.factuality_concern,
-                hitl_reason=validation.hitl_reason,
+                factuality_concern=False,
+                hitl_reason="knowledge_validation_fail",
+                clarification_question=validation.clarification_question,
             )
 
         selected_candidates = [
@@ -609,32 +851,95 @@ class KnowledgeMutationPipeline:
         ]
         if action is KnowledgeAction.ADD:
             if selected_candidates:
-                return self._clarification_action(
+                return self._technical_failure_action(
                     action,
                     action_payload,
                     "Add validation unexpectedly selected an existing target.",
                 )
         elif len(selected_candidates) != 1:
-            return self._clarification_action(
+            return self._technical_failure_action(
                 action,
                 action_payload,
                 "Destructive validation did not select exactly one SQL target.",
             )
 
-        finalized = self.finalizer.finalize(
-            context=context,
-            action=action,
-            action_payload=action_payload,
-            all_candidates=candidates,
-            selected_candidates=selected_candidates,
-            validation_result=validation,
-        )
-        if finalized is None:
-            return self._clarification_action(
-                action,
-                action_payload,
-                "Knowledge content finalization failed safely.",
+        # Confirmation gate: destructive MODIFY and DELETE actions require
+        # explicit user approval before LLM3 may rewrite content or before
+        # the SQL transaction executes. ADD is always pre-authorized by LLM2
+        # EXECUTE and must never be blocked here.
+        if action in {KnowledgeAction.MODIFY, KnowledgeAction.DELETE}:
+            if not (context.request.metadata.get("confirmation_approved")):
+                selected = selected_candidates[0]
+                target_id = selected.candidate_key
+                # Inline _expires_at because branches.py cannot be imported here.
+                _confirmation_expires_at = (
+                    datetime.now(timezone.utc)
+                    + timedelta(minutes=self.config.confirmation_expiry_minutes)
+                ).isoformat()
+                confirmation = repository.create_pending_confirmation(
+                    user_id=context.request.user_id,
+                    action_type="knowledge_mutation",
+                    target_entity_type="knowledge_chunk",
+                    target_entity_id=target_id,
+                    proposed_action={
+                        "domain": "knowledge",
+                        "action": action.value,
+                        "target_chunk_id": target_id,
+                        "target_description": target_description or None,
+                        "replacement_text": replacement_content or None,
+                        "action_authorization": {
+                            "intent": "knowledge_facts",
+                            "action": action.value,
+                            "source": "llm2_validated",
+                            "reason_summary": validation.reason_summary,
+                        },
+                        "validated_knowledge_actions": [
+                            {
+                                "action": action.value,
+                                "target_chunk_ids": [target_id],
+                                "target_description": target_description or None,
+                                "replacement_text": replacement_content or None,
+                                "confidence": float(validation.confidence),
+                                "reason_summary": validation.reason_summary,
+                            }
+                        ],
+                    },
+                    target_snapshot={
+                        "chunk_id": target_id,
+                        "text": selected.text,
+                        "version": chunk_map[target_id].get("version"),
+                    },
+                    expires_at=_confirmation_expires_at,
+                )
+                return ValidatedKnowledgeAction(
+                    action=action,
+                    validation_result=ActionValidationResult.CLARIFY_MISSING_FIELDS,
+                    target_chunk_ids=(target_id,),
+                    confidence=float(validation.confidence),
+                    reason_summary="Awaiting user confirmation before applying destructive mutation.",
+                    requires_hitl=True,
+                    factuality_concern=False,
+                    hitl_reason="knowledge_pending_confirmation",
+                    clarification_question=None,
+                    pending_confirmation_token=confirmation.get("confirmation_token"),
+                )
+
+        finalized: KnowledgeFinalizationResult | None = None
+        if action is KnowledgeAction.MODIFY:
+            finalized = self.finalizer.finalize(
+                context=context,
+                action=action,
+                action_payload=action_payload,
+                all_candidates=candidates,
+                selected_candidates=selected_candidates,
+                validation_result=validation,
             )
+            if finalized is None:
+                return self._technical_failure_action(
+                    action,
+                    action_payload,
+                    "Knowledge content finalization failed safely.",
+                )
 
         target_ids = tuple(candidate.candidate_key for candidate in selected_candidates)
         observed_versions = {
@@ -654,11 +959,32 @@ class KnowledgeMutationPipeline:
                 for field in assessment.matched_fields
             )
         )
-        final_text = finalized.final_content
+        final_text = (
+            proposed_content
+            if action is KnowledgeAction.ADD
+            else finalized.final_content
+            if finalized is not None
+            else None
+        )
+        confidence_values = [
+            float(action_payload.get("confidence", 1.0)),
+            validation.confidence,
+        ]
+        reason_parts = [validation.reason_summary]
+        if finalized is not None:
+            confidence_values.append(finalized.confidence)
+            reason_parts.append(finalized.reason_summary)
         return ValidatedKnowledgeAction(
             action=action,
             validation_result=ActionValidationResult.EXECUTE,
             target_chunk_ids=target_ids,
+            target_topic_ids=tuple(
+                dict.fromkeys(
+                    candidate.knowledge_topic_id
+                    for candidate in selected_candidates
+                    if candidate.knowledge_topic_id
+                )
+            ),
             observed_versions=observed_versions,
             observed_is_deleted=observed_is_deleted,
             knowledge_text=final_text if action is KnowledgeAction.ADD else None,
@@ -671,15 +997,9 @@ class KnowledgeMutationPipeline:
             target_status="active",
             topic_title=action_payload.get("topic_title"),
             target_description=target_description or None,
-            confidence=min(
-                float(action_payload.get("confidence", 1.0)),
-                validation.confidence,
-                finalized.confidence,
-            ),
+            confidence=min(confidence_values),
             matched_fields=matched_fields,
-            reason_summary=(
-                f"{validation.reason_summary} {finalized.reason_summary}"
-            ).strip(),
+            reason_summary=" ".join(reason_parts).strip(),
             requires_hitl=False,
             factuality_concern=False,
             hitl_reason=None,
@@ -703,4 +1023,24 @@ class KnowledgeMutationPipeline:
             requires_hitl=True,
             factuality_concern=False,
             hitl_reason=None,
+        )
+
+    @staticmethod
+    def _technical_failure_action(
+        action: KnowledgeAction,
+        action_payload: dict[str, Any],
+        reason: str,
+    ) -> ValidatedKnowledgeAction:
+        return ValidatedKnowledgeAction(
+            action=action,
+            validation_result=ActionValidationResult.REJECT_UNSAFE_TRANSITION,
+            knowledge_text=action_payload.get("text"),
+            replacement_text=action_payload.get("replacement_text"),
+            new_text=action_payload.get("text") or action_payload.get("replacement_text"),
+            target_description=action_payload.get("target_description"),
+            confidence=0.0,
+            reason_summary=reason,
+            requires_hitl=False,
+            factuality_concern=False,
+            hitl_reason="internal_pipeline_failure",
         )

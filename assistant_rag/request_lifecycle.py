@@ -14,10 +14,13 @@ from hashlib import sha256
 import json
 from typing import Any, Callable
 
-from .action_detection import classify_action_request, request_has_explicit_mutation
 from .contracts import BundledResponse, ChatRequest, Intent, ResponseType
 from .database import AssistantRepository
 from .pipeline import AssistantPipeline
+from .request_policy import (
+    has_destructive_mutation_policy_signal,
+    has_explicit_mutation_policy_signal,
+)
 
 
 class RequestLifecycleConflict(ValueError):
@@ -56,7 +59,7 @@ def looks_like_mutation(request: ChatRequest) -> bool:
     if metadata.get("reminder_reply_context"):
         return True
     return any(
-        request_has_explicit_mutation(request, intent)
+        has_explicit_mutation_policy_signal(request, intent)
         for intent in (Intent.KNOWLEDGE_FACTS, Intent.REMINDER)
     )
 
@@ -67,12 +70,8 @@ def looks_destructive(request: ChatRequest) -> bool:
     # stored action keyword, so it must remain destructive for request limits.
     if request.confirmation_token:
         return True
-    destructive_actions = {"delete", "modify", "turn_off"}
     return any(
-        request_has_explicit_mutation(request, intent)
-        and destructive_actions.intersection(
-            classify_action_request(request.raw_query, intent).matched_actions
-        )
+        has_destructive_mutation_policy_signal(request, intent)
         for intent in (Intent.KNOWLEDGE_FACTS, Intent.REMINDER)
     )
 
@@ -91,6 +90,32 @@ def bundled_response_payload(response: BundledResponse) -> dict[str, Any]:
         "persistence_instructions": dict(response.persistence_instructions),
         "platform_payload": dict(response.platform_payload),
     }
+
+
+def _confirmation_action_was_committed(
+    request: ChatRequest,
+    response: BundledResponse,
+) -> bool:
+    """Consume a confirmation only after its one validated action committed."""
+
+    expected_actions: list[dict[str, Any]] = []
+    for metadata_key in (
+        "validated_knowledge_actions",
+        "validated_reminder_actions",
+    ):
+        values = request.metadata.get(metadata_key) or []
+        if values:
+            if expected_actions:
+                return False
+            expected_actions = list(values)
+    committed_actions = list(response.actions_committed)
+    if len(expected_actions) != 1 or len(committed_actions) != 1:
+        return False
+    expected_action = str(expected_actions[0].get("action") or "").casefold()
+    committed_action = str(
+        committed_actions[0].get("action_type") or ""
+    ).casefold()
+    return bool(expected_action) and committed_action == expected_action
 
 
 class ChatRequestLifecycleExecutor:
@@ -184,7 +209,11 @@ class ChatRequestLifecycleExecutor:
                         request_id=idempotency_request_id,
                         stored_response_json=json.dumps(payload, default=str),
                     )
-            if confirmation_to_mark and response.response_type is not ResponseType.ERROR:
+            if (
+                confirmation_to_mark
+                and response.response_type is not ResponseType.ERROR
+                and _confirmation_action_was_committed(prepared_request, response)
+            ):
                 self.repository.mark_confirmation_confirmed(
                     user_id=prepared_request.user_id,
                     confirmation_token=confirmation_to_mark,

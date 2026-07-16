@@ -43,7 +43,8 @@ def _context(*, stale_question: GeneratedQuestion) -> PipelineContext:
         chat_history=[
             {
                 "role": "conversation_hop",
-                "raw_user_query": "Earlier current context",
+                "raw_user_query": "FORBIDDEN_RAW_HISTORY_QUERY",
+                "rewritten_user_query": "Earlier current context",
                 "raw_response": "Earlier response",
             }
         ],
@@ -116,9 +117,18 @@ def test_llm_clarification_prompt_uses_current_turn_and_excludes_stale_metadata(
     call = llm.calls[0]
     assert call["task"] is LLMTask.GENERATE_CLARIFICATION
     runtime = json.loads(call["user_prompt"].removeprefix("Runtime context:\n"))
-    assert runtime["raw_query"] == context.request.raw_query
+    assert "raw_query" not in runtime
     assert runtime["rewritten_query"] == context.rewritten_query
-    assert runtime["chat_history"] == context.chat_history
+    assert runtime["chat_history"] == [
+        {
+            "role": "conversation_hop",
+            "rewritten_user_query": "Earlier current context",
+            "raw_response": "Earlier response",
+        }
+    ]
     assert runtime["extra"]["task_type"] == "clarification"
     assert "current turn" in runtime["extra"]["generation_instruction"]
+    assert context.request.raw_query not in call["user_prompt"]
+    assert "FORBIDDEN_RAW_HISTORY_QUERY" not in call["user_prompt"]
+    assert "raw_user_query" not in call["user_prompt"]
     assert stale_text not in call["user_prompt"]

@@ -245,8 +245,8 @@ class GeneralPurposeConfig:
     content_composer_default_tool: str = "answer_generation"
     content_composer_fallback_tool: str = "answer_generation"
 
-    # Deterministic file-intent signals. A file tool requires at least one raw-query
-    # match from the verb list and exactly one matching file-type group.
+    # Deterministic file-intent signals. A file tool requires at least one
+    # rewritten-query match from the verb list and exactly one file-type group.
     file_creation_verb_keywords: tuple[str, ...] = FILE_CREATION_VERB_KEYWORDS
     document_tool_signal_keywords: tuple[str, ...] = DOCUMENT_FILE_KEYWORDS
     excel_tool_signal_keywords: tuple[str, ...] = EXCEL_FILE_KEYWORDS

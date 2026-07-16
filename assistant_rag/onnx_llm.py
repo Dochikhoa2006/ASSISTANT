@@ -45,10 +45,7 @@ def _adaptive_max_new_tokens(task: LLMTask, user_prompt: str, configured: int) -
         return configured
 
     context = _runtime_context_from_prompt(user_prompt)
-    query = " ".join(
-        str(context.get(key) or "")
-        for key in ("raw_query", "rewritten_query")
-    ).casefold()
+    query = str(context.get("rewritten_query") or "").casefold()
     extra = context.get("extra") if isinstance(context.get("extra"), dict) else {}
     has_approved_context = bool(
         extra.get("approved_conversation_history")

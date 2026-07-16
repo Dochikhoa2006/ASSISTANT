@@ -30,11 +30,16 @@ from .platform import PlatformSelector
 from .prompts import DEFAULT_PROMPT_REGISTRY
 from .retrieval import HybridRetriever
 from .reranking import SentenceTransformerCrossEncoderReranker
-from .action_detection import DeterministicActionDetector
 from .knowledge_mutation import (
     KnowledgeContentFinalizationStrategy,
     KnowledgeMutationPipeline,
     LLMKnowledgeActionDetector,
+)
+from .reminder_mutation import (
+    LLMReminderActionDetector,
+    ReminderActionValidationStrategy,
+    ReminderContentFinalizationStrategy,
+    ReminderMutationPipeline,
 )
 from .context_filter import HardRuleContextFilter, TwoLayerContextFilter
 from .generation import LLMClarificationStrategy, LLMHumanInTheLoopStrategy, LLMReminderSupportingStrategy, LLMGeneralHITLStrategy
@@ -227,6 +232,9 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
         json_retry_count_knowledge_action_validation=(
             settings.retrieval_validation.knowledge_llm_validation_json_retry_count
         ),
+        json_retry_count_reminder_action_validation=(
+            settings.retrieval_validation.reminder_llm_validation_json_retry_count
+        ),
     )
     model_router = OllamaModelRouter(llm_settings)
     ollama_llm = OllamaLLMClient(llm_settings, model_router)
@@ -252,8 +260,6 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
             assistant_config.retrieval.conversation_min_confidence_score
         ),
     )
-    reminder_action_detector = DeterministicActionDetector()
-    
     hard_rule_filter = HardRuleContextFilter(
         allowed_reminder_statuses=settings.prompt_policy.context_filter_allowed_reminder_statuses,
         reminder_approved_max_items=settings.context_filter.reminder_approved_max_items,
@@ -302,6 +308,29 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
         config=assistant_config,
         validator=knowledge_llm_validator,
         finalizer=knowledge_content_finalizer,
+    )
+    reminder_action_detector = LLMReminderActionDetector(
+        llm=llm,
+        prompts=prompt_registry,
+        min_confidence=settings.prompt_policy.action_min_confidence,
+        default_timezone=assistant_config.default_timezone,
+    )
+    reminder_action_validator = ReminderActionValidationStrategy(
+        config=assistant_config,
+        llm=llm,
+        prompts=prompt_registry,
+    )
+    reminder_content_finalizer = ReminderContentFinalizationStrategy(
+        llm=llm,
+        prompts=prompt_registry,
+        min_confidence=(
+            assistant_config.retrieval_validation.reminder_llm_validation_min_confidence
+        ),
+    )
+    reminder_mutation_pipeline = ReminderMutationPipeline(
+        config=assistant_config,
+        validator=reminder_action_validator,
+        finalizer=reminder_content_finalizer,
     )
     reminder_llm_validator = ReminderRetrievalValidationStrategy(
         config=assistant_config.retrieval_validation,
@@ -390,6 +419,7 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
                 retriever=retriever,
                 context_filter=context_filter,
                 llm=llm,
+                reminder_mutation_pipeline=reminder_mutation_pipeline,
             ),
         }
     )

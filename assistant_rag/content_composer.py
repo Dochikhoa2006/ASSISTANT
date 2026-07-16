@@ -25,11 +25,12 @@ _POWERPOINT_TOOL_NAME = "generate_pptx"
 _GENERIC_FILE_KEYWORDS = frozenset(
     {"file", "artifact", "attachment", "downloadable file", "editable file", "template"}
 )
+_CANONICAL_REWRITTEN_QUERY_KEY = "canonical_rewritten_query"
 
 
 @dataclass(frozen=True)
 class FileCreationDecision:
-    """Auditable result of the raw-query-only file-intent classifier."""
+    """Auditable result of the rewritten-query-only file-intent classifier."""
 
     selected_tool_name: str | None
     matched_verb_keywords: tuple[str, ...]
@@ -80,18 +81,18 @@ def _matches(text: str, keywords: tuple[str, ...]) -> tuple[tuple[str, int, int]
 
 
 def classify_file_creation_request(
-    raw_user_query: str,
+    rewritten_query: str,
     config: GeneralPurposeConfig,
 ) -> FileCreationDecision:
     """Select one file tool only when both required keyword classes are explicit.
 
-    The classifier never reads rewritten text or model output. Independently matched
+    The classifier reads only the canonical rewritten query. Independently matched
     file types fail closed. A longer cross-type phrase suppresses a keyword contained
     inside it so requests such as ``create an Excel file`` are not made ambiguous by
     the generic document keyword ``file``.
     """
 
-    text = _normalize_for_matching(raw_user_query)
+    text = _normalize_for_matching(rewritten_query)
     verb_matches = _matches(text, config.file_creation_verb_keywords)
     matched_verbs = tuple(dict.fromkeys(match[0] for match in verb_matches))
 
@@ -206,13 +207,13 @@ def _selected_file_keywords(
 
 
 def _derive_composition_scope(
-    raw_user_query: str,
+    rewritten_query: str,
     decision: FileCreationDecision,
     config: GeneralPurposeConfig,
 ) -> ContentCompositionScope:
     """Project a compound request into non-file prose and file-only scopes.
 
-    Routing still uses the complete raw query.  This projection happens only after
+    Routing uses the complete canonical rewritten query. This projection happens only after
     authorization and limits what the optional file planner receives.  The first
     file keyword anchors the file clause; common compound-request boundaries keep an
     email/message clause outside the attachment's content.
@@ -220,7 +221,7 @@ def _derive_composition_scope(
 
     if decision.selected_tool_name is None:
         return ContentCompositionScope(
-            answer_request_scope=raw_user_query.strip(),
+            answer_request_scope=rewritten_query.strip(),
             file_request_scope=None,
             answer_generation_responsibility=(
                 "No Microsoft file tool is assigned. Produce the complete user-facing "
@@ -238,13 +239,13 @@ def _derive_composition_scope(
         "not claim that a file was created."
     )
 
-    normalized = _normalize_for_matching(raw_user_query)
+    normalized = _normalize_for_matching(rewritten_query)
     file_matches = _matches(normalized, _selected_file_keywords(decision, config))
     if not file_matches:
         # Protected by the classifier, but fail closed to an answer-only scope if the
         # configured keyword policy changes between classification and projection.
         return ContentCompositionScope(
-            answer_request_scope=raw_user_query.strip(),
+            answer_request_scope=rewritten_query.strip(),
             file_request_scope=None,
             answer_generation_responsibility=answer_responsibility,
             file_tool_responsibility=None,
@@ -254,13 +255,13 @@ def _derive_composition_scope(
     first_file_end = min(
         end for _keyword, start, end in file_matches if start == first_file_start
     )
-    boundaries = tuple(_FILE_SCOPE_BOUNDARY_PATTERN.finditer(raw_user_query))
+    boundaries = tuple(_FILE_SCOPE_BOUNDARY_PATTERN.finditer(rewritten_query))
     prior_boundaries = [boundary for boundary in boundaries if boundary.end() <= first_file_start]
     prior_boundary = prior_boundaries[-1] if prior_boundaries else None
     if prior_boundary is not None and len(prior_boundaries) >= 2:
         previous_boundary = prior_boundaries[-2]
         boundary_text = prior_boundary.group().strip().casefold()
-        between_boundaries = raw_user_query[previous_boundary.end():prior_boundary.start()]
+        between_boundaries = rewritten_query[previous_boundary.end():prior_boundary.start()]
         if (
             boundary_text.startswith(("attach", "include"))
             and not between_boundaries.strip()
@@ -270,21 +271,21 @@ def _derive_composition_scope(
             prior_boundary = previous_boundary
     file_start = prior_boundary.end() if prior_boundary else 0
     answer_prefix_end = prior_boundary.start() if prior_boundary else 0
-    file_end = len(raw_user_query)
-    answer_suffix_start = len(raw_user_query)
+    file_end = len(rewritten_query)
+    answer_suffix_start = len(rewritten_query)
     for boundary in boundaries:
         if boundary.start() < first_file_end:
             continue
-        following_text = raw_user_query[boundary.end():].lstrip()
+        following_text = rewritten_query[boundary.end():].lstrip()
         if _NON_FILE_DELIVERABLE_AFTER_BOUNDARY.match(following_text):
             file_end = boundary.start()
             answer_suffix_start = boundary.end()
             break
 
-    file_scope = raw_user_query[file_start:file_end].strip(" \t\r\n,;.-")
+    file_scope = rewritten_query[file_start:file_end].strip(" \t\r\n,;.-")
     answer_parts = (
-        raw_user_query[:answer_prefix_end].strip(" \t\r\n,;.-"),
-        raw_user_query[answer_suffix_start:].strip(" \t\r\n,;.-"),
+        rewritten_query[:answer_prefix_end].strip(" \t\r\n,;.-"),
+        rewritten_query[answer_suffix_start:].strip(" \t\r\n,;.-"),
     )
     answer_scope = " ".join(part for part in answer_parts if part).strip()
     if not answer_scope:
@@ -300,7 +301,7 @@ def _derive_composition_scope(
 
     return ContentCompositionScope(
         answer_request_scope=answer_scope,
-        file_request_scope=file_scope or raw_user_query.strip(),
+        file_request_scope=file_scope or rewritten_query.strip(),
         answer_generation_responsibility=answer_responsibility,
         file_tool_responsibility=(
             "Construct only content that belongs inside the requested file. Exclude "
@@ -318,7 +319,15 @@ def _file_request_scope(composer_input: ContentComposerInput) -> str:
         file_scope = scope.get("file_request_scope")
         if isinstance(file_scope, str) and file_scope.strip():
             return file_scope.strip()
-    return composer_input.raw_user_query
+    return composer_input.rewritten_query
+
+
+def _canonical_rewritten_query(composer_input: ContentComposerInput) -> str:
+    metadata = getattr(composer_input, "metadata", {}) or {}
+    value = metadata.get(_CANONICAL_REWRITTEN_QUERY_KEY)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return composer_input.rewritten_query.strip()
 
 
 def _composition_scope_payload(composer_input: ContentComposerInput) -> dict[str, Any]:
@@ -341,7 +350,10 @@ def _unauthorized_file_tool_result(
     composer_input: ContentComposerInput,
     config: GeneralPurposeConfig,
 ) -> ContentToolResult | None:
-    decision = classify_file_creation_request(composer_input.raw_user_query, config)
+    decision = classify_file_creation_request(
+        _canonical_rewritten_query(composer_input),
+        config,
+    )
     if decision.selected_tool_name == tool_name:
         return None
     return ContentToolResult(
@@ -436,7 +448,6 @@ class AnswerGenerationTool:
                     PromptContext(
                         stage="answer_generation",
                         user_id=composer_input.user_id,
-                        raw_query=composer_input.raw_user_query,
                         rewritten_query=composer_input.rewritten_query,
                         metadata=composer_input.metadata,
                         platform_context=composer_input.platform_context,
@@ -493,7 +504,10 @@ class GenerateExcelTool:
         self.config = config
 
     def can_handle(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> bool:
-        return classify_file_creation_request(composer_input.raw_user_query, config).selected_tool_name == self.name
+        return classify_file_creation_request(
+            _canonical_rewritten_query(composer_input),
+            config,
+        ).selected_tool_name == self.name
 
     def execute(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> ContentToolResult:
         rejected = _unauthorized_file_tool_result(self.name, composer_input, config)
@@ -586,7 +600,10 @@ class GeneratePDFTool:
         self.config = config
 
     def can_handle(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> bool:
-        return classify_file_creation_request(composer_input.raw_user_query, config).selected_tool_name == self.name
+        return classify_file_creation_request(
+            _canonical_rewritten_query(composer_input),
+            config,
+        ).selected_tool_name == self.name
 
     def execute(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> ContentToolResult:
         rejected = _unauthorized_file_tool_result(self.name, composer_input, config)
@@ -679,7 +696,10 @@ class GeneratePPTXTool:
         self.config = config
 
     def can_handle(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> bool:
-        return classify_file_creation_request(composer_input.raw_user_query, config).selected_tool_name == self.name
+        return classify_file_creation_request(
+            _canonical_rewritten_query(composer_input),
+            config,
+        ).selected_tool_name == self.name
 
     def execute(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> ContentToolResult:
         rejected = _unauthorized_file_tool_result(self.name, composer_input, config)
@@ -780,7 +800,18 @@ class DeterministicContentComposer:
     registry: ContentToolRegistry
 
     def compose(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> ContentComposerResult:
-        decision = classify_file_creation_request(composer_input.raw_user_query, config)
+        canonical_metadata = dict(composer_input.metadata)
+        canonical_metadata[_CANONICAL_REWRITTEN_QUERY_KEY] = (
+            composer_input.rewritten_query
+        )
+        composer_input = replace(
+            composer_input,
+            # Compatibility field only: it must never retain the pre-rewrite input.
+            raw_user_query=composer_input.rewritten_query,
+            metadata=canonical_metadata,
+        )
+        canonical_query = _canonical_rewritten_query(composer_input)
+        decision = classify_file_creation_request(canonical_query, config)
         desired_file_tool_name = decision.selected_tool_name
         file_tool: ContentTool | None = None
         file_route_status = "not_requested"
@@ -801,7 +832,7 @@ class DeterministicContentComposer:
             else replace(decision, selected_tool_name=None)
         )
         composition_scope = _derive_composition_scope(
-            composer_input.raw_user_query,
+            canonical_query,
             scope_decision,
             config,
         )
@@ -809,11 +840,15 @@ class DeterministicContentComposer:
             file_tool = None
             file_route_status = "scope_projection_failed"
             composition_scope = _derive_composition_scope(
-                composer_input.raw_user_query,
+                canonical_query,
                 replace(decision, selected_tool_name=None),
                 config,
             )
         answer_metadata = dict(composer_input.metadata)
+        # The canonical full query is private authorization state for routing
+        # and file tools. The prose stage receives only its projected rewritten
+        # scope, so file-only instructions cannot bleed into the answer prompt.
+        answer_metadata.pop(_CANONICAL_REWRITTEN_QUERY_KEY, None)
         answer_metadata["content_composition_scope"] = {
             "answer_request_scope": composition_scope.answer_request_scope,
             "answer_generation_responsibility": composition_scope.answer_generation_responsibility,
@@ -855,8 +890,8 @@ class DeterministicContentComposer:
         results = [answer_result]
         selected_file_tool_name: str | None = None
         if file_tool is not None and desired_file_tool_name is not None:
-            # The raw query is retained solely so each Microsoft tool can
-            # independently re-check deterministic authorization.  Only the
+            # The complete rewritten query is retained so each Microsoft tool can
+            # independently re-check deterministic authorization. Only the
             # file clause reaches its content-planning prompt and fallback.
             file_metadata = dict(composer_input.metadata)
             file_metadata["content_composition_scope"] = {
@@ -865,6 +900,7 @@ class DeterministicContentComposer:
             }
             file_input = replace(
                 composer_input,
+                raw_user_query=composition_scope.file_request_scope or "",
                 rewritten_query=composition_scope.file_request_scope or "",
                 metadata=file_metadata,
             )

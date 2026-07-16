@@ -32,6 +32,66 @@ def _append_unique_line(parts: list[str], seen: set[str], line: str) -> None:
     parts.append(line)
 
 
+def render_branch_result_text(
+    branch_result: BranchResult,
+    prompt_registry: PromptRegistry = DEFAULT_PROMPT_REGISTRY,
+) -> str:
+    """Render the canonical pre-platform text for persistence and bundling."""
+
+    parts: list[str] = []
+    seen_parts: set[str] = set()
+    operation_summaries = [
+        getattr(result, "user_safe_summary", None)
+        or getattr(result, "user_facing_summary", None)
+        for result in (
+            branch_result.knowledge_operation_results
+            + branch_result.reminder_operation_results
+        )
+    ]
+    for summary in operation_summaries:
+        if summary:
+            _append_unique_line(parts, seen_parts, str(summary).strip())
+    if branch_result.normal_response_text and not operation_summaries:
+        _append_unique_line(
+            parts,
+            seen_parts,
+            branch_result.normal_response_text.strip(),
+        )
+    if branch_result.clarification_question:
+        _append_unique_line(
+            parts,
+            seen_parts,
+            _question_line(
+                "Clarification question",
+                branch_result.clarification_question,
+            ),
+        )
+    if branch_result.fallback_or_error_message:
+        _append_unique_line(
+            parts,
+            seen_parts,
+            branch_result.fallback_or_error_message.strip(),
+        )
+    for question in branch_result.human_supporting_questions:
+        _append_unique_line(
+            parts,
+            seen_parts,
+            _question_line("Supporting question", question),
+        )
+    if branch_result.reminder_supporting_question:
+        _append_unique_line(
+            parts,
+            seen_parts,
+            _question_line(
+                "Reminder supporting question",
+                branch_result.reminder_supporting_question,
+            ),
+        )
+
+    final_text = "\n".join(part.strip() for part in parts if part.strip())
+    return final_text or prompt_registry.message("bundler_empty")
+
+
 class ResponseBundler:
     def __init__(self, prompt_registry: PromptRegistry = DEFAULT_PROMPT_REGISTRY) -> None:
         self.prompt_registry = prompt_registry
@@ -43,44 +103,10 @@ class ResponseBundler:
         rewritten_query: str,
         branch_result: BranchResult,
     ) -> BundledResponse:
-        parts: list[str] = []
-        seen_parts: set[str] = set()
-        operation_summaries = [
-            getattr(result, "user_safe_summary", None) or getattr(result, "user_facing_summary", None)
-            for result in (
-                branch_result.knowledge_operation_results
-                + branch_result.reminder_operation_results
-            )
-        ]
-        for summary in operation_summaries:
-            if summary:
-                _append_unique_line(parts, seen_parts, str(summary).strip())
-        if branch_result.normal_response_text and not operation_summaries:
-            _append_unique_line(parts, seen_parts, branch_result.normal_response_text.strip())
-        if branch_result.clarification_question:
-            _append_unique_line(
-                parts,
-                seen_parts,
-                _question_line("Clarification question", branch_result.clarification_question),
-            )
-        if branch_result.fallback_or_error_message:
-            _append_unique_line(parts, seen_parts, branch_result.fallback_or_error_message.strip())
-        for question in branch_result.human_supporting_questions:
-            _append_unique_line(
-                parts,
-                seen_parts,
-                _question_line("Supporting question", question),
-            )
-        if branch_result.reminder_supporting_question:
-            _append_unique_line(
-                parts,
-                seen_parts,
-                _question_line("Reminder supporting question", branch_result.reminder_supporting_question),
-            )
-            
-        final_text = "\n".join(part.strip() for part in parts if part.strip())
-        if not final_text:
-            final_text = self.prompt_registry.message("bundler_empty")
+        final_text = render_branch_result_text(
+            branch_result,
+            self.prompt_registry,
+        )
 
         committed_actions = []
         for result in branch_result.knowledge_operation_results + branch_result.reminder_operation_results:
@@ -95,7 +121,7 @@ class ResponseBundler:
                 )
 
         last_qa_state = LastQAState(
-            last_user_query=rewritten_query or request.raw_query,
+            last_user_query=rewritten_query,
             last_response=final_text,
             response_type=branch_result.response_type,
             supporting_questions=list(branch_result.human_supporting_questions),

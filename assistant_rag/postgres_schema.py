@@ -72,6 +72,11 @@ knowledge_topics = Table(
     Column("created_at", String, nullable=False),
     Column("updated_at", String, nullable=False),
     Column("version", Integer, nullable=False),
+    UniqueConstraint(
+        "user_id",
+        "title",
+        name="uq_knowledge_topics_user_title",
+    ),
 )
 
 knowledge_sources = Table(

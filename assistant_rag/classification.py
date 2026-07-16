@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 import logging
 from typing import Any
 
-from .action_detection import enforce_mutation_only_intent
 from .config import ClassificationConfig, LastQAConfig
 from .contracts import (
     ChatRequest, Intent, LastQAState, ResponseType, LastQAPath,
@@ -474,7 +473,6 @@ class LLMLastQAResolver:
                         PromptContext(
                             stage="last_qa",
                             user_id=request.user_id,
-                            raw_query=request.raw_query,
                             rewritten_query=rewritten_query,
                             metadata=request.metadata,
                             platform_context=request.platform_context,
@@ -559,7 +557,7 @@ class LLMIntentClassifier(IntentClassifierProtocol):
         explicit_intent = request.metadata.get("intent")
         if explicit_intent:
             try:
-                return enforce_mutation_only_intent(request, Intent(explicit_intent))
+                return Intent(explicit_intent)
             except ValueError:
                 pass
 
@@ -586,7 +584,6 @@ class LLMIntentClassifier(IntentClassifierProtocol):
                     PromptContext(
                         stage="intent_classifier",
                         user_id=request.user_id,
-                        raw_query=request.raw_query,
                         rewritten_query=rewritten_query,
                         metadata=request.metadata,
                         platform_context=request.platform_context,
@@ -599,7 +596,7 @@ class LLMIntentClassifier(IntentClassifierProtocol):
             
             intent_str = payload.get("intent")
             if intent_str and float(payload.get("confidence", 0.0)) >= self.config.min_confidence:
-                return enforce_mutation_only_intent(request, Intent(intent_str))
+                return Intent(intent_str)
         except Exception as e:
             _log_llm_fallback("Intent classifier", e)
 
@@ -618,11 +615,11 @@ class KeywordIntentClassifier(IntentClassifierProtocol):
     ) -> Intent:
         explicit_intent = request.metadata.get("intent")
         if explicit_intent:
-            return enforce_mutation_only_intent(request, Intent(explicit_intent))
+            return Intent(explicit_intent)
         query = rewritten_query.casefold()
         for intent_name, keywords in self.config.intent_keywords.items():
             if any(keyword.casefold() in query for keyword in keywords):
-                return enforce_mutation_only_intent(request, Intent(intent_name))
+                return Intent(intent_name)
         return Intent.GENERAL_RESPONSE
 
 # Expose IntentClassifier as the base protocol for type hints

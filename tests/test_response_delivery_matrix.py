@@ -42,6 +42,7 @@ from assistant_rag.platform import PlatformSelector
 
 
 _FILE_TOOLS = ("generate_pdf", "generate_excel", "generate_pptx")
+_RAW_QUERY_SENTINEL = "RAW_SENTINEL audit-only ingress text."
 
 
 @dataclass
@@ -590,12 +591,14 @@ class ScriptedSender:
         return {"status": "draft_saved", "provider": "gmail"}
 
 
-def _bundled_platform_response() -> BundledResponse:
+def _bundled_platform_response(
+    rewritten_query: str = "request",
+) -> BundledResponse:
     return BundledResponse(
         final_chat_text="Subject: Project update\n\nHello team,\n\nThe update is ready.",
         response_type=ResponseType.NORMAL,
         last_qa_state=LastQAState(
-            last_user_query="request",
+            last_user_query=rewritten_query,
             last_response="response",
             response_type=ResponseType.NORMAL,
         ),
@@ -617,9 +620,10 @@ def _platform_extraction(
 
 
 def test_platform_none_route_is_explicit_safe_passthrough() -> None:
+    rewritten_query = "REWRITTEN_SENTINEL Explain the project update."
     result = PlatformSelector(llm=None).select(
-        _bundled_platform_response(),
-        ChatRequest(user_id="matrix-user", raw_query="Explain the project update."),
+        _bundled_platform_response(rewritten_query),
+        ChatRequest(user_id="matrix-user", raw_query=_RAW_QUERY_SENTINEL),
     )
 
     assert result["platform_selection"] == {
@@ -630,6 +634,31 @@ def test_platform_none_route_is_explicit_safe_passthrough() -> None:
     assert result["delivery"] == {"channel": "none", "status": "not_requested"}
     assert result["text"].startswith("Subject: Project update")
     assert result["seed"] == "preserved"
+
+
+def test_platform_formatter_receives_rewritten_compatibility_request() -> None:
+    rewritten_query = (
+        "REWRITTEN_SENTINEL Draft an email to alex@example.com about the update."
+    )
+    observed_requests: list[ChatRequest] = []
+
+    class RecordingFormatter:
+        def format(
+            self, _response: BundledResponse, request: ChatRequest
+        ) -> dict[str, Any]:
+            observed_requests.append(request)
+            return {}
+
+    selector = PlatformSelector(llm=None)
+    selector.register("gmail", RecordingFormatter())
+    selector.select(
+        _bundled_platform_response(rewritten_query),
+        ChatRequest(user_id="matrix-user", raw_query=_RAW_QUERY_SENTINEL),
+    )
+
+    assert len(observed_requests) == 1
+    assert observed_requests[0].raw_query == rewritten_query
+    assert _RAW_QUERY_SENTINEL not in observed_requests[0].raw_query
 
 
 @pytest.mark.parametrize(
@@ -707,10 +736,10 @@ def test_platform_gmail_status_matrix(
         },
     )
     result = PlatformSelector(llm=llm, senders={"gmail": sender}).select(
-        _bundled_platform_response(),
+        _bundled_platform_response(query),
         ChatRequest(
             user_id="matrix-user",
-            raw_query=query,
+            raw_query=_RAW_QUERY_SENTINEL,
             platform_context=context,
         ),
     )
@@ -756,6 +785,7 @@ def test_platform_non_email_channel_send_matrix(
     platform_context: dict[str, str],
 ) -> None:
     sender = ScriptedSender()
+    rewritten_query = f"Send this update through {channel} to {recipient}."
     selector = PlatformSelector(
         llm=ScriptedPlatformLLM(
             channel,
@@ -765,10 +795,10 @@ def test_platform_non_email_channel_send_matrix(
     )
 
     result = selector.select(
-        _bundled_platform_response(),
+        _bundled_platform_response(rewritten_query),
         ChatRequest(
             user_id="matrix-user",
-            raw_query=f"Send this update through {channel} to {recipient}.",
+            raw_query=_RAW_QUERY_SENTINEL,
             platform_context=platform_context,
         ),
     )

@@ -51,7 +51,7 @@ class AssistantRepository(ABC):
         pass
 
     @abstractmethod
-    def add_knowledge_chunk(self, cursor: sqlite3.Cursor, *, user_id: str, title: str, text: str, source_id: str | None=None, metadata: dict[str, Any] | None=None, replaces_chunk_id: str | None = None, change_reason: str | None = None, modified_by_user_query: str | None = None) -> tuple[str, str, str | None]:
+    def add_knowledge_chunk(self, cursor: sqlite3.Cursor, *, user_id: str, title: str, text: str, source_id: str | None=None, metadata: dict[str, Any] | None=None, replaces_chunk_id: str | None = None, change_reason: str | None = None, modified_by_user_query: str | None = None, knowledge_topic_id: str | None = None) -> tuple[str, str, str | None]:
         pass
 
     @abstractmethod
@@ -150,6 +150,64 @@ class AssistantRepository(ABC):
     def record_action_audit_noop(self, *, user_id: str, topic_title: str, raw_user_query: str, rewritten_user_query: str, response_text: str, intent: str, response_type: str, parent_hop_id: str | None = None) -> RepositoryTransactionResult:
         pass
 
+    def record_branch_outcome(
+        self,
+        *,
+        user_id: str,
+        topic_title: str,
+        raw_user_query: str,
+        rewritten_user_query: str,
+        response_text: str,
+        intent: str,
+        response_type: str,
+        supporting_questions: list[str | dict[str, Any]] | None = None,
+        parent_hop_id: str | None = None,
+        entities: dict[str, Any] | None = None,
+    ) -> RepositoryTransactionResult:
+        """Persist a main-branch outcome that did not write its own audit hop.
+
+        Concrete repositories inherit this implementation so SQLite and
+        PostgreSQL use the same source-of-truth and outbox contract.  The hop
+        and its derived-index job commit atomically.
+        """
+
+        try:
+            with self.transaction() as cursor:
+                topic_id = self.ensure_topic(
+                    cursor,
+                    user_id=user_id,
+                    title=topic_title,
+                )
+                hop = self.append_conversation_hop(
+                    cursor,
+                    topic_id=topic_id,
+                    user_id=user_id,
+                    intent=intent,
+                    raw_user_query=raw_user_query,
+                    rewritten_user_query=rewritten_user_query,
+                    raw_response=response_text,
+                    response_type=response_type,
+                    supporting_questions=supporting_questions,
+                    parent_hop_id=parent_hop_id,
+                    entities=entities,
+                )
+                return RepositoryTransactionResult(
+                    committed=True,
+                    results=(),
+                    audit_topic_id=hop.topic_id,
+                    audit_hop_id=hop.hop_id,
+                    indexing_outbox_ids=(hop.outbox_job_id,),
+                )
+        except Exception:
+            return RepositoryTransactionResult(
+                committed=False,
+                results=(),
+                error_type="RepositoryTransactionError",
+                reason_summary=(
+                    "The branch outcome could not be persisted and was rolled back."
+                ),
+            )
+
     @abstractmethod
     def transactional_knowledge_actions(self, *, user_id: str, topic_title: str, raw_user_query: str, rewritten_user_query: str, response_text: str, actions: list[ValidatedKnowledgeAction], parent_hop_id: str | None = None) -> RepositoryTransactionResult:
         pass
@@ -221,6 +279,23 @@ class AssistantRepository(ABC):
 
     @abstractmethod
     def claim_outbox_jobs(self, *, max_attempts: int, batch_size: int, retry_cutoff: str) -> list[dict[str, Any]]:
+        pass
+
+    @abstractmethod
+    def claim_outbox_jobs_by_ids(
+        self,
+        *,
+        job_ids: list[str],
+        max_attempts: int,
+    ) -> list[dict[str, Any]]:
+        pass
+
+    @abstractmethod
+    def get_outbox_job_statuses(
+        self,
+        *,
+        job_ids: list[str],
+    ) -> dict[str, str]:
         pass
 
     @abstractmethod

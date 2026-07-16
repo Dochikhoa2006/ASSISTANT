@@ -37,7 +37,7 @@ class ReminderAutoscan:
             decision = self.timing_planner.plan(
                 event_time=reminder.source_time,
                 subject=reminder.subject or "event",
-                raw_query=reminder.raw_reminder or reminder.subject,
+                reminder_context=reminder.raw_reminder or reminder.subject,
                 user_timezone=reminder.user_timezone,
                 now=now,
             ) if self.timing_planner else None

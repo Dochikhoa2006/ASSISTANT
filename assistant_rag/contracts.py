@@ -422,6 +422,7 @@ class EvaluationReport:
 class RepositoryTransactionResult:
     committed: bool
     results: tuple[RepositoryActionResult, ...]
+    audit_topic_id: Optional[str] = None
     audit_hop_id: Optional[str] = None
     indexing_outbox_ids: tuple[str, ...] = ()
     error_type: Optional[str] = None
@@ -454,6 +455,8 @@ class ValidatedKnowledgeAction:
     requires_hitl: bool = False
     factuality_concern: bool = False
     hitl_reason: Optional[str] = None
+    clarification_question: Optional[str] = None
+    pending_confirmation_token: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -480,6 +483,7 @@ class LLMRetrievalValidationResult:
     requires_hitl: bool = False
     factuality_concern: bool = False
     hitl_reason: Optional[str] = None
+    clarification_question: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -595,12 +599,18 @@ class ValidatedReminderAction:
     reminder_time: datetime | None = None
     reminder_summary: Optional[str] = None
     raw_reminder: Optional[str] = None
+    supporting_question: Optional[str] = None
+    supporting_response: Optional[str] = None
     user_timezone: Optional[str] = None
     original_time_text: Optional[str] = None
     recurrence_rule: Optional[str] = None
     recurrence_timezone: Optional[str] = None
     next_fire_time: datetime | None = None
     parent_recurring_reminder_id: Optional[str] = None
+    # Legacy callers default to background timing. The three-stage reminder
+    # pipeline disables it only when an explicit notification timestamp has
+    # already been validated and must not be overwritten by autoscan.
+    timing_plan_required: bool = True
 
     replacement_subject: Optional[str] = None
     replacement_time: datetime | None = None
@@ -611,6 +621,9 @@ class ValidatedReminderAction:
     confidence: float = 0.0
     matched_fields: tuple[str, ...] = ()
     reason_summary: Optional[str] = None
+    requires_hitl: bool = False
+    factuality_concern: bool = False
+    hitl_reason: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -789,7 +802,10 @@ class GeneralResponsePersistencePlan:
 @dataclass(frozen=True)
 class ContentComposerInput:
     user_id: str
+    # Legacy compatibility slot. DeterministicContentComposer overwrites it
+    # with rewritten_query before any routing, prompt, or tool can consume it.
     raw_user_query: str
+    # Sole semantic query authority for composition and artifact decisions.
     rewritten_query: str
     sub_branch: GeneralSubBranch
     persistence_mode: PersistenceMode

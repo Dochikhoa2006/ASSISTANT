@@ -9,6 +9,9 @@ from assistant_rag.contracts import BundledResponse, ChatRequest, LastQAState, R
 from assistant_rag.platform import PlatformSelector
 
 
+_RAW_QUERY_SENTINEL = "RAW_SENTINEL audit-only ingress text."
+
+
 class ScriptedPlatformLLM:
     def __init__(self, channel: str, extraction: dict[str, Any]) -> None:
         self.channel = channel
@@ -33,12 +36,12 @@ class RecordingSender:
         }
 
 
-def _bundled_response() -> BundledResponse:
+def _bundled_response(rewritten_query: str) -> BundledResponse:
     return BundledResponse(
         final_chat_text="The requested update is ready.",
         response_type=ResponseType.NORMAL,
         last_qa_state=LastQAState(
-            last_user_query="",
+            last_user_query=rewritten_query,
             last_response="",
             response_type=ResponseType.NORMAL,
         ),
@@ -46,7 +49,7 @@ def _bundled_response() -> BundledResponse:
 
 
 @pytest.mark.parametrize(
-    ("channel", "recipient", "raw_query", "platform_context"),
+    ("channel", "recipient", "rewritten_query", "platform_context"),
     (
         (
             "telegram",
@@ -65,7 +68,7 @@ def _bundled_response() -> BundledResponse:
 def test_numeric_recipient_ids_are_routed_for_non_email_channels(
     channel: str,
     recipient: int,
-    raw_query: str,
+    rewritten_query: str,
     platform_context: dict[str, str],
 ) -> None:
     sender = RecordingSender()
@@ -83,10 +86,10 @@ def test_numeric_recipient_ids_are_routed_for_non_email_channels(
     )
 
     result = selector.select(
-        _bundled_response(),
+        _bundled_response(rewritten_query),
         ChatRequest(
             user_id="platform-test",
-            raw_query=raw_query,
+            raw_query=_RAW_QUERY_SENTINEL,
             platform_context=platform_context,
         ),
     )
@@ -107,6 +110,7 @@ def test_numeric_recipient_ids_are_routed_for_non_email_channels(
 
 
 def test_gmail_recipient_validation_remains_email_only() -> None:
+    rewritten_query = "Send an email to alice@example.com with the update."
     sender = RecordingSender()
     selector = PlatformSelector(
         llm=ScriptedPlatformLLM(
@@ -122,10 +126,10 @@ def test_gmail_recipient_validation_remains_email_only() -> None:
     )
 
     result = selector.select(
-        _bundled_response(),
+        _bundled_response(rewritten_query),
         ChatRequest(
             user_id="platform-test",
-            raw_query="Send an email to alice@example.com with the update.",
+            raw_query=_RAW_QUERY_SENTINEL,
             platform_context={
                 "gmail_username": "sender@example.com",
                 "gmail_app_password": "test-password",
