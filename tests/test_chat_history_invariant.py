@@ -113,6 +113,9 @@ def test_every_registry_prompt_preserves_complete_or_explicitly_empty_history() 
     stages = (
         "intent_classifier",
         "general_sub_branch_detector",
+        "knowledge_action_extraction",
+        "knowledge_action_validation",
+        "knowledge_content_finalization",
         "risky_action_validation",
         "knowledge_retrieval_validation",
         "question_generation",

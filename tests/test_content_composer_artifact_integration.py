@@ -282,13 +282,17 @@ def test_compound_email_and_attachment_keep_real_outputs_disjoint(
         ChatRequest(
             user_id="artifact-integration-user",
             raw_query=(
-                "Draft an email to finance@example.com with the attachment; "
-                "do not send it."
+                "Draft an email about the Excel workbook to finance@example.com and "
+                "operations@example.com; do not send it."
             ),
         ),
     )
 
     assert draft["delivery"]["status"] == "draft_ready"
+    assert draft["delivery"]["recipients"] == [
+        "finance@example.com",
+        "operations@example.com",
+    ]
     assert draft["draft"]["body"] == email_copy
     assert len(draft["draft"]["attachments"]) == 1
     assert draft["draft"]["attachments"][0]["filename"] == result.artifacts[0]["filename"]
@@ -304,7 +308,10 @@ def test_compound_email_and_attachment_keep_real_outputs_disjoint(
         bundled,
         ChatRequest(
             user_id="artifact-integration-user",
-            raw_query="Send the email to finance@example.com with the attachment now.",
+            raw_query=(
+                "Email the Excel workbook to finance@example.com and "
+                "operations@example.com now."
+            ),
             platform_context={
                 "gmail_username": "sender@example.com",
                 "gmail_app_password": "test-app-password",
@@ -317,7 +324,10 @@ def test_compound_email_and_attachment_keep_real_outputs_disjoint(
     assert len(send_sender.calls) == 1
     sent_payload, sent_context = send_sender.calls[0]
     assert sent_payload["body"] == email_copy
-    assert sent_payload["recipients"] == ["finance@example.com"]
+    assert sent_payload["recipients"] == [
+        "finance@example.com",
+        "operations@example.com",
+    ]
     assert len(sent_payload["attachments"]) == 1
     assert sent_payload["attachments"][0]["storage_path"] == str(artifact_path)
     assert sent_context == {

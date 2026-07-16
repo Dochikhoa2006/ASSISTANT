@@ -175,6 +175,7 @@ class HardRuleContextFilter:
         
         _internal_selected_topic_candidates: list[str] = []
         _internal_selected_hop_candidates: list[str] = []
+        approved_rerank_scores: list[float] = []
         
         seen_conversation_ids: set[str] = set()
         for result in conversation_results:
@@ -190,6 +191,7 @@ class HardRuleContextFilter:
                 rejected_conversation_ids.append(result.entity_id)
                 continue
             seen_conversation_ids.add(result.entity_id)
+            approved_rerank_scores.append(float(result.rerank_score))
 
             # Extract native expected_response_type from the hop if available
             raw_hop_ert = payload.get("expected_response_type")
@@ -276,6 +278,9 @@ class HardRuleContextFilter:
             conversation_retrieval_ran=True,
             conversation_context_status=status,
             approved_conversation_count=len(approved_conversation),
+            top_hop_rerank_score=(
+                max(approved_rerank_scores) if approved_rerank_scores else None
+            ),
             _internal_selected_topic_candidates=_internal_selected_topic_candidates,
             _internal_selected_hop_candidates=_internal_selected_hop_candidates,
             _rejected_conversation_ids=tuple(rejected_conversation_ids),

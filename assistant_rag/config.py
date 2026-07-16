@@ -37,6 +37,7 @@ class RetrievalConfig:
     lexical_weight: float = 1.10
     semantic_weight: float = 1.0
     rerank_candidate_limit: int = RETRIEVAL_PIPELINE_POLICY.rrf_top_k
+    conversation_min_confidence_score: float = 0.50
     general_response_reminder_limit: int = 4
     general_response_reminder_statuses: tuple[str, ...] = ("scheduled", "notified")
 
@@ -48,6 +49,10 @@ class RetrievalConfig:
         ).validate()
         if self.chroma_top_k != self.bm25_top_k:
             raise ValueError("OpenSearch and ChromaDB candidate limits must be identical")
+        if not 0.0 <= self.conversation_min_confidence_score <= 1.0:
+            raise ValueError(
+                "conversation_min_confidence_score must be in [0.0, 1.0]"
+            )
 
 
 @dataclass(frozen=True)
@@ -221,6 +226,8 @@ class GeneralPurposeConfig:
     # Sub-branch detector
     general_sub_branch_detector_enabled: bool = True
     general_sub_branch_confidence_threshold: float = 0.65
+    support_question_resolution_min_confidence: float = 0.90
+    conversation_followup_min_score: float = 0.65
     general_sub_branch_fallback_mode: str = "new_conversation_topic"
     general_sub_branch_detector_json_retry_count: int = 1
 
@@ -264,6 +271,12 @@ class GeneralPurposeConfig:
     def __post_init__(self) -> None:
         if not (0.0 <= self.general_sub_branch_confidence_threshold <= 1.0):
             raise ValueError("general_sub_branch_confidence_threshold must be in [0.0, 1.0]")
+        if not (0.0 <= self.support_question_resolution_min_confidence <= 1.0):
+            raise ValueError(
+                "support_question_resolution_min_confidence must be in [0.0, 1.0]"
+            )
+        if not (0.0 <= self.conversation_followup_min_score <= 1.0):
+            raise ValueError("conversation_followup_min_score must be in [0.0, 1.0]")
         if self.content_composer_tool_timeout_seconds <= 0:
             raise ValueError("content_composer_tool_timeout_seconds must be > 0")
         if self.content_composer_default_tool not in self.content_composer_allowed_tools:

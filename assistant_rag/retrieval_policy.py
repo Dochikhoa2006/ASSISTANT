@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+DEFAULT_CROSS_ENCODER_MIN_SCORE = 0.30
+
+
 @dataclass(frozen=True)
 class RetrievalPipelinePolicy:
     source_top_k: int = 20
@@ -17,7 +20,7 @@ class RetrievalPipelinePolicy:
         if self.rrf_top_k != 15:
             raise ValueError("Reciprocal-rank fusion must pass exactly 15 candidates")
         if self.final_top_k != 5:
-            raise ValueError("Cross-encoder retrieval must return exactly 5 candidates")
+            raise ValueError("Cross-encoder retrieval must cap final candidates at 5")
 
 
 RETRIEVAL_PIPELINE_POLICY = RetrievalPipelinePolicy()

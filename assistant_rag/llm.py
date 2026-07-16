@@ -10,6 +10,7 @@ import time
 from typing import Any, Protocol
 from urllib import error, request
 
+from .action_detection import enforce_mutation_only_intent
 from .contracts import Intent, ResponseType
 from .metrics import GLOBAL_METRICS
 from .observability import StageTimer, current_trace
@@ -35,6 +36,9 @@ class LLMTask(str, Enum):
     LAST_QA = "last_qa"
     INTENT = "intent"
     ACTION_EXTRACTION = "action_extraction"
+    KNOWLEDGE_ACTION_EXTRACTION = "knowledge_action_extraction"
+    KNOWLEDGE_ACTION_VALIDATION = "knowledge_action_validation"
+    KNOWLEDGE_CONTENT_FINALIZATION = "knowledge_content_finalization"
     GENERATE_CLARIFICATION = "generate_clarification"
     GENERATE_HUMAN_SUPPORTING = "generate_human_supporting"
     GENERATE_REMINDER_SUPPORTING = "generate_reminder_supporting"
@@ -520,18 +524,32 @@ def structured_fallback_payload(
             "requires_clarification": False,
             "reason_summary": reason,
         })
-    elif task == LLMTask.ACTION_EXTRACTION:
-        intent = str(context.get("intent") or Intent.GENERAL_RESPONSE.value)
-        payload.update({
-            "intent": intent if intent in {item.value for item in Intent} else Intent.GENERAL_RESPONSE.value,
-            "confidence": 0.0,
-            "knowledge_actions": [],
-            "reminder_actions": [],
-            "missing_fields": ["llm_structured_fallback"],
-            "risk_flags": ["safe_fallback_no_actions"],
-            "normalized_entities": {},
-            "reason_summary": reason,
-        })
+    elif task in {
+        LLMTask.ACTION_EXTRACTION,
+        LLMTask.KNOWLEDGE_ACTION_EXTRACTION,
+    }:
+        if "text_content" in (schema.get("properties") or {}):
+            payload.update({
+                "action": "add",
+                "text_content": "",
+                "original_text": "",
+                "replacement_text": "",
+                "confidence": 0.0,
+                "missing_fields": ["llm_structured_fallback"],
+                "reason_summary": reason,
+            })
+        else:
+            intent = str(context.get("intent") or Intent.GENERAL_RESPONSE.value)
+            payload.update({
+                "intent": intent if intent in {item.value for item in Intent} else Intent.GENERAL_RESPONSE.value,
+                "confidence": 0.0,
+                "knowledge_actions": [],
+                "reminder_actions": [],
+                "missing_fields": ["llm_structured_fallback"],
+                "risk_flags": ["safe_fallback_no_actions"],
+                "normalized_entities": {},
+                "reason_summary": reason,
+            })
     elif task == LLMTask.RISKY_ACTION:
         payload.update({"results": []})
     elif task == LLMTask.GENERATE_CLARIFICATION:
@@ -578,7 +596,10 @@ def structured_fallback_payload(
             "confidence": 1.0,
             "is_final_answer": True,
         })
-    elif task == LLMTask.RETRIEVAL_VALIDATION:
+    elif task in {
+        LLMTask.RETRIEVAL_VALIDATION,
+        LLMTask.KNOWLEDGE_ACTION_VALIDATION,
+    }:
         operation = _first_enum(schema, "operation") or "delete"
         payload.update({
             "operation": operation,
@@ -589,9 +610,20 @@ def structured_fallback_payload(
             "reason_summary": reason,
             "candidate_assessments": [],
         })
+        if "should_execute" in (schema.get("properties") or {}):
+            payload.update({
+                "should_execute": False,
+                "requires_hitl": True,
+                "factuality_concern": False,
+            })
     elif task == LLMTask.ACTION_PLANNING:
         payload.update({"confidence": 0.0, "reason_summary": reason})
-    elif task in {LLMTask.CONTENT_COMPOSER_REACT, LLMTask.ANSWER, LLMTask.WRITING}:
+    elif task in {
+        LLMTask.CONTENT_COMPOSER_REACT,
+        LLMTask.ANSWER,
+        LLMTask.WRITING,
+        LLMTask.KNOWLEDGE_CONTENT_FINALIZATION,
+    }:
         payload.update({"reason_summary": reason})
 
     if "sheet_name" in payload:
@@ -796,7 +828,7 @@ class OllamaIntentClassifier:
         explicit_intent = request.metadata.get("intent")
         if explicit_intent:
             try:
-                return Intent(explicit_intent)
+                return enforce_mutation_only_intent(request, Intent(explicit_intent))
             except ValueError:
                 pass
         schema = {
@@ -864,4 +896,4 @@ class OllamaIntentClassifier:
         intent = operation_intents[operation_kind]
         if intent is Intent.CLARIFICATION and not _has_pending_clarification(last_qa_resolution):
             return Intent.GENERAL_RESPONSE
-        return intent
+        return enforce_mutation_only_intent(request, intent)

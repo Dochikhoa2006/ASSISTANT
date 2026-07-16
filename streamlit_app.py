@@ -5,11 +5,11 @@ from hashlib import sha256
 from html import escape
 import json
 import logging
-import mimetypes
 from pathlib import Path
 from typing import Callable
 from uuid import uuid4
 
+from assistant_rag.artifacts import artifact_mime_type, resolve_generated_artifacts
 from assistant_rag.contracts import ChatRequest, ResponseType
 from assistant_rag.llm import LLMTask
 from assistant_rag.platform import GmailSender
@@ -71,27 +71,33 @@ def _clear_gmail_credential_check_result(st: object) -> None:
 
 
 def _render_artifact_downloads(st: object, artifacts: list[dict[str, object]]) -> None:
-    """Offer generated files directly in Streamlit without exposing file paths."""
-    downloadable = [
-        artifact for artifact in artifacts
-        if isinstance(artifact, dict)
-        and str(artifact.get("filename") or "").strip()
-        and Path(str(artifact.get("storage_path") or "")).is_file()
-    ]
+    """Offer every generated file or visibly report why it is unavailable."""
+    downloadable, unavailable = resolve_generated_artifacts(artifacts)
     if not downloadable:
+        for label in unavailable:
+            st.error(f"Generated attachment unavailable: {label}.")
         return
     st.caption("Generated files")
     for artifact in downloadable:
         path = Path(str(artifact["storage_path"]))
         filename = str(artifact["filename"])
-        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        try:
+            data = path.read_bytes()
+        except OSError:
+            st.error(f"Generated attachment unavailable: {filename}.")
+            continue
+        artifact_key = str(artifact.get("artifact_id") or "").strip() or sha256(
+            str(path).encode("utf-8")
+        ).hexdigest()[:16]
         st.download_button(
             label=f"Download {filename}",
-            data=path.read_bytes(),
+            data=data,
             file_name=filename,
-            mime=mime_type,
-            key=f"artifact-download-{artifact.get('artifact_id') or filename}",
+            mime=artifact_mime_type(filename),
+            key=f"artifact-download-{artifact_key}",
         )
+    for label in unavailable:
+        st.error(f"Generated attachment unavailable: {label}.")
 
 
 def _execute_user_request(

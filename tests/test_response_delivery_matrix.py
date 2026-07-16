@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator
 
@@ -409,6 +410,68 @@ def test_general_response_branch_sub_branch_and_hitl_cross_product(
             "reason": "disabled_by_general_purpose_config",
         }
     )
+
+
+def test_general_branch_keeps_created_artifact_visible_when_hop_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(branches_module, "retrieve_knowledge", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        branches_module,
+        "retrieve_reminder_candidates",
+        lambda **_kwargs: [],
+    )
+    context, decision, *_ = _branch_case(GeneralSubBranch.NEW_CONVERSATION_TOPIC)
+    artifact_path = tmp_path / "transaction-safe-workbook.xlsx"
+    artifact_path.write_bytes(b"generated-before-hop-write")
+    artifact = {
+        "artifact_id": "artifact-before-hop-failure",
+        "filename": artifact_path.name,
+        "storage_path": str(artifact_path),
+        "file_type": "xlsx",
+        "status": "created",
+    }
+
+    class ArtifactComposer:
+        def compose(self, *_args: Any, **_kwargs: Any) -> ContentComposerResult:
+            return ContentComposerResult(
+                final_response_text="The workbook is ready.",
+                tool_trace_summary="artifact before failed hop",
+                used_tool_names=("answer_generation", "generate_excel"),
+                confidence=1.0,
+                fallback_used=False,
+                reason_summary="artifact created",
+                content_warnings=(),
+                artifacts=(artifact,),
+            )
+
+    class FailingRepository:
+        @contextmanager
+        def transaction(self) -> Iterator[object]:
+            raise RuntimeError("forced hop failure")
+            yield object()  # pragma: no cover
+
+    branch = GeneralResponseBranch(
+        retriever=object(),
+        config=SimpleNamespace(
+            retrieval=SimpleNamespace(
+                general_response_reminder_statuses=("scheduled", "notified"),
+                general_response_reminder_limit=4,
+            )
+        ),
+        context_filter=EmptyContextFilter(),
+        sub_branch_detector=FixedSubBranchDetector(decision),
+        content_composer=ArtifactComposer(),
+        general_hitl_strategy=None,
+        general_purpose_config=GeneralPurposeConfig(),
+    )
+
+    result = branch.execute(context, FailingRepository())  # type: ignore[arg-type]
+
+    assert result.response_type is ResponseType.ERROR
+    assert result.platform_payload == {"artifacts": [artifact]}
+    assert artifact_path.read_bytes() == b"generated-before-hop-write"
 
 
 @pytest.mark.parametrize("response_type", tuple(ResponseType))

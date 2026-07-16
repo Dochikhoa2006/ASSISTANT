@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import html
 import json
+import mimetypes
 import re
 import uuid
 import zipfile
@@ -15,6 +16,73 @@ from typing import Any
 from .contracts import ArtifactFileType
 from .metrics import GLOBAL_METRICS
 from .repository import AssistantRepository
+
+
+def resolve_generated_artifacts(
+    artifacts: Any,
+) -> tuple[list[dict[str, str]], list[str]]:
+    """Return unique, readable artifact metadata and labels for unavailable files.
+
+    This is the shared hand-off contract used by both user-interface downloads
+    and platform attachments. A declared artifact is never silently omitted:
+    callers can fail closed or report every label returned in the second list.
+    """
+
+    if artifacts is None:
+        values: list[Any] = []
+    elif isinstance(artifacts, dict):
+        values = [artifacts]
+    elif isinstance(artifacts, (list, tuple)):
+        values = list(artifacts)
+    else:
+        values = [artifacts]
+
+    resolved: list[dict[str, str]] = []
+    unavailable: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(values, start=1):
+        if not isinstance(item, dict):
+            unavailable.append(f"artifact {index}")
+            continue
+
+        artifact_id = str(item.get("artifact_id") or "").strip()
+        raw_filename = str(item.get("filename") or "").strip()
+        filename = Path(raw_filename).name if raw_filename else ""
+        storage_path = str(item.get("storage_path") or "").strip()
+        status = str(item.get("status") or "").strip().casefold()
+        label = filename or artifact_id or f"artifact {index}"
+        path = Path(storage_path) if storage_path else None
+        if (
+            not filename
+            or path is None
+            or not path.is_file()
+            or (status and status != "created")
+        ):
+            if label not in unavailable:
+                unavailable.append(label)
+            continue
+
+        identity = artifact_id.casefold() or str(path.absolute())
+        if identity in seen:
+            continue
+        seen.add(identity)
+        resolved.append(
+            {
+                "artifact_id": artifact_id,
+                "filename": filename,
+                "storage_path": storage_path,
+                "storage_url": str(item.get("storage_url") or "").strip(),
+                "file_type": str(item.get("file_type") or path.suffix.lstrip(".")).strip().casefold(),
+            }
+        )
+    return resolved, unavailable
+
+
+def artifact_mime_type(filename: str) -> str:
+    """Return a standards-based attachment/download MIME type."""
+
+    guessed, _ = mimetypes.guess_type(filename)
+    return guessed or "application/octet-stream"
 
 
 def safe_filename(name: str, extension: str) -> str:

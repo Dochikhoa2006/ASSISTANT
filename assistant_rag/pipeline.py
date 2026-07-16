@@ -12,6 +12,8 @@ from .contracts import (
     ChatRequest,
     PipelineContext,
     ApprovedConversationContext,
+    LastQAInteractionType,
+    LastQAPath,
     LastQAResolution,
     RetrievalResult,
 )
@@ -110,6 +112,47 @@ class AssistantPipeline:
                         result.entity_id for result in raw_conversation_results
                     ),
                 )
+
+        # Exact supporting-question answers intentionally skip broad retrieval.
+        # Preserve the resolver's authoritative topic/hop identity as approved
+        # selection candidates so the deterministic sub-branch detector can
+        # apply the same candidate contract without introducing unrelated
+        # conversation text into canonical chat history.
+        if (
+            not should_run_broad_retrieval
+            and resolution.path == LastQAPath.LATEST_CONTEXT_INTERACTION
+            and resolution.interaction_type
+            == LastQAInteractionType.SUPPORTING_QUESTION_ANSWER
+            and resolution.is_authoritative_state
+            and resolution.state is not None
+            and resolution.state.linked_topic_id
+            and resolution.state.linked_hop_id
+        ):
+            state = resolution.state
+            approved_conversation_context = ApprovedConversationContext(
+                approved_conversation_history=[],
+                human_supporting_questions=list(state.supporting_questions),
+                reminder_supporting_questions=(
+                    [state.reminder_supporting_question]
+                    if state.reminder_supporting_question is not None
+                    else []
+                ),
+                clarification_question_context=state.clarification_question,
+                extracted_expected_response_types=(
+                    [state.expected_response_type]
+                    if state.expected_response_type is not None
+                    else []
+                ),
+                conversation_retrieval_ran=False,
+                conversation_context_status="not_run",
+                approved_conversation_count=0,
+                top_hop_rerank_score=None,
+                _internal_selected_topic_candidates=[state.linked_topic_id],
+                _internal_selected_hop_candidates=[state.linked_hop_id],
+                _validation_summary=(
+                    "Authoritative Last-QA supporting-question identity."
+                ),
+            )
         
         chat_history = select_chat_history(
             conversation_retrieval=should_run_broad_retrieval,
@@ -165,6 +208,7 @@ class AssistantPipeline:
             "output_rewritten_query": resolution.rewritten_query,
             "did_merge_query": resolution.did_merge_query,
             "skip_broad_retrieval": resolution.skip_broad_retrieval,
+            "resolution_confidence": resolution.confidence,
             "path": resolution.path.value,
             "interaction_type": resolution.interaction_type.value if resolution.interaction_type else None,
             "question_source": resolution.question_source.value if resolution.question_source else None,

@@ -188,6 +188,7 @@ class ExpectedResponseType(str, Enum):
 class ActionValidationResult(str, Enum):
     EXECUTE = "execute"
     SKIP_NOT_FOUND = "skip_not_found"
+    SKIP_ALREADY_EXISTS = "skip_already_exists"
     CLARIFY_AMBIGUOUS_TARGET = "clarify_ambiguous_target"
     CLARIFY_MISSING_FIELDS = "clarify_missing_fields"
     REJECT_UNSUPPORTED_OPERATION = "reject_unsupported_operation"
@@ -278,6 +279,7 @@ class ApprovedConversationContext:
     conversation_retrieval_ran: bool
     conversation_context_status: Literal["not_run", "approved", "all_rejected", "empty"]
     approved_conversation_count: int
+    top_hop_rerank_score: float | None = None
 
     _internal_selected_topic_candidates: list[str] = field(default_factory=list)
     _internal_selected_hop_candidates: list[str] = field(default_factory=list)
@@ -449,6 +451,9 @@ class ValidatedKnowledgeAction:
     confidence: float = 0.0
     matched_fields: tuple[str, ...] = ()
     reason_summary: Optional[str] = None
+    requires_hitl: bool = False
+    factuality_concern: bool = False
+    hitl_reason: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -459,6 +464,7 @@ class RetrievalCandidateAssessment:
     confidence: float
     matched_fields: tuple[str, ...]
     reason_summary: str
+    matched_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -470,6 +476,10 @@ class LLMRetrievalValidationResult:
     ambiguous: bool
     reason_summary: str
     candidate_assessments: tuple[RetrievalCandidateAssessment, ...]
+    should_execute: bool = False
+    requires_hitl: bool = False
+    factuality_concern: bool = False
+    hitl_reason: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -661,6 +671,7 @@ class LastQAResolution:
     state: LastQAState | None
     did_merge_query: bool
     skip_broad_retrieval: bool
+    confidence: float = 0.0
 
     interaction_type: LastQAInteractionType | None = None
     question_source: QuestionSource = QuestionSource.NONE

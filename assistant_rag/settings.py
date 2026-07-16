@@ -15,7 +15,11 @@ from .content_keywords import (
     FILE_CREATION_VERB_KEYWORDS,
     POWERPOINT_FILE_KEYWORDS,
 )
-from .retrieval_policy import RETRIEVAL_PIPELINE_POLICY, RetrievalPipelinePolicy
+from .retrieval_policy import (
+    DEFAULT_CROSS_ENCODER_MIN_SCORE,
+    RETRIEVAL_PIPELINE_POLICY,
+    RetrievalPipelinePolicy,
+)
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -91,6 +95,28 @@ class OllamaSettings:
     num_ctx_action_extraction: int = 1536
     num_predict_action_extraction: int | None = 160
     temperature_action_extraction: float = 0.0
+
+    # Knowledge-only three-stage mutation pipeline. These dedicated tasks keep
+    # larger lossless context and strict output capacity from changing reminder
+    # validation, generic extraction, or Microsoft file planners.
+    model_knowledge_action_extraction: str = "qwen3.5:4b"
+    timeout_knowledge_action_extraction: float = 24.0
+    num_ctx_knowledge_action_extraction: int = 8192
+    num_predict_knowledge_action_extraction: int | None = 2048
+    temperature_knowledge_action_extraction: float = 0.0
+
+    model_knowledge_action_validation: str = "microsoft/Phi-4-mini-instruct-onnx"
+    timeout_knowledge_action_validation: float = 45.0
+    num_ctx_knowledge_action_validation: int = 16384
+    num_predict_knowledge_action_validation: int | None = 1024
+    temperature_knowledge_action_validation: float = 0.0
+    json_retry_count_knowledge_action_validation: int = 1
+
+    model_knowledge_content_finalization: str = "microsoft/Phi-4-mini-instruct-onnx"
+    timeout_knowledge_content_finalization: float = 90.0
+    num_ctx_knowledge_content_finalization: int = 16384
+    num_predict_knowledge_content_finalization: int | None = 2048
+    temperature_knowledge_content_finalization: float = 0.0
 
     # Task: GENERATE_CLARIFICATION
     model_generate_clarification: str = "qwen3.5:4b"
@@ -186,6 +212,7 @@ class RetrievalSettings:
     lexical_weight: float = 1.10
     semantic_weight: float = 1.0
     rerank_candidate_limit: int = RETRIEVAL_PIPELINE_POLICY.rrf_top_k
+    conversation_min_confidence_score: float = 0.50
 
     def __post_init__(self) -> None:
         RetrievalPipelinePolicy(
@@ -195,6 +222,10 @@ class RetrievalSettings:
         ).validate()
         if self.chroma_top_k != self.bm25_top_k:
             raise ValueError("OpenSearch and ChromaDB candidate limits must be identical")
+        if not 0.0 <= self.conversation_min_confidence_score <= 1.0:
+            raise ValueError(
+                "conversation_min_confidence_score must be between 0 and 1"
+            )
 
 
 @dataclass(frozen=True)
@@ -236,10 +267,14 @@ class RerankerSettings:
     model_name: str = "BAAI/bge-reranker-v2-m3"
     endpoint_url: str | None = None
     timeout_seconds: float = 6.0
-    min_score: float = 0.30
+    min_score: float = DEFAULT_CROSS_ENCODER_MIN_SCORE
     device: str | None = None
     batch_size: int = 24
     max_candidates: int = 20
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.min_score <= 1.0:
+            raise ValueError("Cross-encoder minimum confidence must be between 0 and 1")
 
 
 @dataclass(frozen=True)
@@ -424,7 +459,7 @@ class RetrievalValidationSettings:
     knowledge_llm_validation_model: str | None = None
     knowledge_llm_validation_min_confidence: float = 0.86
     knowledge_llm_validation_json_retry_count: int = 1
-    knowledge_llm_validation_max_candidates: int = 3
+    knowledge_llm_validation_max_candidates: int = 5
     knowledge_llm_validation_failure_policy: str = "fail_closed"
 
     reminder_llm_validation_enabled: bool = True
@@ -534,6 +569,8 @@ class ContextFilterSettings:
 class GeneralPurposeSettings:
     general_sub_branch_detector_enabled: bool = True
     general_sub_branch_confidence_threshold: float = 0.65
+    support_question_resolution_min_confidence: float = 0.90
+    conversation_followup_min_score: float = 0.65
     general_sub_branch_fallback_mode: str = "new_conversation_topic"
     general_sub_branch_detector_json_retry_count: int = 1
     # Controls optional Microsoft file creation; answer_generation always runs.
@@ -630,6 +667,22 @@ class ProductionSettings:
                 num_ctx_action_extraction=_get_int("OLLAMA_ACTION_EXTRACTION_NUM_CTX", OllamaSettings.num_ctx_action_extraction),
                 num_predict_action_extraction=_get_int("OLLAMA_ACTION_EXTRACTION_NUM_PREDICT", OllamaSettings.num_predict_action_extraction) if os.getenv("OLLAMA_ACTION_EXTRACTION_NUM_PREDICT") else OllamaSettings.num_predict_action_extraction,
                 temperature_action_extraction=_get_float("OLLAMA_ACTION_EXTRACTION_TEMPERATURE", OllamaSettings.temperature_action_extraction),
+                model_knowledge_action_extraction=os.getenv("OLLAMA_KNOWLEDGE_ACTION_EXTRACTION_MODEL", OllamaSettings.model_knowledge_action_extraction),
+                timeout_knowledge_action_extraction=_get_float("OLLAMA_KNOWLEDGE_ACTION_EXTRACTION_TIMEOUT", OllamaSettings.timeout_knowledge_action_extraction),
+                num_ctx_knowledge_action_extraction=_get_int("OLLAMA_KNOWLEDGE_ACTION_EXTRACTION_NUM_CTX", OllamaSettings.num_ctx_knowledge_action_extraction),
+                num_predict_knowledge_action_extraction=_get_int("OLLAMA_KNOWLEDGE_ACTION_EXTRACTION_NUM_PREDICT", OllamaSettings.num_predict_knowledge_action_extraction) if os.getenv("OLLAMA_KNOWLEDGE_ACTION_EXTRACTION_NUM_PREDICT") else OllamaSettings.num_predict_knowledge_action_extraction,
+                temperature_knowledge_action_extraction=_get_float("OLLAMA_KNOWLEDGE_ACTION_EXTRACTION_TEMPERATURE", OllamaSettings.temperature_knowledge_action_extraction),
+                model_knowledge_action_validation=os.getenv("OLLAMA_KNOWLEDGE_ACTION_VALIDATION_MODEL", OllamaSettings.model_knowledge_action_validation),
+                timeout_knowledge_action_validation=_get_float("OLLAMA_KNOWLEDGE_ACTION_VALIDATION_TIMEOUT", OllamaSettings.timeout_knowledge_action_validation),
+                num_ctx_knowledge_action_validation=_get_int("OLLAMA_KNOWLEDGE_ACTION_VALIDATION_NUM_CTX", OllamaSettings.num_ctx_knowledge_action_validation),
+                num_predict_knowledge_action_validation=_get_int("OLLAMA_KNOWLEDGE_ACTION_VALIDATION_NUM_PREDICT", OllamaSettings.num_predict_knowledge_action_validation) if os.getenv("OLLAMA_KNOWLEDGE_ACTION_VALIDATION_NUM_PREDICT") else OllamaSettings.num_predict_knowledge_action_validation,
+                temperature_knowledge_action_validation=_get_float("OLLAMA_KNOWLEDGE_ACTION_VALIDATION_TEMPERATURE", OllamaSettings.temperature_knowledge_action_validation),
+                json_retry_count_knowledge_action_validation=_get_int("KNOWLEDGE_LLM_VALIDATION_JSON_RETRY_COUNT", OllamaSettings.json_retry_count_knowledge_action_validation),
+                model_knowledge_content_finalization=os.getenv("OLLAMA_KNOWLEDGE_CONTENT_FINALIZATION_MODEL", OllamaSettings.model_knowledge_content_finalization),
+                timeout_knowledge_content_finalization=_get_float("OLLAMA_KNOWLEDGE_CONTENT_FINALIZATION_TIMEOUT", OllamaSettings.timeout_knowledge_content_finalization),
+                num_ctx_knowledge_content_finalization=_get_int("OLLAMA_KNOWLEDGE_CONTENT_FINALIZATION_NUM_CTX", OllamaSettings.num_ctx_knowledge_content_finalization),
+                num_predict_knowledge_content_finalization=_get_int("OLLAMA_KNOWLEDGE_CONTENT_FINALIZATION_NUM_PREDICT", OllamaSettings.num_predict_knowledge_content_finalization) if os.getenv("OLLAMA_KNOWLEDGE_CONTENT_FINALIZATION_NUM_PREDICT") else OllamaSettings.num_predict_knowledge_content_finalization,
+                temperature_knowledge_content_finalization=_get_float("OLLAMA_KNOWLEDGE_CONTENT_FINALIZATION_TEMPERATURE", OllamaSettings.temperature_knowledge_content_finalization),
                 model_generate_clarification=os.getenv("OLLAMA_GENERATE_CLARIFICATION_MODEL", OllamaSettings.model_generate_clarification),
                 model_generate_clarification_fallback=os.getenv("OLLAMA_GENERATE_CLARIFICATION_FALLBACK_MODEL", OllamaSettings.model_generate_clarification_fallback) or None,
                 timeout_generate_clarification=_get_float("OLLAMA_GENERATE_CLARIFICATION_TIMEOUT", OllamaSettings.timeout_generate_clarification),
@@ -708,6 +761,10 @@ class ProductionSettings:
                 rerank_candidate_limit=_get_int(
                     "RERANKER_TOP_K",
                     _get_int("ASSISTANT_RERANK_CANDIDATE_LIMIT", RetrievalSettings.rerank_candidate_limit),
+                ),
+                conversation_min_confidence_score=_get_float(
+                    "CONVERSATION_MIN_CONFIDENCE_SCORE",
+                    RetrievalSettings.conversation_min_confidence_score,
                 ),
             ),
             opensearch=OpenSearchSettings(
@@ -1137,6 +1194,14 @@ class ProductionSettings:
             general_purpose=GeneralPurposeSettings(
                 general_sub_branch_detector_enabled=_get_bool("GENERAL_SUB_BRANCH_DETECTOR_ENABLED", GeneralPurposeSettings.general_sub_branch_detector_enabled),
                 general_sub_branch_confidence_threshold=_get_float("GENERAL_SUB_BRANCH_CONFIDENCE_THRESHOLD", GeneralPurposeSettings.general_sub_branch_confidence_threshold),
+                support_question_resolution_min_confidence=_get_float(
+                    "SUPPORT_QUESTION_RESOLUTION_MIN_CONFIDENCE",
+                    GeneralPurposeSettings.support_question_resolution_min_confidence,
+                ),
+                conversation_followup_min_score=_get_float(
+                    "CONVERSATION_FOLLOWUP_MIN_SCORE",
+                    GeneralPurposeSettings.conversation_followup_min_score,
+                ),
                 general_sub_branch_fallback_mode=os.getenv("GENERAL_SUB_BRANCH_FALLBACK_MODE", GeneralPurposeSettings.general_sub_branch_fallback_mode),
                 general_sub_branch_detector_json_retry_count=_get_int("GENERAL_SUB_BRANCH_DETECTOR_JSON_RETRY_COUNT", GeneralPurposeSettings.general_sub_branch_detector_json_retry_count),
                 content_composer_enabled=_get_bool("CONTENT_COMPOSER_ENABLED", GeneralPurposeSettings.content_composer_enabled),

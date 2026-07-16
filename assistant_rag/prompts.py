@@ -33,6 +33,8 @@ FAST_ROUTING_STAGES = frozenset(
 MUTATION_STAGES = frozenset(
     {
         "action_detection",
+        "knowledge_action_extraction",
+        "knowledge_content_finalization",
         "risky_action_validation",
         "action_planning",
     }
@@ -41,7 +43,16 @@ MUTATION_STAGES = frozenset(
 RETRIEVAL_VALIDATION_STAGES = frozenset(
     {
         "knowledge_retrieval_validation",
+        "knowledge_action_validation",
         "reminder_retrieval_validation",
+    }
+)
+
+KNOWLEDGE_LLM_STAGES = frozenset(
+    {
+        "knowledge_action_extraction",
+        "knowledge_action_validation",
+        "knowledge_content_finalization",
     }
 )
 
@@ -69,6 +80,9 @@ PROMPT_BUDGETS = {
     "general_sub_branch_detector": 320,
     "content_composer_react": 360,
     "action_detection": 900,
+    "knowledge_action_extraction": 900,
+    "knowledge_action_validation": 2200,
+    "knowledge_content_finalization": 1800,
     "risky_action_validation": 700,
     "action_planning": 360,
     "knowledge_retrieval_validation": 760,
@@ -90,6 +104,9 @@ STAGE_PAYLOAD_LIMITS = {
     "general_sub_branch_detector": (420, 260, 220, 320, 5, 2),
     "content_composer_react": (420, 260, 220, 340, 5, 2),
     "action_detection": (700, 640, 420, 760, 10, 4),
+    "knowledge_action_extraction": (900, 700, 420, 900, 10, 4),
+    "knowledge_action_validation": (1200, 700, 420, 4000, 12, 5),
+    "knowledge_content_finalization": (1200, 700, 420, 3200, 10, 5),
     "risky_action_validation": (620, 560, 360, 640, 8, 4),
     "action_planning": (520, 320, 260, 360, 6, 3),
     "knowledge_retrieval_validation": (620, 520, 320, 720, 8, 4),
@@ -280,6 +297,28 @@ class PromptContext:
             "chat_history": _redact(self.resolved_chat_history()),
         }
 
+        if self.stage in KNOWLEDGE_LLM_STAGES:
+            # Knowledge mutation must be able to validate a short detail near
+            # the end of any retrieved SQL chunk and preserve the rest of that
+            # chunk during finalization. Keep the bounded top-five candidate
+            # payload, current query, and canonical history lossless here.
+            base["raw_query"] = _redact(self.raw_query)
+            base["rewritten_query"] = _redact(self.rewritten_query)
+            base["metadata"] = _compact_value(
+                self.metadata,
+                max_string=metadata_max,
+                max_items=max_items,
+                max_depth=max_depth,
+            )
+            base["platform_context"] = _compact_value(
+                _redact(self.platform_context),
+                max_string=platform_max,
+                max_items=max_items,
+                max_depth=max_depth,
+            )
+            base["extra"] = _redact(self.extra)
+            return _finalize_stage_payload(base)
+
         if self.stage in FAST_ROUTING_STAGES:
             base["metadata"] = _compact_value(_select_keys(self.metadata, FAST_METADATA_KEYS), max_string=metadata_max, max_items=max_items, max_depth=max_depth)
             base["platform_context"] = _compact_value(_redact(_select_keys(self.platform_context, FAST_PLATFORM_KEYS)), max_string=platform_max, max_items=max_items, max_depth=max_depth)
@@ -356,6 +395,10 @@ def _task_guidance(name: str) -> tuple[str, ...]:
             "Extract only schema-valid mutations for the selected branch.",
             "Do not turn normal conversation into durable state changes.",
         ),
+        "knowledge_action_extraction": (
+            "Select exactly one already-authorized knowledge mutation and extract only its content fields.",
+            "Never use history to invent a mutation or silently change add, delete, or modify.",
+        ),
         "risky_action_validation": (
             "High-precision safety gate for destructive or state-changing actions.",
             "When uncertain, reject or require clarification.",
@@ -375,6 +418,14 @@ def _task_guidance(name: str) -> tuple[str, ...]:
         "knowledge_retrieval_validation": (
             "High-precision SQL candidate validator for knowledge mutations.",
             "Prefer clarification over risky delete/modify.",
+        ),
+        "knowledge_action_validation": (
+            "Validate the requested knowledge mutation against every SQL-rehydrated candidate.",
+            "Execute only at high confidence; distinguish safe no-op from HITL clarification.",
+        ),
+        "knowledge_content_finalization": (
+            "Produce exactly one canonical content string after validation.",
+            "For modify, preserve unrelated text from the selected chunk and change only the validated target detail.",
         ),
         "reminder_retrieval_validation": (
             "High-precision SQL-only candidate validator for reminder lifecycle changes.",
@@ -645,6 +696,30 @@ GENERATE_PPTX_PLANNER_SCHEMA = {
 }
 
 
+KNOWLEDGE_ACTION_EXTRACTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "action",
+        "text_content",
+        "original_text",
+        "replacement_text",
+        "confidence",
+        "missing_fields",
+        "reason_summary",
+    ],
+    "properties": {
+        "action": {"enum": ["add", "delete", "modify"]},
+        "text_content": {"type": "string"},
+        "original_text": {"type": "string"},
+        "replacement_text": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "missing_fields": {"type": "array", "items": {"type": "string"}},
+        "reason_summary": {"type": "string"},
+    },
+}
+
+
 KNOWLEDGE_RETRIEVAL_VALIDATION_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -654,14 +729,19 @@ KNOWLEDGE_RETRIEVAL_VALIDATION_SCHEMA = {
         "selected_candidate_keys",
         "confidence",
         "ambiguous",
+        "should_execute",
+        "requires_hitl",
+        "factuality_concern",
+        "reason_summary",
         "candidate_assessments",
     ],
     "properties": {
-        "operation": {"enum": ["delete", "modify"]},
+        "operation": {"enum": ["add", "delete", "modify"]},
         "validation_result": {
             "enum": [
                 "EXECUTE",
                 "SKIP_NOT_FOUND",
+                "SKIP_ALREADY_EXISTS",
                 "CLARIFY_AMBIGUOUS_TARGET",
                 "CLARIFY_MISSING_FIELDS",
                 "REJECT_UNSUPPORTED_OPERATION",
@@ -671,20 +751,47 @@ KNOWLEDGE_RETRIEVAL_VALIDATION_SCHEMA = {
         "selected_candidate_keys": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "ambiguous": {"type": "boolean"},
+        "should_execute": {"type": "boolean"},
+        "requires_hitl": {"type": "boolean"},
+        "factuality_concern": {"type": "boolean"},
+        "reason_summary": {"type": "string"},
         "candidate_assessments": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["candidate_key", "matches_target", "confidence", "matched_fields"],
+                "required": [
+                    "candidate_key",
+                    "matches_target",
+                    "action_compatible",
+                    "confidence",
+                    "matched_fields",
+                    "reason_summary",
+                    "matched_text",
+                ],
                 "properties": {
                     "candidate_key": {"type": "string"},
                     "matches_target": {"type": "boolean"},
+                    "action_compatible": {"type": "boolean"},
                     "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                     "matched_fields": {"type": "array", "items": {"type": "string"}},
+                    "reason_summary": {"type": "string"},
+                    "matched_text": {"type": "string"},
                 },
             },
         },
+    },
+}
+
+
+KNOWLEDGE_CONTENT_FINALIZATION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["final_content", "confidence", "reason_summary"],
+    "properties": {
+        "final_content": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "reason_summary": {"type": "string"},
     },
 }
 
@@ -839,8 +946,9 @@ def _default_templates() -> dict[str, PromptTemplate]:
             ),
             decision_rules=(
                 "Choose operation_kind before intent; intent must agree with it. Map durable_knowledge to knowledge_facts, reminder_lifecycle to reminder, clarification_reply to clarification, and none to general_response.",
-                "durable_knowledge means the user asks to retain, inspect, change, or remove the user's stored facts, preferences, rules, notes, or project knowledge. It also covers direct saved-note or stored-record retrieval. An imperative 'remember' is retention; a question merely asking whether or what the assistant remembers is informational none and must not authorize a mutation.",
-                "reminder_lifecycle means the user asks to create, inspect, change, or remove a scheduled future notification. Choose it for requested notification creation, an explicit lifecycle change, or a clear first-person future commitment with an identifiable event and time; an ordinary reminder lookup question remains none.",
+                "durable_knowledge is mutation-only: choose it only for one explicit request to add, modify, or delete the user's stored facts, preferences, rules, notes, or project knowledge.",
+                "reminder_lifecycle is mutation-only: choose it only for one explicit request to add, modify, delete, turn on, or turn off a scheduled future notification.",
+                "Every request to search, find, list, show, inspect, look up, retrieve, recall, read, or answer a question about stored knowledge or reminders is informational none and belongs to general_response, even when it mentions an earlier add, modify, delete, enable, or disable action.",
                 "Do not infer reminder_lifecycle from reminder lookup questions, vague plans, third-party facts, discussion of future topics, or lifecycle words used in ordinary conversation.",
                 "Choose clarification_reply only for a direct answer to an active mandatory assistant question; a new request is never clarification.",
                 "Choose none for every other informational question, writing task, or conversation. Confidence measures branch ownership, not mutation completeness; use high confidence for exact category matches, while missing mutation fields remain with their owning state branch.",
@@ -900,6 +1008,39 @@ def _default_templates() -> dict[str, PromptTemplate]:
             ),
             safety_rules=_safety_rules_for_stage("action_detection"),
             error_handling=("If vague, risky, or cross-branch, return missing_fields or risk_flags instead of executable actions.",),
+        ),
+        "knowledge_action_extraction": PromptTemplate(
+            name="knowledge_action_extraction",
+            role=(
+                "First-stage knowledge mutation extractor for an already selected knowledge branch. "
+                "Choose exactly one action and extract only the content belonging to that action."
+            ),
+            non_responsibilities=(
+                "Do not retrieve knowledge.",
+                "Do not validate truth or candidate matches.",
+                "Do not execute, write, index, answer, or invent content.",
+                "Do not return more than one action.",
+            ),
+            inputs=(
+                "raw current user query",
+                "rewritten query",
+                "canonical chat_history",
+                "trusted request metadata",
+            ),
+            output_contract="Return strict JSON matching KNOWLEDGE_ACTION_EXTRACTION_SCHEMA.",
+            decision_rules=(
+                "Choose only add, delete, or modify, and only the one explicitly requested in the current query.",
+                "For add, copy the complete fact to store into text_content and leave original_text and replacement_text empty.",
+                "For delete, copy the complete target fact into text_content and leave original_text and replacement_text empty.",
+                "For modify, leave text_content empty and copy the old fact/detail into original_text and its requested replacement into replacement_text.",
+                "Every non-empty content field must be grounded verbatim after case and whitespace normalization. ADD text_content and MODIFY replacement_text must come from the current raw/rewritten query. DELETE text_content and MODIFY original_text may also resolve a clearly referenced target from canonical chat_history. Never source a new fact or replacement from history. Do not paraphrase or expand content.",
+                "Current-query action wording is authoritative. History may resolve a clearly referenced fact but may not supply an omitted mutation or replacement.",
+                "If an action-specific required content field is unavailable, keep it empty and list it in missing_fields.",
+            ),
+            safety_rules=_safety_rules_for_stage("knowledge_action_extraction"),
+            error_handling=(
+                "If the request contains multiple actions, is ambiguous, or lacks required content, return low confidence and missing_fields.",
+            ),
         ),
         "knowledge_operation_recovery": PromptTemplate(
             name="knowledge_operation_recovery",
@@ -1002,6 +1143,75 @@ def _default_templates() -> dict[str, PromptTemplate]:
             safety_rules=_safety_rules_for_stage("knowledge_retrieval_validation"),
             error_handling=("If candidate list is empty or confidence is too low, return a non-executable validation result.",),
         ),
+        "knowledge_action_validation": PromptTemplate(
+            name="knowledge_action_validation",
+            role=(
+                "Second-stage knowledge mutation validator. Determine whether the extracted action should execute "
+                "by comparing its content with every supplied SQL-rehydrated knowledge candidate."
+            ),
+            non_responsibilities=(
+                "Do not retrieve additional data.",
+                "Do not mutate SQL or indexes.",
+                "Do not invent candidate keys, action content, or replacement content.",
+                "Do not produce final indexed content.",
+            ),
+            inputs=(
+                "operation",
+                "raw and rewritten query",
+                "canonical chat_history",
+                "extracted text_content/original_text/replacement_text",
+                "all SQL-rehydrated candidate chunks",
+                "minimum confidence and action policy",
+            ),
+            output_contract="Return strict JSON matching KNOWLEDGE_RETRIEVAL_VALIDATION_SCHEMA.",
+            decision_rules=(
+                "Assess each supplied candidate independently, including whether a short target detail occurs semantically inside a longer chunk.",
+                "retrieval_score and rerank_score are non-gating diagnostic evidence in this knowledge-mutation stage. A low or negative score must never override a content match found in the full SQL text.",
+                "ADD executes only when the proposed content is coherent and is not already represented by a candidate. An existing equivalent fact returns SKIP_ALREADY_EXISTS.",
+                "DELETE executes only when exactly one active candidate is wholly represented by the requested target. If only a detail inside a multi-detail chunk matches, require clarification so unrelated knowledge is never deleted.",
+                "MODIFY executes only when exactly one active candidate matches original_text and replacement_text is complete and compatible.",
+                "For an obvious factual impossibility in newly asserted ADD text_content or MODIFY replacement_text, such as arithmetic known to be false, set factuality_concern=true, requires_hitl=true, and return CLARIFY_MISSING_FIELDS. This takes precedence over duplicate handling. Never apply factuality rejection to a DELETE target, a MODIFY original_text, subjective preferences, personal statements, plans, or uncertain real-world claims.",
+                "Low confidence, an ambiguous target, conflicting candidates, or unsafe content requires HITL clarification and must never execute.",
+                "Only selected_candidate_keys supplied by the caller are permitted. ADD execution selects no candidate; DELETE/MODIFY execution selects exactly one.",
+                "For every candidate, matched_text must be the exact minimal verbatim excerpt from that candidate that supports matches_target, or an empty string when matches_target is false. Never paraphrase matched_text.",
+                "should_execute is true if and only if validation_result is EXECUTE. requires_hitl is true only for a clarification result.",
+            ),
+            safety_rules=_safety_rules_for_stage("knowledge_action_validation"),
+            error_handling=(
+                "On uncertainty or inconsistent evidence, fail closed with a clarification result and low confidence.",
+            ),
+        ),
+        "knowledge_content_finalization": PromptTemplate(
+            name="knowledge_content_finalization",
+            role=(
+                "Third-stage knowledge content finalizer. After high-confidence validation, produce exactly one "
+                "canonical content string for the already fixed action and target."
+            ),
+            non_responsibilities=(
+                "Do not change the selected action or candidate.",
+                "Do not validate again, retrieve, execute, write, index, or claim success.",
+                "Do not invent facts or add commentary around final_content.",
+            ),
+            inputs=(
+                "operation",
+                "raw and rewritten query",
+                "canonical chat_history",
+                "extracted action content",
+                "selected SQL candidate content",
+                "high-confidence validation decision",
+            ),
+            output_contract="Return strict JSON matching KNOWLEDGE_CONTENT_FINALIZATION_SCHEMA.",
+            decision_rules=(
+                "For ADD, preserve the extracted fact exactly except for whitespace normalization; do not paraphrase, expand, or omit it.",
+                "For MODIFY, edit the selected existing chunk: replace only the validated old detail with the requested replacement and preserve every unrelated fact in that chunk.",
+                "For DELETE, copy the selected candidate content exactly into final_content for final integrity checking; it will not be indexed as new content.",
+                "Use chat_history only to preserve explicitly resolved references; never add new facts from history.",
+            ),
+            safety_rules=_safety_rules_for_stage("knowledge_content_finalization"),
+            error_handling=(
+                "If one safe final content string cannot be produced, return an empty string and low confidence.",
+            ),
+        ),
         "reminder_retrieval_validation": PromptTemplate(
             name="reminder_retrieval_validation",
             role=(
@@ -1084,6 +1294,7 @@ def _default_templates() -> dict[str, PromptTemplate]:
             output_contract="Return a JSON data object matching the caller-provided schema. Never return, describe, or copy a JSON Schema.",
             decision_rules=(
                 "For clarification, ask one short, concrete question for the supplied missing field or ambiguity; do not ask for speculative preferences, architecture, scale, or unrelated context.",
+                "For clarification, generate a new question for the current raw_query and rewritten_query; never reuse a precomputed clarification_question from request metadata.",
                 "For human_supporting, ask at most one optional next-step question after a useful answer exists.",
                 "For reminder_supporting, ask one useful reminder-specific follow-up only when the supplied context supports it.",
                 "Do not mix question types.",
@@ -1213,6 +1424,8 @@ def _default_messages() -> dict[str, str]:
         "knowledge_missing_content": "What knowledge fact would you like me to save?",
         "knowledge_missing_target": "Which stored knowledge item would you like me to change or remove?",
         "knowledge_missing_replacement": "What should replace the current stored knowledge?",
+        "knowledge_factuality_confirmation": "That new fact may be incorrect. What corrected fact would you like me to save?",
+        "knowledge_partial_chunk_delete": "That fact is part of a larger stored knowledge item. Please ask me to modify that item so I can preserve its unrelated facts.",
         "reminder_missing_action": "Which reminder action should I perform?",
         "reminder_missing_subject": "What should the reminder be about?",
         "reminder_missing_time": "When should I remind you?",

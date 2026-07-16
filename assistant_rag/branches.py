@@ -21,7 +21,6 @@ from .contracts import (
     GeneralSubBranch,
     GeneralSubBranchDecision,
     Intent,
-    LastQAInteractionType,
     PersistenceMode,
     PipelineContext,
     QuestionSource,
@@ -36,22 +35,22 @@ from .contracts import (
 
 SUB_BRANCH_PROMPT_POLICIES = {
     GeneralSubBranch.SUPPORT_QUESTION_ANSWER: {
-        "chat_history_role": "The user is answering a previous human supporting question.",
-        "response_goal": "Use the prior supporting question, expected_response_type, previous assistant response, and current user answer to enhance, refine, continue, or personalize the prior answer.",
-        "database_update_mode": "append_to_existing_topic_or_branch_from_existing_hop",
+        "chat_history_role": "User is answering a prior supporting question.",
+        "response_goal": "Enhance/refine prior answer using current reply.",
+        "database_update_mode": "append_to_existing_topic",
         "allowed_database_updates": ("conversation_hop_append",),
-        "prohibited_database_updates": ("new_topic_creation_unless_no_valid_topic", "knowledge_mutation", "reminder_mutation", "notification_write"),
+        "prohibited_database_updates": ("new_topic_creation", "knowledge_mutation", "reminder_mutation", "notification_write"),
     },
     GeneralSubBranch.CONVERSATION_FOLLOW_UP: {
-        "chat_history_role": "The user is continuing an approved existing conversation.",
-        "response_goal": "Use approved chat_history to continue the same topic while keeping the current user query primary.",
+        "chat_history_role": "User is continuing an approved existing conversation.",
+        "response_goal": "Use chat history to stay on topic.",
         "database_update_mode": "append_to_existing_topic",
         "allowed_database_updates": ("conversation_hop_append",),
         "prohibited_database_updates": ("new_topic_creation", "knowledge_mutation", "reminder_mutation", "notification_write"),
     },
     GeneralSubBranch.NEW_CONVERSATION_TOPIC: {
-        "chat_history_role": "The user is starting a new conversation topic.",
-        "response_goal": "Answer the current query directly. Do not force continuity from unrelated old history.",
+        "chat_history_role": "User is starting fresh.",
+        "response_goal": "Answer directly without forcing old context.",
         "database_update_mode": "create_or_ensure_new_topic_then_append_hop",
         "allowed_database_updates": ("conversation_topic_create_or_ensure", "conversation_hop_append"),
         "prohibited_database_updates": ("knowledge_mutation", "reminder_mutation", "notification_write"),
@@ -69,6 +68,7 @@ from .action_detection import (
     DeterministicActionDetector,
     action_payload_is_authorized,
     classify_action_request,
+    request_has_explicit_mutation,
 )
 from .generation import QuestionGenerationStrategy
 from .branch_orchestration import ValidatedActionBuilder
@@ -80,6 +80,10 @@ def _mutation_clarification_message_key(domain: str, missing_fields: list[str]) 
     """Choose a fast, user-facing question for predictable mutation gaps."""
     missing = {str(field).casefold() for field in missing_fields}
     if domain == "knowledge":
+        if "factuality_confirmation" in missing:
+            return "knowledge_factuality_confirmation"
+        if "partial_chunk_delete" in missing:
+            return "knowledge_partial_chunk_delete"
         if {"replacement_text", "replacement", "new_text"} & missing:
             return "knowledge_missing_replacement"
         if {"target_description", "target", "target_entities"} & missing:
@@ -208,6 +212,9 @@ def _validated_knowledge_from_dict(payload: dict[str, Any]) -> ValidatedKnowledg
         confidence=float(payload.get("confidence", 1.0)),
         matched_fields=tuple(payload.get("matched_fields") or ()),
         reason_summary=payload.get("reason_summary"),
+        requires_hitl=bool(payload.get("requires_hitl", False)),
+        factuality_concern=bool(payload.get("factuality_concern", False)),
+        hitl_reason=payload.get("hitl_reason"),
     )
 
 
@@ -272,10 +279,12 @@ class ClarificationBranch:
         self.clarification_strategy = clarification_strategy
 
     def execute(self, context: PipelineContext, repository: AssistantRepository) -> BranchResult:
-        question: GeneratedQuestion | None = context.request.metadata.get("clarification_question")
-        if not question:
-            if self.clarification_strategy:
-                question = self.clarification_strategy.generate(context)
+        # A clarification decision belongs to the current turn. Always invoke
+        # the configured generator instead of reusing a question carried in
+        # request metadata from an earlier turn.
+        question: GeneratedQuestion | None = None
+        if self.clarification_strategy:
+            question = self.clarification_strategy.generate(context)
         if not question:
             fallback = self.config.question_generation.fallback_policy if self.config else "fallback_message"
             question = GeneratedQuestion(
@@ -342,16 +351,23 @@ class GeneralResponseBranch:
 
         from .general_sub_branch import GeneralSubBranchValidator, GeneralPersistencePlanBuilder
         
-        decision = self._deterministic_general_decision(context, approved_context)
-        if decision and self.general_purpose_config:
-            plan = GeneralPersistencePlanBuilder().build_plan(decision, context, self.general_purpose_config)
-            answer_mode = self._general_sub_branch_to_answer_mode(decision.sub_branch)
-        elif self.sub_branch_detector and self.general_purpose_config:
-            decision = self.sub_branch_detector.detect(
-                context,
-                self.general_purpose_config,
-                merged_supporting_detail,
-            )
+        if self.general_purpose_config:
+            if self.sub_branch_detector:
+                decision = self.sub_branch_detector.detect(
+                    context,
+                    self.general_purpose_config,
+                    merged_supporting_detail,
+                )
+            else:
+                decision = GeneralSubBranchDecision(
+                    sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
+                    confidence=1.0,
+                    persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
+                    reason_summary=(
+                        "Deterministic rule fired: NEW_CONVERSATION_TOPIC "
+                        "because no detector is configured."
+                    ),
+                )
             decision = GeneralSubBranchValidator().validate(decision, context, self.general_purpose_config)
             plan = GeneralPersistencePlanBuilder().build_plan(decision, context, self.general_purpose_config)
             answer_mode = self._general_sub_branch_to_answer_mode(decision.sub_branch)
@@ -498,6 +514,14 @@ class GeneralResponseBranch:
             return BranchResult(
                 response_type=ResponseType.ERROR,
                 fallback_or_error_message="The database transaction failed and was rolled back.",
+                warnings=list(composer_result.content_warnings) if composer_result else [],
+                # File creation completed before conversation persistence. Keep
+                # every successful artifact visible in the chatbot even when
+                # the hop transaction fails; platform delivery is blocked for
+                # error responses by PlatformSelector.
+                platform_payload={"artifacts": list(composer_result.artifacts)}
+                if composer_result and composer_result.artifacts
+                else {},
             )
             
         return BranchResult(
@@ -511,49 +535,6 @@ class GeneralResponseBranch:
             database_write_result={"conversation_hop_id": hop.hop_id},
             indexing_job_result={"conversation_hop_job_id": hop.outbox_job_id},
             platform_payload={"artifacts": list(composer_result.artifacts)} if composer_result and composer_result.artifacts else {},
-        )
-
-    def _deterministic_general_decision(
-        self, context: PipelineContext, approved_context: Any
-    ) -> GeneralSubBranchDecision | None:
-        authoritative = self._authoritative_last_qa_decision(context)
-        if authoritative:
-            return authoritative
-        if context.last_qa_state:
-            return None
-        if getattr(approved_context, "approved_conversation_history", []):
-            return None
-        return GeneralSubBranchDecision(
-            sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
-            confidence=1.0,
-            persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
-            reason_summary="No approved prior context; deterministic new conversation topic.",
-        )
-
-    def _authoritative_last_qa_decision(self, context: PipelineContext) -> GeneralSubBranchDecision | None:
-        trace = context.last_qa_trace or {}
-        state = context.last_qa_state
-        if not state:
-            return None
-        if not trace.get("skip_broad_retrieval") or not trace.get("is_authoritative_state"):
-            return None
-        if not state.linked_topic_id or not state.linked_hop_id:
-            return None
-
-        interaction_type = trace.get("interaction_type")
-        if interaction_type == LastQAInteractionType.SUPPORTING_QUESTION_ANSWER.value:
-            sub_branch = GeneralSubBranch.SUPPORT_QUESTION_ANSWER
-        else:
-            sub_branch = GeneralSubBranch.CONVERSATION_FOLLOW_UP
-
-        return GeneralSubBranchDecision(
-            sub_branch=sub_branch,
-            confidence=1.0,
-            persistence_mode=PersistenceMode.APPEND_TO_EXISTING_TOPIC,
-            selected_topic_id=state.linked_topic_id,
-            selected_hop_id=state.linked_hop_id,
-            selected_parent_hop_id=state.linked_hop_id,
-            reason_summary="Reused authoritative Last-QA latest-context resolution.",
         )
 
     def _general_sub_branch_to_answer_mode(self, sub_branch: Any) -> AnswerMode:
@@ -636,6 +617,7 @@ class KnowledgeFactsBranch:
     retriever: HybridRetriever | None = None
     context_filter: ContextFilter | None = None
     llm: LLMClient | None = None
+    knowledge_mutation_pipeline: Any | None = None
 
     def _generate_clarification(self, context: PipelineContext, missing_fields: list[str], ambiguity_reason: str) -> BranchResult:
         question = GeneratedQuestion(
@@ -652,34 +634,25 @@ class KnowledgeFactsBranch:
         )
 
     def execute(self, context: PipelineContext, repository: AssistantRepository) -> BranchResult:
+        # The production knowledge path begins with the dedicated LLM extractor.
+        # Keep the legacy deterministic guard only for callers that have not
+        # opted into the three-stage mutation pipeline.
+        if (
+            self.knowledge_mutation_pipeline is None
+            and not request_has_explicit_mutation(
+                context.request, Intent.KNOWLEDGE_FACTS
+            )
+        ):
+            return self._generate_clarification(
+                context,
+                ["action_keyword"],
+                "Read-only knowledge requests belong to general-purpose.",
+            )
         actions = list(context.request.metadata.get("knowledge_actions", []))
         detector = self.action_detector or DeterministicActionDetector()
         detection = detector.detect(
             context.request, context.rewritten_query, Intent.KNOWLEDGE_FACTS
         )
-        if detection.metadata.get("knowledge_lookup"):
-            if self.retriever is None:
-                return self._generate_clarification(
-                    context,
-                    ["target_description"],
-                    "Knowledge retrieval is unavailable.",
-                )
-            knowledge_results = retrieve_knowledge(
-                retriever=self.retriever,
-                repository=repository,
-                user_id=context.request.user_id,
-                query=context.rewritten_query,
-            )
-            if knowledge_results:
-                return BranchResult(
-                    response_type=ResponseType.NORMAL,
-                    normal_response_text=str(knowledge_results[0].payload.get("text", "")),
-                )
-            return self._generate_clarification(
-                context,
-                ["target_description"],
-                "No single stored knowledge item matched the lookup.",
-            )
         if detection.requires_clarification:
             return self._generate_clarification(
                 context,
@@ -707,10 +680,19 @@ class KnowledgeFactsBranch:
             _validated_knowledge_from_dict(action)
             for action in context.request.metadata.get("validated_knowledge_actions", [])
         ] if context.request.metadata.get("confirmation_approved") else []
-        if self.validated_action_builder:
+        if self.knowledge_mutation_pipeline or self.validated_action_builder:
             if prevalidated_actions:
                 validated_actions = prevalidated_actions
+            elif self.knowledge_mutation_pipeline:
+                validated_actions = [
+                    self.knowledge_mutation_pipeline.build_action(
+                        context=context,
+                        action_payload=actions[0],
+                        repository=repository,
+                    )
+                ]
             else:
+                assert self.validated_action_builder is not None
                 validated_actions = self.validated_action_builder.build_knowledge_actions(
                     context.request.user_id,
                     actions,
@@ -740,10 +722,20 @@ class KnowledgeFactsBranch:
             for v_act in validated_actions:
                 if v_act.validation_result in (ActionValidationResult.CLARIFY_AMBIGUOUS_TARGET, ActionValidationResult.CLARIFY_MISSING_FIELDS):
                     clarification_needed = True
-                    if v_act.action is KnowledgeAction.MODIFY and not v_act.new_text:
+                    if v_act.factuality_concern:
+                        clarification_missing_fields.append(
+                            "factuality_confirmation"
+                        )
+                    elif v_act.hitl_reason == "partial_chunk_delete":
+                        clarification_missing_fields.append(
+                            "partial_chunk_delete"
+                        )
+                    elif v_act.action is KnowledgeAction.MODIFY and not v_act.new_text:
                         clarification_missing_fields.append("replacement_text")
                     elif v_act.action in {KnowledgeAction.MODIFY, KnowledgeAction.DELETE}:
                         clarification_missing_fields.append("target_description")
+                    elif v_act.action is KnowledgeAction.ADD:
+                        clarification_missing_fields.append("text")
             
             if clarification_needed:
                 if self.config.mutation_policy.partial_execution_policy == MutationPartialExecutionPolicy.ALL_OR_NOTHING:
@@ -759,9 +751,13 @@ class KnowledgeFactsBranch:
                     status = "validation_failed"
                     if v_act.validation_result == ActionValidationResult.SKIP_NOT_FOUND:
                         status = "not_found"
+                    elif v_act.validation_result == ActionValidationResult.SKIP_ALREADY_EXISTS:
+                        status = "skipped"
                     user_safe_summary = f"Action skipped due to {v_act.validation_result.value}."
                     if v_act.validation_result == ActionValidationResult.SKIP_NOT_FOUND:
                         user_safe_summary = "No matching knowledge item was found."
+                    elif v_act.validation_result == ActionValidationResult.SKIP_ALREADY_EXISTS:
+                        user_safe_summary = "That knowledge is already stored."
                     pre_repo_results.append(RepositoryActionResult(
                         action_id="pre-repo",
                         action_type=v_act.action.value,
@@ -931,6 +927,12 @@ class ReminderBranch:
         )
 
     def execute(self, context: PipelineContext, repository: AssistantRepository) -> BranchResult:
+        if not request_has_explicit_mutation(context.request, Intent.REMINDER):
+            return self._generate_clarification(
+                context,
+                ["action_keyword"],
+                "Read-only reminder requests belong to general-purpose.",
+            )
         actions = list(context.request.metadata.get("reminder_actions", []))
         detector = self.action_detector or DeterministicActionDetector()
         detection = detector.detect(
@@ -1270,4 +1272,16 @@ class BranchRouter:
     def route(self, context: PipelineContext, repository: AssistantRepository) -> BranchResult:
         if context.intent not in self.branches:
             raise ValueError(f"No branch registered for intent: {context.intent}")
+        if context.intent in {Intent.KNOWLEDGE_FACTS, Intent.REMINDER} and not (
+            request_has_explicit_mutation(context.request, context.intent)
+        ):
+            general_branch = self.branches.get(Intent.GENERAL_RESPONSE)
+            if general_branch is None:
+                raise ValueError(
+                    "A general-purpose branch is required for read-only knowledge/reminder requests."
+                )
+            return general_branch.execute(
+                replace(context, intent=Intent.GENERAL_RESPONSE),
+                repository,
+            )
         return self.branches[context.intent].execute(context, repository)

@@ -8,6 +8,7 @@ from getpass import getpass
 import imaplib
 import json
 import logging
+import re
 import smtplib
 import sys
 from tempfile import TemporaryDirectory
@@ -33,7 +34,10 @@ from assistant_rag.bundler import ChatOutput, ResponseBundler
 from assistant_rag.classification import LLMLastQAResolver, LastQAResolver, QueryRewriter, can_skip_broad_retrieval
 from assistant_rag.config import GeneralPurposeConfig
 from assistant_rag.context_filter import HardRuleContextFilter, TwoLayerContextFilter
-from assistant_rag.retrieval_policy import RETRIEVAL_PIPELINE_POLICY
+from assistant_rag.retrieval_policy import (
+    DEFAULT_CROSS_ENCODER_MIN_SCORE,
+    RETRIEVAL_PIPELINE_POLICY,
+)
 from assistant_rag.content_composer import (
     AnswerGenerationTool,
     ContentToolRegistry,
@@ -56,6 +60,11 @@ from assistant_rag.contracts import (
 )
 from assistant_rag.database import SQLiteRepository, now_iso
 from assistant_rag.hybrid_llm import HybridLLMClient
+from assistant_rag.knowledge_mutation import (
+    KnowledgeContentFinalizationStrategy,
+    KnowledgeMutationPipeline,
+    LLMKnowledgeActionDetector,
+)
 from assistant_rag.general_sub_branch import GeneralSubBranchDetector
 from assistant_rag.last_qa import InMemoryLastQAStore
 from assistant_rag.llm import (
@@ -80,6 +89,7 @@ from assistant_rag.request_lifecycle import (
     ChatRequestLifecycleExecutor,
     RequestLifecycleConflict,
 )
+from assistant_rag.retrieval_validation import KnowledgeRetrievalValidationStrategy
 from assistant_rag.settings import ProductionSettings
 
 
@@ -437,8 +447,16 @@ class OptionalReminderSupportingStrategy:
 
 
 class DeterministicRetriever:
-    def __init__(self, repository: SQLiteRepository) -> None:
+    def __init__(
+        self,
+        repository: SQLiteRepository,
+        *,
+        min_score: float = DEFAULT_CROSS_ENCODER_MIN_SCORE,
+        conversation_min_score: float = 0.50,
+    ) -> None:
         self.repository = repository
+        self.min_score = min_score
+        self.conversation_min_score = conversation_min_score
         self.conversation_calls = 0
         self.knowledge_calls = 0
 
@@ -480,11 +498,19 @@ class DeterministicRetriever:
                     payload=payload,
                 )
             )
-        results.sort(key=lambda item: item.confidence, reverse=True)
-        return results[: RETRIEVAL_PIPELINE_POLICY.final_top_k]
+        results.sort(key=lambda item: item.rerank_score, reverse=True)
+        return [
+            result
+            for result in results
+            if result.rerank_score >= self.conversation_min_score
+        ][: RETRIEVAL_PIPELINE_POLICY.final_top_k]
 
     def retrieve_knowledge(
-        self, *, user_id: str, query: str
+        self,
+        *,
+        user_id: str,
+        query: str,
+        enforce_min_score: bool = True,
     ) -> list[RetrievalResult]:
         self.knowledge_calls += 1
         query_norm = _normalize(query)
@@ -522,8 +548,12 @@ class DeterministicRetriever:
                     payload=payload,
                 )
             )
-        results.sort(key=lambda item: item.confidence, reverse=True)
-        return results[: RETRIEVAL_PIPELINE_POLICY.final_top_k]
+        results.sort(key=lambda item: item.rerank_score, reverse=True)
+        return [
+            result
+            for result in results
+            if not enforce_min_score or result.rerank_score >= self.min_score
+        ][: RETRIEVAL_PIPELINE_POLICY.final_top_k]
 
 
 class ScenarioLLM:
@@ -531,6 +561,172 @@ class ScenarioLLM:
         return "Start with Python basics, practice daily, then build small projects."
 
     def generate_json(self, **kwargs: Any) -> dict[str, Any]:
+        task = kwargs.get("task")
+        prompt = str(kwargs.get("user_prompt") or "")
+        prefix = "Runtime context:\n"
+        payload = json.loads(prompt[len(prefix) :]) if prompt.startswith(prefix) else {}
+        if task is LLMTask.KNOWLEDGE_ACTION_EXTRACTION:
+            request = ChatRequest(
+                user_id=str(payload.get("user_id") or DEBUG_USER),
+                raw_query=str(payload.get("raw_query") or ""),
+            )
+            detected = DeterministicActionDetector().detect(
+                request,
+                str(payload.get("rewritten_query") or request.raw_query),
+                Intent.KNOWLEDGE_FACTS,
+            )
+            actions = list(detected.metadata.get("knowledge_actions") or [])
+            if len(actions) != 1:
+                return {
+                    "action": "add",
+                    "text_content": "",
+                    "original_text": "",
+                    "replacement_text": "",
+                    "confidence": 0.0,
+                    "missing_fields": list(detected.missing_fields or ["action_keyword"]),
+                    "reason_summary": "Debug extraction requires one complete action.",
+                }
+            action = actions[0]
+            action_name = str(action.get("action") or "")
+            return {
+                "action": action_name,
+                "text_content": (
+                    str(action.get("text") or action.get("target_description") or "")
+                    if action_name in {"add", "delete"}
+                    else ""
+                ),
+                "original_text": (
+                    str(action.get("target_description") or "")
+                    if action_name == "modify"
+                    else ""
+                ),
+                "replacement_text": (
+                    str(action.get("replacement_text") or "")
+                    if action_name == "modify"
+                    else ""
+                ),
+                "confidence": 0.99,
+                "missing_fields": (
+                    ["replacement_text"]
+                    if action_name == "modify" and not action.get("replacement_text")
+                    else []
+                ),
+                "reason_summary": "Deterministic debug extraction.",
+            }
+
+        if task is LLMTask.KNOWLEDGE_ACTION_VALIDATION:
+            extra = payload.get("extra") or {}
+            operation = str(extra.get("operation") or "")
+            target = str(extra.get("target_description") or "")
+            proposed = str(extra.get("proposed_content") or "")
+            replacement = str(extra.get("replacement_content") or "")
+            candidates = list(extra.get("candidate_chunks") or [])
+            assessments: list[dict[str, Any]] = []
+            selected: list[str] = []
+            for candidate in candidates:
+                key = str(candidate.get("candidate_key") or "")
+                text = str(candidate.get("text_excerpt") or "")
+                matched_text = ""
+                matches = False
+                if operation == "add":
+                    matches = bool(proposed) and (
+                        proposed.casefold() in text.casefold()
+                        or text.casefold() in proposed.casefold()
+                    )
+                    matched_text = text if matches else ""
+                elif operation == "modify":
+                    replacement_value = re.search(r"\b\d+\s+days?\b", replacement, re.I)
+                    old_value = re.search(r"\b\d+\s+days?\b", text, re.I)
+                    if replacement_value and old_value:
+                        matched_text = old_value.group(0)
+                        matches = True
+                    elif target and target.casefold() in text.casefold():
+                        start = text.casefold().index(target.casefold())
+                        matched_text = text[start : start + len(target)]
+                        matches = True
+                    else:
+                        target_terms = set(
+                            re.findall(r"[a-z0-9]+", target.casefold())
+                        )
+                        text_terms = set(
+                            re.findall(r"[a-z0-9]+", text.casefold())
+                        )
+                        meaningful_target = {
+                            term for term in target_terms if len(term) > 2
+                        }
+                        if meaningful_target and len(
+                            meaningful_target & text_terms
+                        ) / len(meaningful_target) >= 0.4:
+                            matched_text = text
+                            matches = True
+                elif target and target.casefold() in text.casefold():
+                    start = text.casefold().index(target.casefold())
+                    matched_text = text[start : start + len(target)]
+                    matches = True
+                if matches and operation in {"delete", "modify"} and not selected:
+                    selected = [key]
+                assessments.append(
+                    {
+                        "candidate_key": key,
+                        "matches_target": matches,
+                        "action_compatible": matches,
+                        "confidence": 0.99 if matches else 0.95,
+                        "matched_fields": ["text"] if matches else [],
+                        "reason_summary": "Deterministic full-text debug assessment.",
+                        "matched_text": matched_text,
+                    }
+                )
+            if operation == "add":
+                duplicate = any(item["matches_target"] for item in assessments)
+                validation_result = "SKIP_ALREADY_EXISTS" if duplicate else "EXECUTE"
+                selected = []
+                should_execute = not duplicate
+            elif selected:
+                validation_result = "EXECUTE"
+                should_execute = True
+            else:
+                validation_result = "SKIP_NOT_FOUND"
+                should_execute = False
+            return {
+                "operation": operation,
+                "validation_result": validation_result,
+                "selected_candidate_keys": selected,
+                "confidence": 0.99,
+                "ambiguous": False,
+                "should_execute": should_execute,
+                "requires_hitl": False,
+                "factuality_concern": False,
+                "reason_summary": "Deterministic debug validation.",
+                "candidate_assessments": assessments,
+            }
+
+        if task is LLMTask.KNOWLEDGE_CONTENT_FINALIZATION:
+            extra = payload.get("extra") or {}
+            operation = str(extra.get("operation") or "")
+            extracted = extra.get("extracted_action_content") or {}
+            candidates = list(extra.get("validated_candidate_context") or [])
+            validation = extra.get("validation_result") or {}
+            if operation == "add":
+                final_content = str(extracted.get("text_content") or "")
+            else:
+                selected = next(
+                    (item for item in candidates if item.get("selected")),
+                    {},
+                )
+                final_content = str(selected.get("text") or "")
+                if operation == "modify":
+                    assessments = list(validation.get("candidate_assessments") or [])
+                    matched_text = str(
+                        assessments[0].get("matched_text") if assessments else ""
+                    )
+                    replacement = str(extracted.get("replacement_text") or "")
+                    final_content = final_content.replace(matched_text, replacement, 1)
+            return {
+                "final_content": final_content,
+                "confidence": 0.99,
+                "reason_summary": "Deterministic debug finalization.",
+            }
+
         raise AssertionError("deterministic content composer must not request a ReAct decision")
 
 
@@ -571,7 +767,13 @@ def build_scenario_state(settings: ProductionSettings) -> ScenarioState:
     config = build_assistant_config(debug_settings)
     repository = SQLiteRepository.in_memory()
     repository.initialize_schema()
-    retriever = DeterministicRetriever(repository)
+    retriever = DeterministicRetriever(
+        repository,
+        min_score=debug_settings.reranker.min_score,
+        conversation_min_score=(
+            debug_settings.retrieval.conversation_min_confidence_score
+        ),
+    )
     hard_filter = HardRuleContextFilter(
         allowed_reminder_statuses=debug_settings.prompt_policy.context_filter_allowed_reminder_statuses,
         reminder_approved_max_items=debug_settings.context_filter.reminder_approved_max_items,
@@ -586,8 +788,26 @@ def build_scenario_state(settings: ProductionSettings) -> ScenarioState:
         knowledge_resolver=knowledge_resolver,
         reminder_resolver=reminder_resolver,
     )
+    knowledge_llm = ScenarioLLM()
+    knowledge_validator = KnowledgeRetrievalValidationStrategy(
+        config=config.retrieval_validation,
+        llm=knowledge_llm,
+        prompts=DEFAULT_PROMPT_REGISTRY,
+    )
+    knowledge_pipeline = KnowledgeMutationPipeline(
+        retriever=retriever,
+        config=config,
+        validator=knowledge_validator,
+        finalizer=KnowledgeContentFinalizationStrategy(
+            llm=knowledge_llm,
+            prompts=DEFAULT_PROMPT_REGISTRY,
+            min_confidence=(
+                config.retrieval_validation.knowledge_llm_validation_min_confidence
+            ),
+        ),
+    )
     gp_config = GeneralPurposeConfig(
-        general_sub_branch_detector_enabled=False,
+        general_sub_branch_detector_enabled=True,
         content_composer_enabled=False,
         hitl_supporting_question_enabled=True,
     )
@@ -606,16 +826,24 @@ def build_scenario_state(settings: ProductionSettings) -> ScenarioState:
                 hitl_strategy=OptionalHITLStrategy(),
                 general_hitl_strategy=DeterministicGeneralHITLStrategy(),
                 general_purpose_config=gp_config,
+                sub_branch_detector=GeneralSubBranchDetector(
+                    ScenarioLLM(), DEFAULT_PROMPT_REGISTRY
+                ),
             ),
             Intent.KNOWLEDGE_FACTS: KnowledgeFactsBranch(
                 config=config,
-                action_detector=None,
+                action_detector=LLMKnowledgeActionDetector(
+                    llm=knowledge_llm,
+                    prompts=DEFAULT_PROMPT_REGISTRY,
+                    min_confidence=debug_settings.prompt_policy.action_min_confidence,
+                ),
                 clarification_strategy=clarification_strategy,
                 prompt_registry=DEFAULT_PROMPT_REGISTRY,
                 validated_action_builder=validated_builder,
                 retriever=retriever,
                 context_filter=context_filter,
-                llm=None,
+                llm=knowledge_llm,
+                knowledge_mutation_pipeline=knowledge_pipeline,
             ),
             Intent.REMINDER: ReminderBranch(
                 config=config,
@@ -776,6 +1004,12 @@ def scenario_clarification_direct(settings: ProductionSettings) -> ScenarioResul
         metadata={
             "intent": Intent.CLARIFICATION.value,
             "clarification_text": "Which item should I update?",
+            "clarification_question": GeneratedQuestion(
+                text="Which stale item was requested previously?",
+                source=QuestionSource.CLARIFICATION_QUESTION,
+                purpose="stale_metadata_question",
+                confidence=1.0,
+            ),
         },
     )
     assert_response(response, ResponseType.CLARIFICATION, "Which item")
@@ -1250,6 +1484,129 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
             f"{attached_delivery!r}; attachment_count={len(list(attachment_message.iter_attachments()))}"
         )
 
+    # Microsoft-tool artifacts must be attached without relying on generic
+    # attach/file/document wording, and the raw request remains authoritative
+    # when an incomplete extractor returns only one of multiple recipients.
+    class IncompleteRecipientPlatformLLM:
+        def __init__(self, mode: str) -> None:
+            self.mode = mode
+
+        def generate_json(self, **kwargs: Any) -> dict[str, Any]:
+            if "platform selector" in str(kwargs.get("system_prompt") or ""):
+                return {"channel": "gmail", "confidence": 1.0}
+            return {
+                "recipients": ["alice@example.com"],
+                "subject": "Migration workbook",
+                "body": "The migration workbook is ready.",
+                "mode": self.mode,
+            }
+
+    from email import policy
+    from email.parser import BytesParser
+
+    workbook_bytes = b"debug-generated-workbook-mime-payload"
+    with TemporaryDirectory(prefix="assistant-debug-gmail-artifact-") as artifact_dir:
+        workbook_path = Path(artifact_dir) / "migration_budget.xlsx"
+        workbook_path.write_bytes(workbook_bytes)
+        workbook_bundled = replace(
+            bundled,
+            final_chat_text="Subject: Migration workbook\n\nThe migration workbook is ready.",
+            platform_payload={
+                "artifacts": [{
+                    "artifact_id": "platform-test-workbook",
+                    "file_type": "xlsx",
+                    "filename": workbook_path.name,
+                    "storage_path": str(workbook_path),
+                    "storage_url": f"/artifacts/{workbook_path.name}",
+                    "status": "created",
+                }],
+            },
+        )
+        credentials = {
+            "gmail_username": "sender@example.com",
+            "gmail_app_password": "app-password-for-test",
+        }
+        workbook_send_query = (
+            "Create an Excel workbook with the migration budget, then email it to "
+            "alice@example.com and bob@example.com now."
+        )
+        workbook_draft_query = (
+            "Create an Excel workbook with the migration budget, then save a Gmail draft to "
+            "alice@example.com and bob@example.com; do not send."
+        )
+
+        try:
+            smtplib.SMTP_SSL = FakeSMTP  # type: ignore[assignment]
+            workbook_sent = PlatformSelector(
+                llm=IncompleteRecipientPlatformLLM("draft"),
+                senders={"gmail": GmailSender()},
+            ).select(
+                workbook_bundled,
+                ChatRequest(
+                    user_id="platform-test",
+                    raw_query=workbook_send_query,
+                    platform_context=credentials,
+                ),
+            )
+        finally:
+            smtplib.SMTP_SSL = original_smtp_ssl  # type: ignore[assignment]
+
+        expected_recipients = ["alice@example.com", "bob@example.com"]
+        if workbook_sent["delivery"]["status"] != "sent":
+            raise AssertionError(f"compound workbook email was not sent: {workbook_sent!r}")
+        if workbook_sent["delivery"]["recipients"] != expected_recipients:
+            raise AssertionError("incomplete extractor dropped an explicit Gmail recipient")
+        sent_workbook_message = FakeSMTP.instances[-1].message
+        sent_workbook_attachments = list(sent_workbook_message.iter_attachments())
+        if str(sent_workbook_message["To"]) != ", ".join(expected_recipients):
+            raise AssertionError("compound workbook email did not address every raw recipient")
+        if len(sent_workbook_attachments) != 1:
+            raise AssertionError("compound workbook email did not include exactly one generated artifact")
+        if sent_workbook_attachments[0].get_filename() != workbook_path.name:
+            raise AssertionError("compound workbook email changed the generated artifact filename")
+        if sent_workbook_attachments[0].get_content_type() != (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ):
+            raise AssertionError("SMTP MIME attachment did not preserve the Excel content type")
+        if sent_workbook_attachments[0].get_payload(decode=True) != workbook_bytes:
+            raise AssertionError("SMTP MIME attachment bytes did not match the generated workbook")
+
+        try:
+            imaplib.IMAP4_SSL = FakeIMAP  # type: ignore[assignment]
+            workbook_drafted = PlatformSelector(
+                llm=IncompleteRecipientPlatformLLM("send"),
+                senders={"gmail": GmailSender()},
+            ).select(
+                workbook_bundled,
+                ChatRequest(
+                    user_id="platform-test",
+                    raw_query=workbook_draft_query,
+                    platform_context=credentials,
+                ),
+            )
+        finally:
+            imaplib.IMAP4_SSL = original_imap_ssl  # type: ignore[assignment]
+
+        if workbook_drafted["delivery"]["status"] != "draft_saved":
+            raise AssertionError(f"compound workbook Gmail draft was not saved: {workbook_drafted!r}")
+        if workbook_drafted["delivery"]["recipients"] != expected_recipients:
+            raise AssertionError("saved workbook draft dropped an explicit Gmail recipient")
+        saved_workbook_bytes = FakeIMAP.instances[-1].append_args[3]
+        saved_workbook_message = BytesParser(policy=policy.default).parsebytes(saved_workbook_bytes)
+        saved_workbook_attachments = list(saved_workbook_message.iter_attachments())
+        if str(saved_workbook_message["To"]) != ", ".join(expected_recipients):
+            raise AssertionError("saved workbook draft did not address every raw recipient")
+        if len(saved_workbook_attachments) != 1:
+            raise AssertionError("saved workbook draft did not include exactly one generated artifact")
+        if saved_workbook_attachments[0].get_filename() != workbook_path.name:
+            raise AssertionError("saved workbook draft changed the generated artifact filename")
+        if saved_workbook_attachments[0].get_content_type() != (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ):
+            raise AssertionError("IMAP MIME attachment did not preserve the Excel content type")
+        if saved_workbook_attachments[0].get_payload(decode=True) != workbook_bytes:
+            raise AssertionError("IMAP MIME attachment bytes did not match the generated workbook")
+
     smtp_connections_before_missing_credentials = len(FakeSMTP.instances)
     missing_credentials_selector = PlatformSelector(
         llm=ScriptedPlatformLLM("send"),
@@ -1276,12 +1633,17 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
 def scenario_general_new_conversation_skips_sub_branch_llm(settings: ProductionSettings) -> ScenarioResult:
     state = build_scenario_state(settings)
 
-    class FailingSubBranchDetector:
-        def detect(self, *_args: Any, **_kwargs: Any) -> Any:
-            raise AssertionError("sub-branch detector should not run for a context-free new conversation")
+    class FailingSubBranchLLM:
+        def chat(self, **_kwargs: Any) -> str:
+            raise AssertionError("deterministic sub-branch selection must not call the LLM")
+
+        def generate_json(self, **_kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("deterministic sub-branch selection must not call the LLM")
 
     branch = state.pipeline.router.branches[Intent.GENERAL_RESPONSE]
-    branch.sub_branch_detector = FailingSubBranchDetector()
+    branch.sub_branch_detector = GeneralSubBranchDetector(
+        FailingSubBranchLLM(), DEFAULT_PROMPT_REGISTRY
+    )
     branch.general_purpose_config = GeneralPurposeConfig(
         general_sub_branch_detector_enabled=True,
         content_composer_enabled=False,
@@ -1299,7 +1661,7 @@ def scenario_general_new_conversation_skips_sub_branch_llm(settings: ProductionS
     return ScenarioResult(
         "general_new_conversation_skips_sub_branch_llm",
         True,
-        "context-free general responses choose new topic without sub-branch LLM",
+        "detector chose a context-free new topic without calling its retained LLM dependency",
     )
 
 
@@ -1547,34 +1909,37 @@ def scenario_multi_action_detection_fails_closed(settings: ProductionSettings) -
     )
 
 
-def scenario_sql_backed_knowledge_lookup(settings: ProductionSettings) -> ScenarioResult:
-    """Explicit knowledge reads must use the canonical derived retrieval exactly once."""
-    class LookupDetector:
+def scenario_read_only_knowledge_general_route(settings: ProductionSettings) -> ScenarioResult:
+    """Knowledge reads must be answered only by the general-purpose branch."""
+    class MustNotRunMutationDetector:
         def detect(self, *_: Any, **__: Any) -> Any:
-            return type(
-                "LookupDetection",
-                (),
-                {
-                    "metadata": {"knowledge_lookup": True},
-                    "requires_clarification": False,
-                    "missing_fields": [],
-                },
-            )()
+            raise AssertionError("read-only knowledge query reached the mutation detector")
 
     state = build_scenario_state(settings)
     fact = "The stored infrastructure locality preference is Tokyo."
     seed_knowledge(state, title="Infrastructure preference", text=fact)
-    state.pipeline.router.branches[Intent.KNOWLEDGE_FACTS].action_detector = LookupDetector()
+    state.pipeline.router.branches[
+        Intent.KNOWLEDGE_FACTS
+    ].action_detector = MustNotRunMutationDetector()
     response = run_request(
         state,
         "What is the stored infrastructure locality preference?",
-        metadata={"intent": Intent.KNOWLEDGE_FACTS.value},
+        metadata={
+            # Even a stale/incorrect caller hint may not force a read into the
+            # mutation-only branch.
+            "intent": Intent.KNOWLEDGE_FACTS.value,
+            "normal_response_text": fact,
+        },
     )
     if response.response_type is not ResponseType.NORMAL or response.final_chat_text != fact:
-        raise AssertionError(f"SQL-backed lookup did not return the exact stored fact: {response}")
+        raise AssertionError(f"general knowledge answer did not return the stored fact: {response}")
     if state.retriever.knowledge_calls != 1:
-        raise AssertionError("explicit knowledge lookup did not use exactly one canonical retrieval")
-    return ScenarioResult("sql_backed_knowledge_lookup", True, "explicit knowledge lookup used the canonical retrieval")
+        raise AssertionError("general-purpose knowledge answer did not use canonical retrieval")
+    return ScenarioResult(
+        "read_only_knowledge_general_route",
+        True,
+        "read-only knowledge lookup was owned exclusively by general-purpose",
+    )
 
 
 def scenario_general_sql_knowledge_fallback(settings: ProductionSettings) -> ScenarioResult:
@@ -1592,6 +1957,43 @@ def scenario_general_sql_knowledge_fallback(settings: ProductionSettings) -> Sce
     if state.retriever.knowledge_calls != 1:
         raise AssertionError("general response did not use exactly one canonical knowledge retrieval")
     return ScenarioResult("general_sql_knowledge_fallback", True, "general response used one canonical knowledge retrieval")
+
+
+def scenario_read_only_reminder_general_route(settings: ProductionSettings) -> ScenarioResult:
+    """Reminder reads must be answered only by the general-purpose branch."""
+
+    class MustNotRunMutationDetector:
+        def detect(self, *_: Any, **__: Any) -> Any:
+            raise AssertionError("read-only reminder query reached the mutation detector")
+
+    state = build_scenario_state(settings)
+    seed_reminder(
+        state,
+        subject="Submit payroll",
+        summary="Submit payroll",
+        reminder_time=datetime(2026, 7, 20, 9, tzinfo=timezone.utc),
+    )
+    state.pipeline.router.branches[
+        Intent.REMINDER
+    ].action_detector = MustNotRunMutationDetector()
+    answer = "The Submit payroll reminder is scheduled for July 20 at 9 AM UTC."
+    response = run_request(
+        state,
+        "When is my Submit payroll reminder?",
+        metadata={
+            "intent": Intent.REMINDER.value,
+            "normal_response_text": answer,
+        },
+    )
+    assert_response(response, ResponseType.NORMAL, answer)
+    reminders = state.repository.list_reminders(user_id=state.user_id)
+    if len(reminders) != 1 or reminders[0]["status"] != "scheduled":
+        raise AssertionError("read-only reminder answer changed reminder state")
+    return ScenarioResult(
+        "read_only_reminder_general_route",
+        True,
+        "read-only reminder lookup was owned exclusively by general-purpose",
+    )
 
 
 def scenario_deterministic_knowledge_update(settings: ProductionSettings) -> ScenarioResult:
@@ -1886,6 +2288,9 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         LLMTask.LAST_QA: "qwen3.5:4b",
         LLMTask.INTENT: "qwen3.5:4b",
         LLMTask.ACTION_EXTRACTION: "qwen3.5:4b",
+        LLMTask.KNOWLEDGE_ACTION_EXTRACTION: "qwen3.5:4b",
+        LLMTask.KNOWLEDGE_ACTION_VALIDATION: "microsoft/Phi-4-mini-instruct-onnx",
+        LLMTask.KNOWLEDGE_CONTENT_FINALIZATION: "microsoft/Phi-4-mini-instruct-onnx",
         LLMTask.GENERATE_CLARIFICATION: "qwen3.5:4b",
         LLMTask.GENERATE_HUMAN_SUPPORTING: "qwen3.5:4b",
         LLMTask.GENERATE_REMINDER_SUPPORTING: "qwen3.5:4b",
@@ -1914,12 +2319,16 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         "rrf_k": default_settings.retrieval.rrf_k,
         "reranker_top_k": default_settings.retrieval.rerank_candidate_limit,
         "reranker_min_score": default_settings.reranker.min_score,
+        "conversation_min_confidence_score": default_settings.retrieval.conversation_min_confidence_score,
         "reranker_batch_size": default_settings.reranker.batch_size,
         "final_context_top_k": default_settings.retrieval.max_results,
         "last_qa_min_confidence": default_settings.prompt_policy.last_qa_min_confidence,
         "last_qa_clarification_merge_min_confidence": default_settings.prompt_policy.clarification_merge_min_confidence,
         "last_qa_skip_broad_retrieval_min_confidence": default_settings.prompt_policy.last_qa_skip_broad_retrieval_min_confidence,
+        "support_question_resolution_min_confidence": default_settings.general_purpose.support_question_resolution_min_confidence,
+        "conversation_followup_min_score": default_settings.general_purpose.conversation_followup_min_score,
         "action_min_confidence": default_settings.prompt_policy.action_min_confidence,
+        "knowledge_validation_candidate_limit": default_settings.retrieval_validation.knowledge_llm_validation_max_candidates,
         "risky_action_confidence_threshold": default_settings.prompt_policy.risky_action_confidence_threshold,
         "reminder_candidate_limit": default_settings.reminder_resolver.reminder_target_candidate_limit,
         "reminder_target_min_score": default_settings.reminder_resolver.reminder_target_relevance_threshold,
@@ -1945,12 +2354,16 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         "rrf_k": 40,
         "reranker_top_k": RETRIEVAL_PIPELINE_POLICY.rrf_top_k,
         "reranker_min_score": 0.30,
+        "conversation_min_confidence_score": 0.50,
         "reranker_batch_size": 24,
         "final_context_top_k": RETRIEVAL_PIPELINE_POLICY.final_top_k,
         "last_qa_min_confidence": 0.80,
         "last_qa_clarification_merge_min_confidence": 0.84,
         "last_qa_skip_broad_retrieval_min_confidence": 0.90,
+        "support_question_resolution_min_confidence": 0.90,
+        "conversation_followup_min_score": 0.65,
         "action_min_confidence": 0.76,
+        "knowledge_validation_candidate_limit": 5,
         "risky_action_confidence_threshold": 0.90,
         "reminder_candidate_limit": 12,
         "reminder_target_min_score": 0.78,
@@ -1989,6 +2402,18 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         raise AssertionError(f"embedding model mismatch: {default_settings.embeddings.model_name}")
     if router.decision_for_task(LLMTask.ANSWER).num_ctx != default_settings.ollama.num_ctx_answer:
         raise AssertionError("answer task should use writing context window")
+    knowledge_capacity = {
+        LLMTask.KNOWLEDGE_ACTION_EXTRACTION: (8192, 2048),
+        LLMTask.KNOWLEDGE_ACTION_VALIDATION: (16384, 1024),
+        LLMTask.KNOWLEDGE_CONTENT_FINALIZATION: (16384, 2048),
+    }
+    for task, expected in knowledge_capacity.items():
+        decision = router.decision_for_task(task)
+        if (decision.num_ctx, decision.num_predict) != expected:
+            raise AssertionError(
+                f"{task.value} capacity mismatch: "
+                f"{(decision.num_ctx, decision.num_predict)}"
+            )
     if default_settings.ollama.model_intent != "qwen3.5:4b":
         raise AssertionError("intent must use the validated semantic routing model")
     if default_settings.ollama.model_intent_fallback != "qwen3.5:4b":
@@ -2001,6 +2426,9 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         LLMTask.LAST_QA: 18.0,
         LLMTask.INTENT: 20.0,
         LLMTask.ACTION_EXTRACTION: 24.0,
+        LLMTask.KNOWLEDGE_ACTION_EXTRACTION: 24.0,
+        LLMTask.KNOWLEDGE_ACTION_VALIDATION: 45.0,
+        LLMTask.KNOWLEDGE_CONTENT_FINALIZATION: 90.0,
         LLMTask.RISKY_ACTION: 35.0,
         LLMTask.RETRIEVAL_VALIDATION: 35.0,
         LLMTask.ANSWER: 75.0,
@@ -2138,8 +2566,9 @@ def scenario_intent_branch_ownership_policy(settings: ProductionSettings) -> Sce
     prompt = DEFAULT_PROMPT_REGISTRY.system("intent_classifier")
     required_prompt_rules = (
         "Choose operation_kind before intent; intent must agree with it.",
-        "durable_knowledge means the user asks to retain, inspect, change, or remove",
-        "reminder_lifecycle means the user asks to create, inspect, change, or remove a scheduled future notification.",
+        "durable_knowledge is mutation-only",
+        "reminder_lifecycle is mutation-only",
+        "Every request to search, find, list, show, inspect, look up, retrieve, recall, read, or answer",
         "a new request is never clarification.",
     )
     missing_rules = [rule for rule in required_prompt_rules if rule not in prompt]
@@ -2222,7 +2651,7 @@ def scenario_last_qa_relationship_policy(settings: ProductionSettings) -> Scenar
     expected = {
         "exact supporting answer": True,
         "forged supporting match": False,
-        "direct normal follow-up": True,
+        "direct normal follow-up": False,
         "normal follow-up carrying a question": False,
         "metadata-backed reminder reply": True,
         "metadata-free reminder reply": False,
@@ -2247,7 +2676,7 @@ def scenario_last_qa_relationship_policy(settings: ProductionSettings) -> Scenar
     standalone_rule = "A latest message that starts a distinct standalone request is not a clarification answer"
     if standalone_rule not in clarification_prompt:
         raise AssertionError("clarification merge lost its standalone-request safeguard")
-    return ScenarioResult("last_qa_relationship_policy", True, "Last-QA precedence and skip gates require exact supporting-question or reminder evidence")
+    return ScenarioResult("last_qa_relationship_policy", True, "Last-QA skips retrieval only for exact supporting-question or reminder evidence; normal follow-up requires reranked conversation evidence")
 
 
 def scenario_debug_hybrid_llm_compatibility(settings: ProductionSettings) -> ScenarioResult:
@@ -2464,7 +2893,7 @@ def scenario_general_broad_retrieval_approved(settings: ProductionSettings) -> S
     )
     response = run_request(
         state,
-        "Continue Atlas context with QA signoff",
+        "Atlas context QA signoff",
         metadata={
             "intent": Intent.GENERAL_RESPONSE.value,
             "normal_response_text": "Continuing from the approved Atlas context.",
@@ -2513,6 +2942,58 @@ def scenario_general_broad_retrieval_approved(settings: ProductionSettings) -> S
     )
 
 
+def scenario_general_broad_retrieval_below_followup_gate(
+    settings: ProductionSettings,
+) -> ScenarioResult:
+    """A retrievable but weak hop must not own follow-up persistence."""
+    state = build_scenario_state(settings)
+    old_topic_id, _ = seed_conversation(
+        state,
+        title="Weak Atlas Context",
+        query="Project Atlas context",
+        response="Atlas deployment requires a freeze window and QA signoff.",
+    )
+    response = run_request(
+        state,
+        # Deterministic debug score: 3 matching terms / 5 query terms = 0.60.
+        # This passes retrieval's 0.50 floor but fails the 0.65 follow-up gate.
+        "Continue Atlas context signoff today",
+        metadata={
+            "intent": Intent.GENERAL_RESPONSE.value,
+            "normal_response_text": "Starting a fresh discussion.",
+        },
+    )
+    assert_response(response, ResponseType.NORMAL, "fresh discussion")
+    if state.retriever.conversation_calls != 1:
+        raise AssertionError("weak-hop scenario did not run broad retrieval exactly once")
+    if response.conversation_topic_id == old_topic_id:
+        raise AssertionError("a 0.60 hop incorrectly owned follow-up persistence")
+    persisted = state.repository.connection.execute(
+        """
+        SELECT previous_hop_id, parent_hop_id, entities_json
+        FROM conversation_hops
+        WHERE hop_id = ? AND user_id = ?
+        """,
+        (response.conversation_hop_id, state.user_id),
+    ).fetchone()
+    if persisted is None:
+        raise AssertionError("weak-hop new-topic response was not persisted")
+    entities = json.loads(str(persisted["entities_json"]))
+    if (
+        persisted["previous_hop_id"] is not None
+        or persisted["parent_hop_id"] is not None
+        or entities.get("sub_branch") != "new_conversation_topic"
+    ):
+        raise AssertionError(
+            "below-threshold retrieval did not produce isolated new-topic persistence"
+        )
+    return ScenarioResult(
+        "general_broad_retrieval_below_followup_gate",
+        True,
+        "a 0.60 retrieved hop passed retrieval but safely fell back to a new topic",
+    )
+
+
 def scenario_lastqa_supporting_skip(settings: ProductionSettings) -> ScenarioResult:
     state = build_scenario_state(settings)
     topic_id, hop_id = seed_conversation(
@@ -2552,6 +3033,77 @@ def scenario_lastqa_supporting_skip(settings: ProductionSettings) -> ScenarioRes
     if state.retriever.conversation_calls != before_calls:
         raise AssertionError("last-QA supporting-question path should skip broad retrieval")
     return ScenarioResult("lastqa_supporting_skip", True, "latest-context Last-QA path skipped broad retrieval")
+
+
+def scenario_lastqa_support_below_resolution_gate(
+    settings: ProductionSettings,
+) -> ScenarioResult:
+    """A stale 0.80 support match must not append to the linked topic."""
+    state = build_scenario_state(settings)
+    old_topic_id, old_hop_id = seed_conversation(
+        state,
+        title="Stale Supporting Context",
+        query="Prepare the report",
+        response="A draft is ready.",
+    )
+    state.pipeline.last_qa_store.save(
+        state.user_id,
+        LastQAState(
+            last_user_query="Prepare the report",
+            last_response="A draft is ready.",
+            response_type=ResponseType.NORMAL,
+            supporting_questions=[
+                GeneratedQuestion(
+                    text="Report format should use now",
+                    source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+                    purpose="optional_context",
+                    confidence=1.0,
+                )
+            ],
+            linked_topic_id=old_topic_id,
+            linked_hop_id=old_hop_id,
+        ),
+    )
+    before_calls = state.retriever.conversation_calls
+    response = run_request(
+        state,
+        # Deterministic Last-QA overlap: 4/5 = 0.80. The resolver recognizes
+        # it, but the sub-branch's stricter 0.90 ownership gate rejects it.
+        "Report format should use today",
+        metadata={
+            "intent": Intent.GENERAL_RESPONSE.value,
+            "normal_response_text": "Treating this as a fresh request.",
+        },
+    )
+    assert_response(response, ResponseType.NORMAL, "fresh request")
+    if state.retriever.conversation_calls != before_calls:
+        raise AssertionError("authoritative Last-QA support path unexpectedly retrieved")
+    if response.conversation_topic_id == old_topic_id:
+        raise AssertionError("a 0.80 stale support match incorrectly appended to its old topic")
+    persisted = state.repository.connection.execute(
+        """
+        SELECT previous_hop_id, parent_hop_id, entities_json
+        FROM conversation_hops
+        WHERE hop_id = ? AND user_id = ?
+        """,
+        (response.conversation_hop_id, state.user_id),
+    ).fetchone()
+    if persisted is None:
+        raise AssertionError("stale-support new-topic response was not persisted")
+    entities = json.loads(str(persisted["entities_json"]))
+    if (
+        persisted["previous_hop_id"] is not None
+        or persisted["parent_hop_id"] is not None
+        or entities.get("sub_branch") != "new_conversation_topic"
+    ):
+        raise AssertionError(
+            "below-threshold support match did not produce isolated new-topic persistence"
+        )
+    return ScenarioResult(
+        "lastqa_support_below_resolution_gate",
+        True,
+        "a 0.80 supporting-question match could not reuse stale topic ownership",
+    )
 
 
 def scenario_knowledge_add(settings: ProductionSettings) -> ScenarioResult:
@@ -2640,6 +3192,164 @@ def scenario_knowledge_modify_missing_replacement(settings: ProductionSettings) 
     )
     assert_response(response, ResponseType.CLARIFICATION, "replace")
     return ScenarioResult("knowledge_modify_missing_replacement", True, "missing replacement asks clarification")
+
+
+def scenario_knowledge_three_llm_pipeline(settings: ProductionSettings) -> ScenarioResult:
+    state = build_scenario_state(settings)
+    original = "Atlas retention is 30 days"
+    replacement = "Atlas retention is 45 days"
+    prefix = " ".join(f"Unrelated detail {index}." for index in range(500))
+    stored = f"{prefix} {original}. Preserve this tail marker."
+    final_content = stored.replace(original, replacement, 1)
+    chunk_id = seed_knowledge(state, title="Project Atlas", text=stored)
+    query = f"Change {original} to {replacement}"
+
+    class StageLLM:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+            self.responses = [
+                {
+                    "action": "modify",
+                    "text_content": "",
+                    "original_text": original,
+                    "replacement_text": replacement,
+                    "confidence": 0.99,
+                    "missing_fields": [],
+                    "reason_summary": "One grounded action.",
+                },
+                {
+                    "operation": "modify",
+                    "validation_result": "EXECUTE",
+                    "selected_candidate_keys": [chunk_id],
+                    "confidence": 0.99,
+                    "ambiguous": False,
+                    "should_execute": True,
+                    "requires_hitl": False,
+                    "factuality_concern": False,
+                    "reason_summary": "One SQL candidate contains the target.",
+                    "candidate_assessments": [
+                        {
+                            "candidate_key": chunk_id,
+                            "matches_target": True,
+                            "action_compatible": True,
+                            "confidence": 0.99,
+                            "matched_fields": ["text"],
+                            "reason_summary": "Exact detail found in full text.",
+                            "matched_text": original,
+                        }
+                    ],
+                },
+                {
+                    "final_content": final_content,
+                    "confidence": 0.99,
+                    "reason_summary": "Only the validated detail changed.",
+                },
+            ]
+
+        def generate_json(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append(dict(kwargs))
+            if not self.responses:
+                raise AssertionError("confirmation replay called a knowledge model")
+            return self.responses.pop(0)
+
+        def chat(self, **_kwargs: Any) -> str:
+            raise AssertionError("knowledge mutation stages require JSON")
+
+    llm = StageLLM()
+    config = state.pipeline.config
+    validator = KnowledgeRetrievalValidationStrategy(
+        config=config.retrieval_validation,
+        llm=llm,
+        prompts=DEFAULT_PROMPT_REGISTRY,
+    )
+    finalizer = KnowledgeContentFinalizationStrategy(
+        llm=llm,
+        prompts=DEFAULT_PROMPT_REGISTRY,
+        min_confidence=(
+            config.retrieval_validation.knowledge_llm_validation_min_confidence
+        ),
+    )
+    state.pipeline.router.branches[Intent.KNOWLEDGE_FACTS] = KnowledgeFactsBranch(
+        config=config,
+        action_detector=LLMKnowledgeActionDetector(
+            llm=llm,
+            prompts=DEFAULT_PROMPT_REGISTRY,
+            min_confidence=settings.prompt_policy.action_min_confidence,
+        ),
+        prompt_registry=DEFAULT_PROMPT_REGISTRY,
+        knowledge_mutation_pipeline=KnowledgeMutationPipeline(
+            retriever=state.retriever,
+            config=config,
+            validator=validator,
+            finalizer=finalizer,
+        ),
+    )
+
+    # A normal knowledge retrieval would reject this exact deterministic score;
+    # the mutation-only bypass must still deliver it to SQL validation.
+    state.retriever.min_score = 1.01
+    lifecycle = ChatRequestLifecycleExecutor(
+        pipeline=state.pipeline,
+        repository=state.repository,
+    )
+    initial = lifecycle.execute(
+        ChatRequest(
+            user_id=state.user_id,
+            raw_query=query,
+            metadata={"intent": Intent.KNOWLEDGE_FACTS.value},
+            idempotency_key="knowledge-three-llm-initial",
+        ),
+        fallback_request_id="knowledge-three-llm-initial",
+    )
+    if initial.response is None:
+        raise AssertionError("initial knowledge mutation unexpectedly replayed")
+    assert_response(initial.response, ResponseType.KNOWLEDGE_ACTION, "confirm")
+    if not initial.response.actions_pending_confirmation:
+        raise AssertionError("validated modify did not require confirmation")
+    expected_tasks = [
+        LLMTask.KNOWLEDGE_ACTION_EXTRACTION,
+        LLMTask.KNOWLEDGE_ACTION_VALIDATION,
+        LLMTask.KNOWLEDGE_CONTENT_FINALIZATION,
+    ]
+    if [call["task"] for call in llm.calls] != expected_tasks:
+        raise AssertionError("knowledge model stages did not execute exactly once in order")
+    prompt_payloads = [
+        json.loads(str(call["user_prompt"]).removeprefix("Runtime context:\n"))
+        for call in llm.calls
+    ]
+    canonical_history = prompt_payloads[0]["chat_history"]
+    for payload in prompt_payloads:
+        if payload["raw_query"] != query or payload["chat_history"] != canonical_history:
+            raise AssertionError("knowledge stages did not share query/history")
+    if "Preserve this tail marker." not in json.dumps(prompt_payloads[1:]):
+        raise AssertionError("long SQL chunk tail was truncated before validation/finalization")
+
+    token = initial.response.actions_pending_confirmation[0]["confirmation_token"]
+    confirmed = lifecycle.execute(
+        ChatRequest(
+            user_id=state.user_id,
+            raw_query="Confirm",
+            confirmation_token=token,
+            idempotency_key="knowledge-three-llm-confirm",
+        ),
+        fallback_request_id="knowledge-three-llm-confirm",
+    )
+    if confirmed.response is None:
+        raise AssertionError("confirmation unexpectedly replayed")
+    assert_response(confirmed.response, ResponseType.KNOWLEDGE_ACTION)
+    if len(llm.calls) != 3:
+        raise AssertionError("confirmation replay re-ran a knowledge model")
+    active = state.repository.connection.execute(
+        "SELECT raw_text FROM knowledge_chunks WHERE user_id = ? AND is_deleted = 0",
+        (state.user_id,),
+    ).fetchall()
+    if [row["raw_text"] for row in active] != [final_content]:
+        raise AssertionError("confirmed modify did not preserve the full finalized chunk")
+    return ScenarioResult(
+        "knowledge_three_llm_pipeline",
+        True,
+        "three dedicated knowledge LLM stages, threshold bypass, full text, and confirmation replay passed",
+    )
 
 
 def scenario_reminder_add(settings: ProductionSettings) -> ScenarioResult:
@@ -2867,8 +3577,9 @@ SCENARIOS: tuple[ScenarioFn, ...] = (
     scenario_last_qa_mandatory_before_classification,
     scenario_deterministic_action_detection,
     scenario_multi_action_detection_fails_closed,
-    scenario_sql_backed_knowledge_lookup,
+    scenario_read_only_knowledge_general_route,
     scenario_general_sql_knowledge_fallback,
+    scenario_read_only_reminder_general_route,
     scenario_deterministic_knowledge_update,
     scenario_shared_confirmation_lifecycle,
     scenario_clarification_schema_echo_recovery,
@@ -2882,11 +3593,14 @@ SCENARIOS: tuple[ScenarioFn, ...] = (
     scenario_onnx_non_retryable_model_error,
     scenario_content_composer_deterministic,
     scenario_general_broad_retrieval_approved,
+    scenario_general_broad_retrieval_below_followup_gate,
     scenario_lastqa_supporting_skip,
+    scenario_lastqa_support_below_resolution_gate,
     scenario_knowledge_add,
     scenario_knowledge_modify,
     scenario_knowledge_delete_not_found,
     scenario_knowledge_modify_missing_replacement,
+    scenario_knowledge_three_llm_pipeline,
     scenario_reminder_add,
     scenario_reminder_supporting_question_printed,
     scenario_reminder_modify,

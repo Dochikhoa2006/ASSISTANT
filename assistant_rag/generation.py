@@ -58,9 +58,15 @@ class LLMClarificationStrategy:
                         rewritten_query=context.rewritten_query,
                         intent=context.intent.value,
                         extra={
+                            "task_type": "clarification",
                             "missing_fields": missing_fields,
                             "ambiguity_reason": ambiguity_reason,
-                        }
+                            "generation_instruction": (
+                                "Generate a new clarification question for the current turn. "
+                                "Do not reuse a precomputed clarification_question from request metadata."
+                            ),
+                        },
+                        chat_history=context.chat_history,
                     )
                 ),
                 schema=schema,

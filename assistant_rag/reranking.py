@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from math import isfinite
 import time
 from typing import Iterable
 from urllib import error, request
@@ -30,9 +31,19 @@ class SentenceTransformerCrossEncoderReranker:
             kwargs["device"] = self.settings.device
         self.model = CrossEncoder(self.settings.model_name, **kwargs)
 
-    def rerank(self, query: str, results: Iterable[RetrievalResult]) -> list[RetrievalResult]:
+    def rerank(
+        self,
+        query: str,
+        results: Iterable[RetrievalResult],
+        *,
+        enforce_min_score: bool = True,
+    ) -> list[RetrievalResult]:
         if self.remote is not None:
-            return self.remote.rerank(query, results)
+            return self.remote.rerank(
+                query,
+                results,
+                enforce_min_score=enforce_min_score,
+            )
         candidates = list(results)[: self.settings.max_candidates]
         pairs = [(query, str(item.payload.get("text", ""))) for item in candidates]
         if not pairs:
@@ -47,7 +58,7 @@ class SentenceTransformerCrossEncoderReranker:
                     entity_id=result.entity_id,
                     source_store_evidence=result.source_store_evidence,
                     rerank_score=value,
-                    confidence=max(result.confidence, value),
+                    confidence=value,
                     validation_status=result.validation_status,
                     payload=result.payload,
                 )
@@ -55,7 +66,11 @@ class SentenceTransformerCrossEncoderReranker:
         return [
             item
             for item in sorted(reranked, key=lambda item: item.rerank_score, reverse=True)
-            if item.rerank_score >= self.settings.min_score
+            if isfinite(item.rerank_score)
+            and (
+                not enforce_min_score
+                or item.rerank_score >= self.settings.min_score
+            )
         ]
 
     def warmup(self) -> None:
@@ -71,7 +86,13 @@ class SentenceTransformerCrossEncoderReranker:
 class HTTPReranker:
     settings: RerankerSettings
 
-    def rerank(self, query: str, results: Iterable[RetrievalResult]) -> list[RetrievalResult]:
+    def rerank(
+        self,
+        query: str,
+        results: Iterable[RetrievalResult],
+        *,
+        enforce_min_score: bool = True,
+    ) -> list[RetrievalResult]:
         candidates = list(results)[: self.settings.max_candidates]
         if not candidates:
             return []
@@ -104,7 +125,7 @@ class HTTPReranker:
                     entity_id=result.entity_id,
                     source_store_evidence=result.source_store_evidence,
                     rerank_score=value,
-                    confidence=max(result.confidence, value),
+                    confidence=value,
                     validation_status=result.validation_status,
                     payload=payload,
                 )
@@ -112,7 +133,11 @@ class HTTPReranker:
         return [
             item
             for item in sorted(reranked, key=lambda item: item.rerank_score, reverse=True)
-            if item.rerank_score >= self.settings.min_score
+            if isfinite(item.rerank_score)
+            and (
+                not enforce_min_score
+                or item.rerank_score >= self.settings.min_score
+            )
         ]
 
     def _score(self, body: dict[str, object]) -> list[float]:

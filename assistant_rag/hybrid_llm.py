@@ -31,14 +31,18 @@ class HybridLLMClient:
         system_prompt: str,
         user_prompt: str,
         schema: dict[str, Any],
+        model_override: str | None = None,
+        fallback_for: str | None = None,
     ) -> dict[str, Any]:
-        model_name = self.ollama_client.router.model_for_task(task)
+        model_name = model_override or self.ollama_client.router.model_for_task(task)
         if uses_onnx_runtime(model_name):
             payload = self.onnx_client.generate_json(
                 task=task,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                schema=schema
+                schema=schema,
+                model_override=model_override,
+                fallback_for=fallback_for,
             )
             onnx_error = self.onnx_client.last_error_by_task.get(task)
             if not onnx_error:
@@ -71,7 +75,9 @@ class HybridLLMClient:
             task=task,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            schema=schema
+            schema=schema,
+            model_override=model_override,
+            fallback_for=fallback_for,
         )
 
     def chat(self, *, task: LLMTask, system_prompt: str, user_prompt: str) -> str:

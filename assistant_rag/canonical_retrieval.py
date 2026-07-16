@@ -13,9 +13,17 @@ def retrieve_knowledge(
     repository: AssistantRepository,
     user_id: str,
     query: str,
+    enforce_min_score: bool = True,
 ) -> list[RetrievalResult]:
     """Run the sole knowledge retrieval pipeline, then hydrate its SQL truth."""
-    candidates = retriever.retrieve_knowledge(user_id=user_id, query=query)
+    if enforce_min_score:
+        candidates = retriever.retrieve_knowledge(user_id=user_id, query=query)
+    else:
+        candidates = retriever.retrieve_knowledge(
+            user_id=user_id,
+            query=query,
+            enforce_min_score=False,
+        )
     return repository.hydrate_knowledge_retrieval_results(
         user_id=user_id,
         results=candidates,

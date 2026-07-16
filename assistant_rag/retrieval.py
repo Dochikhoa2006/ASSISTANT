@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from math import isfinite
 from typing import Iterable, Protocol
 
 from .contracts import RetrievalResult
-from .retrieval_policy import RETRIEVAL_PIPELINE_POLICY, RetrievalPipelinePolicy
+from .retrieval_policy import (
+    DEFAULT_CROSS_ENCODER_MIN_SCORE,
+    RETRIEVAL_PIPELINE_POLICY,
+    RetrievalPipelinePolicy,
+)
 
 
 class SearchIndex(Protocol):
@@ -35,7 +40,13 @@ class SearchIndex(Protocol):
 
 
 class Reranker(Protocol):
-    def rerank(self, query: str, results: Iterable[RetrievalResult]) -> list[RetrievalResult]:
+    def rerank(
+        self,
+        query: str,
+        results: Iterable[RetrievalResult],
+        *,
+        enforce_min_score: bool = True,
+    ) -> list[RetrievalResult]:
         ...
 
 
@@ -50,6 +61,8 @@ class HybridRetriever:
     rerank_candidate_limit: int = RETRIEVAL_PIPELINE_POLICY.rrf_top_k
     bm25_top_k: int = RETRIEVAL_PIPELINE_POLICY.source_top_k
     chroma_top_k: int = RETRIEVAL_PIPELINE_POLICY.source_top_k
+    rerank_min_score: float = DEFAULT_CROSS_ENCODER_MIN_SCORE
+    conversation_min_confidence_score: float = 0.50
 
     def __post_init__(self) -> None:
         RetrievalPipelinePolicy(
@@ -59,6 +72,12 @@ class HybridRetriever:
         ).validate()
         if self.chroma_top_k != self.bm25_top_k:
             raise ValueError("OpenSearch and ChromaDB candidate limits must be identical")
+        if not 0.0 <= self.rerank_min_score <= 1.0:
+            raise ValueError("Cross-encoder minimum confidence must be between 0 and 1")
+        if not 0.0 <= self.conversation_min_confidence_score <= 1.0:
+            raise ValueError(
+                "Conversation minimum confidence must be between 0 and 1"
+            )
 
     def retrieve_conversation(
         self, *, user_id: str, query: str
@@ -70,12 +89,17 @@ class HybridRetriever:
         )
 
     def retrieve_knowledge(
-        self, *, user_id: str, query: str
+        self,
+        *,
+        user_id: str,
+        query: str,
+        enforce_min_score: bool = True,
     ) -> list[RetrievalResult]:
         return self._retrieve(
             user_id=user_id,
             query=query,
             allowed_entity_type="knowledge_chunk",
+            enforce_min_score=enforce_min_score,
         )
 
     def _retrieve(
@@ -84,6 +108,7 @@ class HybridRetriever:
         user_id: str,
         query: str,
         allowed_entity_type: str,
+        enforce_min_score: bool = True,
     ) -> list[RetrievalResult]:
         merged = self._rrf_merge(
             self.bm25.search(
@@ -103,10 +128,42 @@ class HybridRetriever:
             user_id=user_id,
             results=merged,
         )
-        reranked = self.reranker.rerank(query, eligible[: self.rerank_candidate_limit])
+        if enforce_min_score:
+            # Preserve compatibility with injected rerankers implementing the
+            # original two-argument contract on every normal retrieval path.
+            reranked = self.reranker.rerank(
+                query,
+                eligible[: self.rerank_candidate_limit],
+            )
+        else:
+            reranked = self.reranker.rerank(
+                query,
+                eligible[: self.rerank_candidate_limit],
+                enforce_min_score=False,
+            )
+        min_score = (
+            self.conversation_min_confidence_score
+            if allowed_entity_type == "conversation_hop"
+            else self.rerank_min_score
+        )
+        # Keep the threshold and final confidence invariant at the shared
+        # boundary even when an injected reranker forgets to enforce it.
+        threshold_approved = sorted(
+            (
+                replace(result, confidence=result.rerank_score)
+                for result in reranked
+                if isfinite(result.rerank_score)
+                and (
+                    not enforce_min_score
+                    or result.rerank_score >= min_score
+                )
+            ),
+            key=lambda item: item.rerank_score,
+            reverse=True,
+        )
         return self._filter_hard_rules(
             user_id=user_id,
-            results=reranked,
+            results=threshold_approved,
         )[: RETRIEVAL_PIPELINE_POLICY.final_top_k]
 
     @staticmethod

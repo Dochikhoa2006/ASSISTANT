@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import logging
 from typing import Any
 
+from .action_detection import enforce_mutation_only_intent
 from .config import ClassificationConfig, LastQAConfig
 from .contracts import (
     ChatRequest, Intent, LastQAState, ResponseType, LastQAPath,
@@ -113,6 +114,7 @@ def _resolve_exact_reminder_notification_reply(
         state=state,
         did_merge_query=False,
         skip_broad_retrieval=True,
+        confidence=1.0,
         interaction_type=LastQAInteractionType.REMINDER_NOTIFICATION_REPLY,
         question_source=QuestionSource.NONE,
         linked_topic_id=state.linked_topic_id,
@@ -134,22 +136,25 @@ class SupportingQuestionMatcher:
         self.match_threshold = match_threshold
 
     def matches(self, query: str, supporting_questions: list[Any]) -> bool:
+        return self.confidence(query, supporting_questions) >= self.match_threshold
+
+    def confidence(self, query: str, supporting_questions: list[Any]) -> float:
         if not query or not supporting_questions:
-            return False
+            return 0.0
         
         query_terms = set(query.casefold().split())
         if not query_terms:
-            return False
+            return 0.0
 
+        best_score = 0.0
         for question in supporting_questions:
             question_terms = set(question.text.casefold().split())
             if not question_terms:
                 continue
             intersection = query_terms.intersection(question_terms)
             overlap_ratio = len(intersection) / len(query_terms)
-            if overlap_ratio >= self.match_threshold:
-                return True
-        return False
+            best_score = max(best_score, overlap_ratio)
+        return best_score
 
 
 def can_skip_broad_retrieval(
@@ -169,13 +174,10 @@ def can_skip_broad_retrieval(
     matched_question = " ".join(str(payload.get("matched_question") or "").casefold().split())
 
     if interaction_type == LastQAInteractionType.NORMAL_FOLLOW_UP:
-        return bool(
-            state.linked_topic_id
-            and state.linked_hop_id
-            and state.last_response
-            and question_source == QuestionSource.NONE.value
-            and not matched_question
-        )
+        # Conversation follow-up ownership requires broad retrieval plus a
+        # validated top-hop reranker score. Last-QA may recognize continuity,
+        # but it must not bypass that conversation evidence gate.
+        return False
 
     if interaction_type == LastQAInteractionType.SUPPORTING_QUESTION_ANSWER:
         human_questions = {
@@ -234,6 +236,7 @@ class LastQAResolver:
                 state=None, 
                 did_merge_query=False,
                 skip_broad_retrieval=False,
+                confidence=1.0,
                 path=LastQAPath.NO_LAST_QA,
                 merge_reason=None,
                 skip_reason="no_last_qa_exists",
@@ -248,6 +251,7 @@ class LastQAResolver:
                 state=None,
                 did_merge_query=False,
                 skip_broad_retrieval=False,
+                confidence=0.0,
                 path=LastQAPath.BROAD_RETRIEVAL_REQUIRED,
                 merge_reason="clarification_not_answered_or_low_confidence",
                 skip_reason="broad_retrieval_required",
@@ -259,13 +263,20 @@ class LastQAResolver:
             return resolution
 
         if state.response_type in (ResponseType.NORMAL, ResponseType.KNOWLEDGE_ACTION, ResponseType.REMINDER_ACTION, ResponseType.REMINDER_REPLY, ResponseType.ERROR):
-            if state.supporting_questions and self.matcher.matches(rewritten_query, state.supporting_questions):
+            support_confidence = self.matcher.confidence(
+                rewritten_query, state.supporting_questions
+            )
+            if (
+                state.supporting_questions
+                and support_confidence >= self.matcher.match_threshold
+            ):
                 skip = bool(state.linked_topic_id and state.linked_hop_id)
                 resolution = LastQAResolution(
                     rewritten_query=rewritten_query, 
                     state=state, 
                     did_merge_query=False,
                     skip_broad_retrieval=skip, 
+                    confidence=support_confidence,
                     path=LastQAPath.LATEST_CONTEXT_INTERACTION if skip else LastQAPath.BROAD_RETRIEVAL_REQUIRED,
                     interaction_type=LastQAInteractionType.SUPPORTING_QUESTION_ANSWER if skip else None,
                     question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION if skip else QuestionSource.NONE,
@@ -283,6 +294,7 @@ class LastQAResolver:
             state=None,
             did_merge_query=False,
             skip_broad_retrieval=False,
+            confidence=0.0,
             path=LastQAPath.BROAD_RETRIEVAL_REQUIRED,
             merge_reason="no_safe_last_qa_merge",
             skip_reason="broad_retrieval_required",
@@ -378,6 +390,7 @@ class LLMLastQAResolver:
                     state=None,
                     did_merge_query=False,
                     skip_broad_retrieval=False,
+                    confidence=0.0,
                     is_authoritative_state=False,
                     diagnostic_context={"previous_last_qa_state": "safe_summary_only"},
                     merge_reason="clarification_merge_disabled",
@@ -397,6 +410,7 @@ class LLMLastQAResolver:
                     state=state,
                     did_merge_query=True,
                     skip_broad_retrieval=False,
+                    confidence=float(merge_payload.get("confidence", 0.0)),
                     is_authoritative_state=False,
                     missing_context=merge_payload.get("missing_context", []),
                     merge_reason="current_query_answered_previous_clarification",
@@ -411,6 +425,7 @@ class LLMLastQAResolver:
                 state=None,
                 did_merge_query=False,
                 skip_broad_retrieval=False,
+                confidence=0.0,
                 is_authoritative_state=False,
                 diagnostic_context={"previous_last_qa_state": "safe_summary_only"},
                 merge_reason="clarification_not_answered_or_low_confidence",
@@ -493,6 +508,7 @@ class LLMLastQAResolver:
                             state=state,
                             did_merge_query=False,
                             skip_broad_retrieval=True,
+                            confidence=float(payload.get("confidence", 0.0)),
                             linked_topic_id=state.linked_topic_id,
                             linked_hop_id=state.linked_hop_id,
                             matched_question=payload.get("matched_question"),
@@ -543,7 +559,7 @@ class LLMIntentClassifier(IntentClassifierProtocol):
         explicit_intent = request.metadata.get("intent")
         if explicit_intent:
             try:
-                return Intent(explicit_intent)
+                return enforce_mutation_only_intent(request, Intent(explicit_intent))
             except ValueError:
                 pass
 
@@ -583,7 +599,7 @@ class LLMIntentClassifier(IntentClassifierProtocol):
             
             intent_str = payload.get("intent")
             if intent_str and float(payload.get("confidence", 0.0)) >= self.config.min_confidence:
-                return Intent(intent_str)
+                return enforce_mutation_only_intent(request, Intent(intent_str))
         except Exception as e:
             _log_llm_fallback("Intent classifier", e)
 
@@ -602,11 +618,11 @@ class KeywordIntentClassifier(IntentClassifierProtocol):
     ) -> Intent:
         explicit_intent = request.metadata.get("intent")
         if explicit_intent:
-            return Intent(explicit_intent)
+            return enforce_mutation_only_intent(request, Intent(explicit_intent))
         query = rewritten_query.casefold()
         for intent_name, keywords in self.config.intent_keywords.items():
             if any(keyword.casefold() in query for keyword in keywords):
-                return Intent(intent_name)
+                return enforce_mutation_only_intent(request, Intent(intent_name))
         return Intent.GENERAL_RESPONSE
 
 # Expose IntentClassifier as the base protocol for type hints

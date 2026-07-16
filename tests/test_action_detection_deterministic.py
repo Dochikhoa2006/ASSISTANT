@@ -161,8 +161,10 @@ def test_rewritten_query_cannot_inject_an_action() -> None:
         Intent.KNOWLEDGE_FACTS,
     )
 
-    assert not result.requires_clarification
-    assert result.metadata == {"knowledge_lookup": True}
+    assert result.requires_clarification
+    assert result.metadata == {}
+    assert result.missing_fields == ["action_keyword"]
+    assert result.risk_flags == ["missing_action_keyword"]
 
 
 def test_hyphenated_noun_does_not_create_a_second_action() -> None:

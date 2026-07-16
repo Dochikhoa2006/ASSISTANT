@@ -41,11 +41,16 @@ class GeneralSubBranchDetector:
 
         approved_context = context.approved_conversation_context
         last_qa_state = context.last_qa_state
+        resolution_confidence = self._finite_score(
+            (context.last_qa_trace or {}).get("resolution_confidence")
+        )
         support_question_rule_fired = bool(
             last_qa_state is not None
             and last_qa_state.supporting_questions
             and approved_context is not None
             and approved_context._internal_selected_hop_candidates
+            and resolution_confidence
+            >= config.support_question_resolution_min_confidence
         )
 
         if support_question_rule_fired:
@@ -61,7 +66,16 @@ class GeneralSubBranchDetector:
                 reason_summary="Deterministic rule fired: SUPPORT_QUESTION_ANSWER.",
             )
 
-        if approved_context is not None and approved_context.approved_conversation_history:
+        top_hop_rerank_score = self._finite_score(
+            approved_context.top_hop_rerank_score
+            if approved_context is not None
+            else None
+        )
+        if (
+            approved_context is not None
+            and approved_context.approved_conversation_history
+            and top_hop_rerank_score >= config.conversation_followup_min_score
+        ):
             selected_topic_id = (
                 approved_context._internal_selected_topic_candidates[0]
                 if approved_context._internal_selected_topic_candidates
@@ -89,6 +103,16 @@ class GeneralSubBranchDetector:
             reason_summary="Deterministic rule fired: NEW_CONVERSATION_TOPIC.",
         )
 
+    @staticmethod
+    def _finite_score(value: object) -> float:
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if score != score or score in (float("inf"), float("-inf")):
+            return 0.0
+        return score
+
 
 class GeneralSubBranchValidator:
     def validate(
@@ -97,20 +121,32 @@ class GeneralSubBranchValidator:
         if decision.sub_branch == GeneralSubBranch.CONVERSATION_FOLLOW_UP:
             if not decision.selected_topic_id or not decision.selected_hop_id:
                 return GeneralSubBranchDecision(
-                    sub_branch=GeneralSubBranch(config.general_sub_branch_fallback_mode),
+                    sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
                     confidence=decision.confidence,
                     persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
-                    reason_summary="Missing required topic_id/hop_id for follow-up.",
+                    reason_summary=(
+                        "Validator rule fired: NEW_CONVERSATION_TOPIC because "
+                        "CONVERSATION_FOLLOW_UP is missing topic_id/hop_id."
+                    ),
                 )
         elif decision.sub_branch == GeneralSubBranch.SUPPORT_QUESTION_ANSWER:
-            if not context.last_qa_state or not context.last_qa_state.linked_topic_id or not context.last_qa_state.linked_hop_id:
-                if not decision.selected_topic_id or not decision.selected_hop_id:
-                    return GeneralSubBranchDecision(
-                        sub_branch=GeneralSubBranch(config.general_sub_branch_fallback_mode),
-                        confidence=decision.confidence,
-                        persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
-                        reason_summary="Missing required context for support question answer.",
-                    )
+            state = context.last_qa_state
+            if (
+                state is None
+                or not state.linked_topic_id
+                or not state.linked_hop_id
+                or not decision.selected_topic_id
+                or not decision.selected_hop_id
+            ):
+                return GeneralSubBranchDecision(
+                    sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
+                    confidence=decision.confidence,
+                    persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
+                    reason_summary=(
+                        "Validator rule fired: NEW_CONVERSATION_TOPIC because "
+                        "SUPPORT_QUESTION_ANSWER is missing linked topic/hop IDs."
+                    ),
+                )
         return decision
 
 

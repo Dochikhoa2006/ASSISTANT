@@ -5,6 +5,7 @@ from itertools import product
 
 import pytest
 
+from assistant_rag.branches import SUB_BRANCH_PROMPT_POLICIES
 from assistant_rag.config import GeneralPurposeConfig
 from assistant_rag.contracts import (
     ApprovedConversationContext,
@@ -19,7 +20,11 @@ from assistant_rag.contracts import (
     QuestionSource,
     ResponseType,
 )
-from assistant_rag.general_sub_branch import GeneralSubBranchDetector
+from assistant_rag.general_sub_branch import (
+    GeneralPersistencePlanBuilder,
+    GeneralSubBranchDetector,
+    GeneralSubBranchValidator,
+)
 from assistant_rag.prompts import DEFAULT_PROMPT_REGISTRY
 
 
@@ -57,6 +62,7 @@ def _approved_context(
     history: bool = True,
     topic_candidates: tuple[str, ...] = ("topic-linked", "topic-later"),
     hop_candidates: tuple[str, ...] = ("hop-linked", "hop-later"),
+    top_score: float | None = 0.95,
 ) -> ApprovedConversationContext:
     return ApprovedConversationContext(
         approved_conversation_history=(
@@ -71,6 +77,7 @@ def _approved_context(
         conversation_retrieval_ran=True,
         conversation_context_status="approved" if history else "empty",
         approved_conversation_count=1 if history else 0,
+        top_hop_rerank_score=top_score,
         _internal_selected_topic_candidates=list(topic_candidates),
         _internal_selected_hop_candidates=list(hop_candidates),
     )
@@ -80,6 +87,7 @@ def _context(
     *,
     last_qa_state: LastQAState | None = None,
     approved_context: ApprovedConversationContext | None = None,
+    resolution_confidence: float = 1.0,
 ) -> PipelineContext:
     return PipelineContext(
         request=ChatRequest(user_id="test-user", raw_query="Continue Project Atlas"),
@@ -87,6 +95,7 @@ def _context(
         last_qa_state=last_qa_state,
         conversation_results=[],
         intent=Intent.GENERAL_RESPONSE,
+        last_qa_trace={"resolution_confidence": resolution_confidence},
         approved_conversation_context=approved_context,
     )
 
@@ -291,3 +300,113 @@ def test_disabled_guard_keeps_configured_fallback_path_and_never_calls_llm() -> 
     assert decision.confidence == 1.0
     assert decision.reason_summary == "Detector disabled by config."
     _assert_unchanged_defaults(decision)
+
+
+@pytest.mark.parametrize(
+    ("resolution_confidence", "expected"),
+    (
+        (0.899, GeneralSubBranch.CONVERSATION_FOLLOW_UP),
+        (0.90, GeneralSubBranch.SUPPORT_QUESTION_ANSWER),
+        (1.0, GeneralSubBranch.SUPPORT_QUESTION_ANSWER),
+    ),
+)
+def test_support_question_resolution_confidence_gate_is_inclusive(
+    resolution_confidence: float,
+    expected: GeneralSubBranch,
+) -> None:
+    decision = _detector().detect(
+        _context(
+            last_qa_state=_last_qa(),
+            approved_context=_approved_context(),
+            resolution_confidence=resolution_confidence,
+        ),
+        GeneralPurposeConfig(support_question_resolution_min_confidence=0.90),
+    )
+
+    assert decision.sub_branch is expected
+    assert decision.confidence == 1.0
+
+
+@pytest.mark.parametrize(
+    ("top_score", "expected"),
+    (
+        (None, GeneralSubBranch.NEW_CONVERSATION_TOPIC),
+        (0.649, GeneralSubBranch.NEW_CONVERSATION_TOPIC),
+        (0.65, GeneralSubBranch.CONVERSATION_FOLLOW_UP),
+        (0.99, GeneralSubBranch.CONVERSATION_FOLLOW_UP),
+    ),
+)
+def test_conversation_follow_up_top_hop_score_gate_is_inclusive(
+    top_score: float | None,
+    expected: GeneralSubBranch,
+) -> None:
+    decision = _detector().detect(
+        _context(approved_context=_approved_context(top_score=top_score)),
+        GeneralPurposeConfig(conversation_followup_min_score=0.65),
+    )
+
+    assert decision.sub_branch is expected
+    assert decision.confidence == 1.0
+
+
+def test_support_validator_forces_new_topic_when_linked_ids_are_missing() -> None:
+    state = _last_qa()
+    state.linked_hop_id = None
+    context = _context(last_qa_state=state, approved_context=_approved_context())
+    unsafe = replace(
+        _detector().detect(context, GeneralPurposeConfig()),
+        sub_branch=GeneralSubBranch.SUPPORT_QUESTION_ANSWER,
+        persistence_mode=PersistenceMode.APPEND_TO_EXISTING_TOPIC,
+        selected_topic_id="topic-linked",
+        selected_hop_id="hop-from-decision",
+    )
+
+    decision = GeneralSubBranchValidator().validate(
+        unsafe, context, GeneralPurposeConfig()
+    )
+
+    assert decision.sub_branch is GeneralSubBranch.NEW_CONVERSATION_TOPIC
+    assert decision.persistence_mode is PersistenceMode.CREATE_NEW_TOPIC
+    assert decision.selected_topic_id is None
+    assert decision.selected_hop_id is None
+
+
+def test_follow_up_validator_and_plan_enforce_candidate_identity() -> None:
+    context = _context(approved_context=_approved_context())
+    unsafe = replace(
+        _detector().detect(context, GeneralPurposeConfig()),
+        selected_hop_id=None,
+    )
+    validated = GeneralSubBranchValidator().validate(
+        unsafe, context, GeneralPurposeConfig()
+    )
+    plan = GeneralPersistencePlanBuilder().build_plan(
+        validated, context, GeneralPurposeConfig()
+    )
+
+    assert validated.sub_branch is GeneralSubBranch.NEW_CONVERSATION_TOPIC
+    assert plan.sub_branch is GeneralSubBranch.NEW_CONVERSATION_TOPIC
+    assert plan.persistence_mode is PersistenceMode.CREATE_NEW_TOPIC
+    assert plan.topic_id is None
+    assert plan.previous_hop_id is None
+
+
+def test_sub_branch_prompt_policies_match_the_persistence_contract() -> None:
+    assert SUB_BRANCH_PROMPT_POLICIES[GeneralSubBranch.SUPPORT_QUESTION_ANSWER][
+        "chat_history_role"
+    ] == "User is answering a prior supporting question."
+    assert SUB_BRANCH_PROMPT_POLICIES[GeneralSubBranch.SUPPORT_QUESTION_ANSWER][
+        "response_goal"
+    ] == "Enhance/refine prior answer using current reply."
+    assert SUB_BRANCH_PROMPT_POLICIES[GeneralSubBranch.CONVERSATION_FOLLOW_UP][
+        "chat_history_role"
+    ] == "User is continuing an approved existing conversation."
+    assert SUB_BRANCH_PROMPT_POLICIES[GeneralSubBranch.CONVERSATION_FOLLOW_UP][
+        "response_goal"
+    ] == "Use chat history to stay on topic."
+    assert SUB_BRANCH_PROMPT_POLICIES[GeneralSubBranch.NEW_CONVERSATION_TOPIC][
+        "chat_history_role"
+    ] == "User is starting fresh."
+    assert SUB_BRANCH_PROMPT_POLICIES[GeneralSubBranch.NEW_CONVERSATION_TOPIC][
+        "response_goal"
+    ] == "Answer directly without forcing old context."

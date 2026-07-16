@@ -14,7 +14,7 @@ from hashlib import sha256
 import json
 from typing import Any, Callable
 
-from .action_detection import classify_action_request
+from .action_detection import classify_action_request, request_has_explicit_mutation
 from .contracts import BundledResponse, ChatRequest, Intent, ResponseType
 from .database import AssistantRepository
 from .pipeline import AssistantPipeline
@@ -55,10 +55,8 @@ def looks_like_mutation(request: ChatRequest) -> bool:
     # every keyed API/Streamlit reply receives the same exactly-once lifecycle.
     if metadata.get("reminder_reply_context"):
         return True
-    if metadata.get("knowledge_actions") or metadata.get("reminder_actions"):
-        return True
     return any(
-        classify_action_request(request.raw_query, intent).matched_actions
+        request_has_explicit_mutation(request, intent)
         for intent in (Intent.KNOWLEDGE_FACTS, Intent.REMINDER)
     )
 
@@ -71,7 +69,8 @@ def looks_destructive(request: ChatRequest) -> bool:
         return True
     destructive_actions = {"delete", "modify", "turn_off"}
     return any(
-        destructive_actions.intersection(
+        request_has_explicit_mutation(request, intent)
+        and destructive_actions.intersection(
             classify_action_request(request.raw_query, intent).matched_actions
         )
         for intent in (Intent.KNOWLEDGE_FACTS, Intent.REMINDER)

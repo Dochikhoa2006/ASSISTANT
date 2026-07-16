@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 
 from .bm25_opensearch import OpenSearchBM25Index
@@ -31,6 +31,11 @@ from .prompts import DEFAULT_PROMPT_REGISTRY
 from .retrieval import HybridRetriever
 from .reranking import SentenceTransformerCrossEncoderReranker
 from .action_detection import DeterministicActionDetector
+from .knowledge_mutation import (
+    KnowledgeContentFinalizationStrategy,
+    KnowledgeMutationPipeline,
+    LLMKnowledgeActionDetector,
+)
 from .context_filter import HardRuleContextFilter, TwoLayerContextFilter
 from .generation import LLMClarificationStrategy, LLMHumanInTheLoopStrategy, LLMReminderSupportingStrategy, LLMGeneralHITLStrategy
 from .retrieval_validation import KnowledgeRetrievalValidationStrategy, ReminderRetrievalValidationStrategy
@@ -69,6 +74,9 @@ def build_assistant_config(settings: ProductionSettings) -> AssistantConfig:
             lexical_weight=settings.retrieval.lexical_weight,
             semantic_weight=settings.retrieval.semantic_weight,
             rerank_candidate_limit=settings.retrieval.rerank_candidate_limit,
+            conversation_min_confidence_score=(
+                settings.retrieval.conversation_min_confidence_score
+            ),
         ),
         outbox=OutboxConfig(
             max_attempts=settings.worker.outbox_max_attempts,
@@ -214,8 +222,14 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
     embeddings = SentenceTransformerEmbeddingClient(settings.embeddings)
     chroma = ChromaPersistentVectorIndex(settings.chroma, embeddings)
     prompt_registry = DEFAULT_PROMPT_REGISTRY
-    model_router = OllamaModelRouter(settings.ollama)
-    ollama_llm = OllamaLLMClient(settings.ollama, model_router)
+    llm_settings = replace(
+        settings.ollama,
+        json_retry_count_knowledge_action_validation=(
+            settings.retrieval_validation.knowledge_llm_validation_json_retry_count
+        ),
+    )
+    model_router = OllamaModelRouter(llm_settings)
+    ollama_llm = OllamaLLMClient(llm_settings, model_router)
     onnx_llm = ONNXLLMClient(
         model_router,
         preload=settings.ollama.preload_onnx_models,
@@ -233,8 +247,12 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
         rerank_candidate_limit=assistant_config.retrieval.rerank_candidate_limit,
         bm25_top_k=assistant_config.retrieval.bm25_top_k,
         chroma_top_k=assistant_config.retrieval.chroma_top_k,
+        rerank_min_score=settings.reranker.min_score,
+        conversation_min_confidence_score=(
+            assistant_config.retrieval.conversation_min_confidence_score
+        ),
     )
-    action_detector = DeterministicActionDetector()
+    reminder_action_detector = DeterministicActionDetector()
     
     hard_rule_filter = HardRuleContextFilter(
         allowed_reminder_statuses=settings.prompt_policy.context_filter_allowed_reminder_statuses,
@@ -267,6 +285,24 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
         llm=llm,
         prompts=prompt_registry,
     )
+    knowledge_action_detector = LLMKnowledgeActionDetector(
+        llm=llm,
+        prompts=prompt_registry,
+        min_confidence=settings.prompt_policy.action_min_confidence,
+    )
+    knowledge_content_finalizer = KnowledgeContentFinalizationStrategy(
+        llm=llm,
+        prompts=prompt_registry,
+        min_confidence=(
+            assistant_config.retrieval_validation.knowledge_llm_validation_min_confidence
+        ),
+    )
+    knowledge_mutation_pipeline = KnowledgeMutationPipeline(
+        retriever=retriever,
+        config=assistant_config,
+        validator=knowledge_llm_validator,
+        finalizer=knowledge_content_finalizer,
+    )
     reminder_llm_validator = ReminderRetrievalValidationStrategy(
         config=assistant_config.retrieval_validation,
         llm=llm,
@@ -293,7 +329,7 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
 
     sub_branch_detector = GeneralSubBranchDetector(
         llm=llm, prompt_registry=prompt_registry,
-    ) if gp_config.general_sub_branch_detector_enabled else None
+    )
 
     answer_gen_tool = AnswerGenerationTool(llm=llm, prompt_registry=prompt_registry)
     excel_tool = GenerateExcelTool(llm=llm, prompt_registry=prompt_registry, config=gp_config)
@@ -335,17 +371,18 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
             ),
             Intent.KNOWLEDGE_FACTS: KnowledgeFactsBranch(
                 config=assistant_config,
-                action_detector=action_detector,
+                action_detector=knowledge_action_detector,
                 clarification_strategy=clarification_strategy,
                 prompt_registry=prompt_registry,
                 validated_action_builder=validated_action_builder,
                 retriever=retriever,
                 context_filter=context_filter,
                 llm=llm,
+                knowledge_mutation_pipeline=knowledge_mutation_pipeline,
             ),
             Intent.REMINDER: ReminderBranch(
                 config=assistant_config,
-                action_detector=action_detector,
+                action_detector=reminder_action_detector,
                 clarification_strategy=clarification_strategy,
                 prompt_registry=prompt_registry,
                 reminder_supporting_strategy=reminder_supporting_strategy,

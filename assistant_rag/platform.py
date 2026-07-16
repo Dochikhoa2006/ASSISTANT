@@ -14,7 +14,8 @@ import time
 from typing import Any, Protocol
 from urllib import request as urlrequest
 
-from .contracts import BundledResponse, ChatRequest
+from .artifacts import artifact_mime_type, resolve_generated_artifacts
+from .contracts import BundledResponse, ChatRequest, ResponseType
 from .llm import LLMClient, LLMTask
 from .chat_history import CHAT_HISTORY_PROMPT_RULE, inject_chat_history
 
@@ -28,11 +29,27 @@ _CHANNELS = ("gmail", "zalo", "telegram")
 _EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w+-])")
 _SEND_WORDS = re.compile(r"\b(send|deliver|email|mail|message|nhắn|gửi)\b", re.I)
 _DIRECT_SEND_WORDS = re.compile(r"\b(send|deliver|gửi)\b", re.I)
-_DO_NOT_SEND = re.compile(r"\b(?:do\s+not|don't|not\s+to|without)\s+(?:send|deliver|gửi)\b", re.I)
+_DO_NOT_SEND = re.compile(
+    r"\b(?:do\s+not|don't|not\s+to|without)\s+(?:send|deliver|email|mail|gửi)\b",
+    re.I,
+)
 _DRAFT_WORDS = re.compile(r"\b(compose|draft|write|prepare|soạn)\b", re.I)
 _EMAIL_MESSAGE_WORDS = re.compile(r"\b(?:email|mail|message)\b", re.I)
 _DIRECT_EMAIL_VERB = re.compile(r"\b(?:email|mail)\s+(?:to\s+)?[\w.+-]+@", re.I)
-_FILE_DELIVERY_WORDS = re.compile(r"\b(?:file|attachment|document|excel|spreadsheet|workbook|pdf|powerpoint|presentation|pptx)\b", re.I)
+_EMAIL_OBJECT_DELIVERY = re.compile(
+    r"\b(?:email|mail)\b(?:"
+    r"\s+(?:it|this|that|them)\s+to\b"
+    r"|\s+(?:[\w'-]+\s+){0,6}\.?"
+    r"(?:file|document|workbook|spreadsheet|worksheet|pdf|report|presentation|deck|slides|"
+    r"powerpoint|excel|xlsx|pptx|docx)"
+    r"\s+to\b)",
+    re.I,
+)
+_FILE_DELIVERY_WORDS = re.compile(
+    r"\b(?:file|attachment|document|report|excel|spreadsheet|workbook|worksheet|xlsx|"
+    r"pdf|powerpoint|presentation|deck|slides|pptx|docx)\b",
+    re.I,
+)
 _SUBJECT_LINE = re.compile(r"^\s*subject\s*:\s*(.+?)\s*$", re.I | re.M)
 _EMAIL_SALUTATION = re.compile(r"^\s*(?:dear|hello|hi)\b", re.I | re.M)
 _SAVE_GMAIL_DRAFT = re.compile(
@@ -101,7 +118,7 @@ def _gmail_recipient_candidates(text: str) -> list[str]:
     seen: set[str] = set()
     clause_pattern = re.compile(
         r"\b(?:to|cc|bcc|recipient(?:s)?\s*(?:are|:)?|email(?:s)?(?:\s+to|\s*:|\s+))\s+"
-        r"(.+?)(?=\b(?:to|cc|bcc|using|via|with|from|subject|body|username|app\s+password|credential)\b|\.(?:\s|$)|;|\n|$)",
+        r"(.+?)(?=\b(?:to|cc|bcc|using|via|with|from|subject|body|username|app\s+password|credential)\b|\.(?:\s|$)|\n|$)",
         re.I | re.S,
     )
     for match in clause_pattern.finditer(text):
@@ -134,7 +151,12 @@ def _is_explicit_email_message_request(text: str) -> bool:
     has_file_delivery_action = bool(_DIRECT_SEND_WORDS.search(text) and _FILE_DELIVERY_WORDS.search(text))
     return bool(
         _recipient_emails(text)
-        and (has_message_action or has_file_delivery_action or _DIRECT_EMAIL_VERB.search(text))
+        and (
+            has_message_action
+            or has_file_delivery_action
+            or _DIRECT_EMAIL_VERB.search(text)
+            or _EMAIL_OBJECT_DELIVERY.search(text)
+        )
     )
 
 
@@ -174,22 +196,8 @@ def _safe_imap_failure_reason(exc: Exception) -> str:
 
 
 def _public_artifacts(payload: dict[str, Any]) -> list[dict[str, str]]:
-    result: list[dict[str, str]] = []
-    for item in payload.get("artifacts", []) or []:
-        if not isinstance(item, dict):
-            continue
-        path = _clean(item.get("storage_path"))
-        filename = _clean(item.get("filename"))
-        # Artifacts must have been created by the content tool and have a real
-        # local file; never accept an arbitrary path supplied in a chat request.
-        if path and filename and Path(path).is_file():
-            result.append({
-                "artifact_id": _clean(item.get("artifact_id")),
-                "filename": filename,
-                "storage_path": path,
-                "storage_url": _clean(item.get("storage_url")),
-            })
-    return result
+    resolved, _ = resolve_generated_artifacts(payload.get("artifacts"))
+    return resolved
 
 
 @dataclass
@@ -320,17 +328,23 @@ class GmailSender:
         }
 
     def _email_message(self, payload: dict[str, Any], username: str, recipients: list[str]) -> EmailMessage:
+        attachments, unavailable = resolve_generated_artifacts(payload.get("attachments"))
+        if unavailable:
+            raise ValueError(
+                "Generated attachment files are unavailable: " + ", ".join(unavailable)
+            )
         message = EmailMessage()
         message["From"] = username
         message["To"] = ", ".join(recipients)
         message["Subject"] = payload["subject"]
         message.set_content(payload["body"])
-        for artifact in payload.get("attachments", []):
+        for artifact in attachments:
             path = Path(artifact["storage_path"])
+            maintype, subtype = artifact_mime_type(artifact["filename"]).split("/", 1)
             message.add_attachment(
                 path.read_bytes(),
-                maintype="application",
-                subtype="octet-stream",
+                maintype=maintype,
+                subtype=subtype,
                 filename=artifact["filename"],
             )
         return message
@@ -412,6 +426,13 @@ class PlatformSelector:
     def select(self, response: BundledResponse, request: ChatRequest) -> dict[str, Any]:
         base = dict(response.platform_payload)
         context = request.platform_context or {}
+        if response.response_type is ResponseType.ERROR:
+            base["platform_selection"] = {
+                "channel": "none",
+                "confidence": 1.0,
+                "source": "safe_fallback_error_response",
+            }
+            return self._hitl_passthrough(base, response)
         selection = self._choose_channel(response, request)
         channel = selection["channel"]
         base["platform_selection"] = selection
@@ -420,9 +441,29 @@ class PlatformSelector:
 
         formatter = self.formatters.get(channel)
         if formatter:
+            generated_artifacts = base.get("artifacts")
+            had_generated_artifacts = "artifacts" in base
             base.update(formatter.format(response, request))
+            if had_generated_artifacts:
+                # A channel formatter may shape text, but it cannot replace or
+                # discard files created by the content-composition stage.
+                base["artifacts"] = generated_artifacts
+            else:
+                base.pop("artifacts", None)
 
         message = self._extract(channel, response, request, base)
+        unavailable_attachments = list(message.get("unavailable_attachments") or [])
+        if unavailable_attachments:
+            return self._delivery_hold(
+                base,
+                "The message was not sent or drafted because these generated "
+                "attachments are unavailable: "
+                + ", ".join(unavailable_attachments)
+                + ". Regenerate the files and try again.",
+                channel=channel,
+                draft=message,
+                status="failed",
+            )
         missing = self._missing_fields(channel, message, context)
         if missing:
             return self._delivery_hold(
@@ -601,16 +642,16 @@ class PlatformSelector:
             except Exception:
                 extracted = {}
         allowed_gmail_recipients = _gmail_recipient_candidates(text) if channel == "gmail" else []
-        allowed_gmail_keys = {item.casefold() for item in allowed_gmail_recipients}
         recipient_parser = _recipient_emails if channel == "gmail" else _recipient_identifiers
         recipients = recipient_parser(extracted.get("recipients"))
         for recipient in recipient_parser(extracted.get("recipient")):
             if recipient.casefold() not in {item.casefold() for item in recipients}:
                 recipients.append(recipient)
         if channel == "gmail":
-            recipients = [item for item in recipients if item.casefold() in allowed_gmail_keys]
-            if not recipients:
-                recipients = allowed_gmail_recipients
+            # Literal addresses in the raw request are authoritative. The LLM
+            # extractor may neither invent addresses nor narrow the explicit
+            # ordered recipient set.
+            recipients = allowed_gmail_recipients
         # The bundled answer is the canonical body unless a platform-specific
         # extractor safely supplied a body. This makes artifact/general answers
         # usable by all delivery platforms without a second answer generator.
@@ -621,7 +662,12 @@ class PlatformSelector:
             subject = subject_match.group(1).strip(" '\"") if subject_match else ""
         if not subject:
             subject = _subject_from_bundled_response(response.final_chat_text)
-        attachments = _public_artifacts(base) if re.search(r"\b(attach|attachment|file|document|đính kèm)\b", text, re.I) else []
+        attachments: list[dict[str, str]] = []
+        unavailable_attachments: list[str] = []
+        if channel == "gmail":
+            attachments, unavailable_attachments = resolve_generated_artifacts(
+                base.get("artifacts")
+            )
         if not subject and attachments:
             subject = "Requested file"
         mode = _clean(extracted.get("mode"))
@@ -631,6 +677,8 @@ class PlatformSelector:
             mode = "send"
         elif _DRAFT_WORDS.search(text):
             mode = "draft"
+        elif _DIRECT_EMAIL_VERB.search(text) or _EMAIL_OBJECT_DELIVERY.search(text):
+            mode = "send"
         elif mode not in {"send", "draft"}:
             mode = "send" if _SEND_WORDS.search(text) and not _DRAFT_WORDS.search(text) else "draft"
         return {
@@ -641,6 +689,7 @@ class PlatformSelector:
             "body": body,
             "mode": mode,
             "attachments": attachments,
+            "unavailable_attachments": unavailable_attachments,
         }
 
     @staticmethod

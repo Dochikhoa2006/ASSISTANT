@@ -613,17 +613,33 @@ def test_deterministic_last_qa_resolver_reminder_reply_requires_exact_source_hop
 
 
 @pytest.mark.parametrize(
-    ("intent_value", "operation_kind", "expected"),
+    ("intent_value", "operation_kind", "query", "expected"),
     (
-        ("general_response", "none", Intent.GENERAL_RESPONSE),
-        ("knowledge_facts", "durable_knowledge", Intent.KNOWLEDGE_FACTS),
-        ("reminder", "reminder_lifecycle", Intent.REMINDER),
-        ("clarification", "clarification_reply", Intent.CLARIFICATION),
+        ("general_response", "none", "Explain the Atlas policy.", Intent.GENERAL_RESPONSE),
+        (
+            "knowledge_facts",
+            "durable_knowledge",
+            "Remember that Atlas uses PostgreSQL.",
+            Intent.KNOWLEDGE_FACTS,
+        ),
+        (
+            "reminder",
+            "reminder_lifecycle",
+            "Remind me tomorrow at 9 AM to submit expenses.",
+            Intent.REMINDER,
+        ),
+        (
+            "clarification",
+            "clarification_reply",
+            "The concise-report preference.",
+            Intent.CLARIFICATION,
+        ),
     ),
 )
 def test_production_intent_classifier_operation_routes(
     intent_value: str,
     operation_kind: str,
+    query: str,
     expected: Intent,
 ) -> None:
     llm = _LLMStub(
@@ -636,8 +652,8 @@ def test_production_intent_classifier_operation_routes(
     classifier = OllamaIntentClassifier(llm, min_confidence=0.7)
 
     result = classifier.classify(
-        ChatRequest(user_id="user-1", raw_query="Route this"),
-        "Route this",
+        ChatRequest(user_id="user-1", raw_query=query),
+        query,
         last_qa_resolution=_pending_clarification_resolution(),
         approved_conversation_context=None,
     )
@@ -690,9 +706,18 @@ def test_production_intent_classifier_failures_are_safe_general_fallbacks(
     assert len(llm.calls) == 1
 
 
-@pytest.mark.parametrize("intent", tuple(Intent))
+@pytest.mark.parametrize(
+    ("intent", "query"),
+    (
+        (Intent.CLARIFICATION, "The requested target."),
+        (Intent.GENERAL_RESPONSE, "Explain the requested target."),
+        (Intent.KNOWLEDGE_FACTS, "Remember that Atlas uses PostgreSQL."),
+        (Intent.REMINDER, "Set a reminder tomorrow at 9 AM."),
+    ),
+)
 def test_production_intent_classifier_valid_metadata_override_bypasses_llm(
     intent: Intent,
+    query: str,
 ) -> None:
     llm = _LLMStub(error=AssertionError("LLM must not run"))
     classifier = OllamaIntentClassifier(llm, min_confidence=0.7)
@@ -700,10 +725,10 @@ def test_production_intent_classifier_valid_metadata_override_bypasses_llm(
     result = classifier.classify(
         ChatRequest(
             user_id="user-1",
-            raw_query="Explicit route",
+            raw_query=query,
             metadata={"intent": intent.value},
         ),
-        "Explicit route",
+        query,
     )
 
     assert result is intent

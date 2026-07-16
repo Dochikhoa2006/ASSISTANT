@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import replace
 from typing import Any
 
 import onnxruntime_genai as og
@@ -274,8 +275,19 @@ class ONNXLLMClient:
         system_prompt: str,
         user_prompt: str,
         schema: dict[str, Any],
+        model_override: str | None = None,
+        fallback_for: str | None = None,
     ) -> dict[str, Any]:
+        del fallback_for
         decision = self.router.decision_for_task(task)
+        if model_override:
+            decision = replace(
+                decision,
+                model=model_override,
+                reason_summary=(
+                    f"Explicit model override for {task.value}"
+                ),
+            )
         retry_count = getattr(self.router.settings, f"json_retry_count_{task.value}", self.router.settings.structured_retry_count)
         total_attempts = retry_count + 1
         attempt_plan = _structured_attempt_plan(total_attempts)

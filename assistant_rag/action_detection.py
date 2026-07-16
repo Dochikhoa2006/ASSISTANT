@@ -245,6 +245,85 @@ def action_payload_is_authorized(
     return True, decision.reason_summary
 
 
+_MUTATION_REQUEST_PREFIX = re.compile(
+    r"^(?:"
+    r"(?:can|could|would|will)\s+you(?:\s+(?:please|kindly))?(?:\s+help\s+me(?:\s+to)?)?"
+    r"|(?:i|we)\s+(?:want|need|would\s+like)(?:\s+you)?\s+to"
+    r"|(?:i|we|you)\s+(?:should|must|need\s+to)"
+    r"|need\s+to|let(?:'s|\s+us)|help\s+me(?:\s+to)?|make\s+sure\s+to"
+    r"|i\s+authorize\s+you\s+to|go\s+ahead\s+and"
+    r")$"
+)
+_READ_ONLY_ACTION_OPENING = re.compile(
+    r"^(?:remember|remind\s+me)\s+"
+    r"(?:what|who|where|why|how|which|whether|if)\b"
+    r"|^update\s+me\s+(?:on|about)\b"
+)
+
+
+def request_has_explicit_mutation(request: ChatRequest, intent: Intent) -> bool:
+    """Return whether a state branch owns this exact raw user request.
+
+    Knowledge and reminder branches are mutation-only. Read/search/list/lookup
+    requests remain general-purpose even if they discuss a previous action such
+    as "what did I add?". A verified pending confirmation is the sole exception
+    because its action was already authorized and stored by the lifecycle layer.
+    """
+
+    if intent not in _ACTION_METADATA_KEYS:
+        return False
+
+    metadata = request.metadata or {}
+    validated_key = (
+        "validated_knowledge_actions"
+        if intent is Intent.KNOWLEDGE_FACTS
+        else "validated_reminder_actions"
+    )
+    if (
+        request.confirmation_token
+        and metadata.get("confirmation_approved")
+        and metadata.get(validated_key)
+    ):
+        confirmed, reason = action_payload_is_authorized(
+            request,
+            intent,
+            list(metadata.get(validated_key) or []),
+        )
+        if confirmed and reason == "authorized_confirmed_action":
+            return True
+
+    matches = _effective_action_matches(request.raw_query, intent)
+    if not matches:
+        return False
+
+    normalized_query = _normalize(request.raw_query).strip()
+    if _READ_ONLY_ACTION_OPENING.search(normalized_query):
+        return False
+
+    first_match = min(matches, key=lambda item: (item.start, item.end))
+    prefix = normalized_query[: first_match.start].strip(" \t\r\n,.:;!?-")
+    while True:
+        cleaned = re.sub(
+            r"^(?:please|kindly|just|now)(?:\s+|$)", "", prefix
+        ).strip()
+        if cleaned == prefix:
+            break
+        prefix = cleaned
+    if not prefix:
+        return True
+    return bool(_MUTATION_REQUEST_PREFIX.fullmatch(prefix))
+
+
+def enforce_mutation_only_intent(request: ChatRequest, intent: Intent) -> Intent:
+    """Move non-mutating knowledge/reminder requests to general-purpose."""
+
+    if intent in _ACTION_METADATA_KEYS and not request_has_explicit_mutation(
+        request, intent
+    ):
+        return Intent.GENERAL_RESPONSE
+    return intent
+
+
 @dataclass
 class DeterministicActionDetector:
     """Authorize one branch action without invoking a model."""
@@ -252,6 +331,20 @@ class DeterministicActionDetector:
     def detect(self, request: ChatRequest, rewritten_query: str, intent: Intent) -> ActionDetectionResult:
         if intent not in _ACTION_METADATA_KEYS:
             return ActionDetectionResult(intent=intent, confidence=1.0, metadata={})
+
+        decision = classify_action_request(request.raw_query, intent)
+        if not request_has_explicit_mutation(request, intent):
+            return ActionDetectionResult(
+                intent=intent,
+                confidence=0.0,
+                metadata={},
+                missing_fields=["action_keyword"],
+                risk_flags=[
+                    "read_only_query_requires_general_response"
+                    if decision.matched_actions
+                    else decision.reason_summary
+                ],
+            )
 
         action_key = _ACTION_METADATA_KEYS[intent]
         supplied_actions = list(request.metadata.get(action_key) or [])
@@ -263,14 +356,7 @@ class DeterministicActionDetector:
                 metadata={action_key: supplied_actions},
             )
 
-        decision = classify_action_request(request.raw_query, intent)
         if decision.selected_action is None:
-            if intent is Intent.KNOWLEDGE_FACTS and not supplied_actions and not decision.matched_actions:
-                return ActionDetectionResult(
-                    intent=intent,
-                    confidence=1.0,
-                    metadata={"knowledge_lookup": True},
-                )
             missing = "single_action" if decision.matched_actions else "action_keyword"
             return ActionDetectionResult(
                 intent=intent,
