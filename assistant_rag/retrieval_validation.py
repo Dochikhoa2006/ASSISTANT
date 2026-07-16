@@ -62,6 +62,9 @@ class KnowledgeRetrievalValidationStrategy:
         )
         if isolated_first_response is None:
             return self._build_internal_failure_result(operation)
+        first_model_response_ready = self._first_model_response_ready(
+            isolated_first_response
+        )
 
         payloads = []
         candidate_map = {}
@@ -106,6 +109,7 @@ class KnowledgeRetrievalValidationStrategy:
                 raw_response,
                 candidate_map,
                 requested_operation=operation,
+                first_model_response_ready=first_model_response_ready,
             )
         except Exception as e:
             logger.error(f"Knowledge LLM validation failed: {e}")
@@ -136,8 +140,8 @@ class KnowledgeRetrievalValidationStrategy:
         missing_fields = response["missing_fields"]
         reason_summary = response["reason_summary"]
         if (
-            action != requested_operation
-            or not isinstance(action, str)
+            not isinstance(action, str)
+            or action != requested_operation
             or not isinstance(text_content, str)
             or not isinstance(original_text, str)
             or not isinstance(replacement_text, str)
@@ -146,25 +150,36 @@ class KnowledgeRetrievalValidationStrategy:
             or not isfinite(float(confidence))
             or not 0.0 <= float(confidence) <= 1.0
             or not isinstance(missing_fields, list)
-            or missing_fields
+            or not all(isinstance(field, str) for field in missing_fields)
             or not isinstance(reason_summary, str)
-            or not reason_summary.strip()
         ):
-            return None
-        if action in {"add", "delete"}:
-            if not text_content or original_text or replacement_text:
-                return None
-        elif text_content or not original_text or not replacement_text:
             return None
         return {
             "action": action,
-            "text_content": text_content,
-            "original_text": original_text,
-            "replacement_text": replacement_text,
+            "text_content": text_content.strip(),
+            "original_text": original_text.strip(),
+            "replacement_text": replacement_text.strip(),
             "confidence": float(confidence),
-            "missing_fields": [],
-            "reason_summary": reason_summary,
+            "missing_fields": [field.strip() for field in missing_fields],
+            "reason_summary": reason_summary.strip(),
         }
+
+    def _first_model_response_ready(
+        self,
+        response: dict[str, Any],
+    ) -> bool:
+        action = response["action"]
+        text_content = response["text_content"]
+        original_text = response["original_text"]
+        replacement_text = response["replacement_text"]
+        if action in {"add", "delete"}:
+            return bool(text_content and not original_text and not replacement_text)
+        return bool(
+            action == "modify"
+            and not text_content
+            and original_text
+            and replacement_text
+        )
 
     def _parse_and_validate_result(
         self,
@@ -172,7 +187,14 @@ class KnowledgeRetrievalValidationStrategy:
         candidate_map: dict[str, KnowledgeValidationCandidate],
         *,
         requested_operation: str,
+        first_model_response_ready: bool,
     ) -> LLMRetrievalValidationResult:
+        """Guard 2: validate only model 2's contract and grounded evidence.
+
+        The finalizer owns exact MODIFY content construction and the repository
+        owns concurrency/database invariants, so this guard does not duplicate
+        those later-stage responsibilities.
+        """
         expected_fields = {
             "operation",
             "decision",
@@ -210,7 +232,6 @@ class KnowledgeRetrievalValidationStrategy:
                 or not isinstance(raw_confidence, (int, float))
                 or not isinstance(raw_question, str)
                 or not isinstance(raw_reason, str)
-                or not raw_reason.strip()
                 or not isinstance(raw_assessments, list)
             ):
                 return self._build_internal_failure_result(requested_operation)
@@ -241,7 +262,7 @@ class KnowledgeRetrievalValidationStrategy:
                         action_compatible=item["action_compatible"],
                         confidence=float(item_confidence),
                         matched_fields=tuple(item["matched_fields"]),
-                        reason_summary=item["reason_summary"],
+                        reason_summary=item["reason_summary"].strip(),
                         matched_text=item["matched_text"],
                     )
                 )
@@ -256,7 +277,10 @@ class KnowledgeRetrievalValidationStrategy:
                 selected_candidate_keys=tuple(raw_selected),
                 confidence=float(raw_confidence),
                 ambiguous=False,
-                reason_summary=raw_reason,
+                reason_summary=(
+                    raw_reason.strip()
+                    or "Knowledge validation returned a safe decision."
+                ),
                 candidate_assessments=assessments,
                 should_execute=raw_decision == "PASS",
                 requires_hitl=raw_decision == "FAIL",
@@ -287,10 +311,7 @@ class KnowledgeRetrievalValidationStrategy:
         assessment_keys = [
             assessment.candidate_key for assessment in res.candidate_assessments
         ]
-        if (
-            len(set(assessment_keys)) != len(assessment_keys)
-            or set(assessment_keys) != set(candidate_map)
-        ):
+        if len(set(assessment_keys)) != len(assessment_keys):
             return self._build_internal_failure_result(requested_operation)
         for assessment in res.candidate_assessments:
             candidate_text = candidate_map[assessment.candidate_key].text
@@ -307,13 +328,22 @@ class KnowledgeRetrievalValidationStrategy:
                 return self._build_internal_failure_result(requested_operation)
 
         if res.validation_result is ActionValidationResult.CLARIFY_MISSING_FIELDS:
-            if res.selected_candidate_keys or not (res.clarification_question or "").strip():
+            # FAIL is already non-executable. It needs a usable question and no
+            # selected target, but incomplete assessment coverage must not turn
+            # a safe refusal into an internal pipeline error.
+            if res.selected_candidate_keys or not (
+                res.clarification_question or ""
+            ).strip():
                 return self._build_internal_failure_result(requested_operation)
             return res
 
         if res.clarification_question != "":
             return self._build_internal_failure_result(requested_operation)
+        if not first_model_response_ready:
+            return self._build_internal_failure_result(requested_operation)
         if res.confidence < self.config.knowledge_llm_validation_min_confidence:
+            return self._build_internal_failure_result(requested_operation)
+        if set(assessment_keys) != set(candidate_map):
             return self._build_internal_failure_result(requested_operation)
         if requested_operation == "add":
             if res.selected_candidate_keys or any(
@@ -341,9 +371,6 @@ class KnowledgeRetrievalValidationStrategy:
                 or not selected_assessment.action_compatible
                 or selected_assessment.confidence
                 < self.config.knowledge_llm_validation_min_confidence
-                or candidate_map[selected_key].text.count(
-                    selected_assessment.matched_text
-                ) != 1
             ):
                 return self._build_internal_failure_result(requested_operation)
             strong_compatible_matches = {

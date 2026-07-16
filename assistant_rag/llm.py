@@ -43,7 +43,6 @@ class LLMTask(str, Enum):
     REMINDER_CONTENT_FINALIZATION = "reminder_content_finalization"
     GENERATE_CLARIFICATION = "generate_clarification"
     GENERATE_HUMAN_SUPPORTING = "generate_human_supporting"
-    GENERATE_REMINDER_SUPPORTING = "generate_reminder_supporting"
     CLARIFICATION_MERGE = "clarification_merge"
     ANSWER = "answer"
     WRITING = "writing"
@@ -529,24 +528,9 @@ def structured_fallback_payload(
     elif task == LLMTask.REMINDER_ACTION_EXTRACTION:
         payload.update({
             "action": "add",
-            "toggle_direction": "",
             "retrieval_text": "",
-            "changed_fields": [],
-            "subject": "",
-            "reminder_summary": "",
-            "raw_reminder": "",
-            "notification_time": "",
-            "event_time": "",
-            "time_semantics": "unchanged",
-            "user_timezone": "",
-            "original_time_text": "",
-            "recurrence_rule": "",
-            "recurrence_timezone": "",
-            "supporting_question": "",
-            "supporting_response": "",
+            "field_values": [],
             "confidence": 0.0,
-            "missing_fields": ["llm_structured_fallback"],
-            "reason_summary": reason,
         })
     elif task in {
         LLMTask.ACTION_EXTRACTION,
@@ -588,16 +572,6 @@ def structured_fallback_payload(
         })
     elif task == LLMTask.GENERATE_HUMAN_SUPPORTING:
         payload.update({"questions": []})
-    elif task == LLMTask.GENERATE_REMINDER_SUPPORTING:
-        payload.update({
-            "question_text": "",
-            "question_source": "reminder_supporting_question",
-            "purpose": "reminder_followup",
-            "confidence": 0.0,
-            "should_ask": False,
-            "expected_response_type": "unknown",
-            "reason_summary": reason,
-        })
     elif task == LLMTask.CLARIFICATION_MERGE:
         payload.update({
             "answered_clarification": False,
@@ -632,10 +606,18 @@ def structured_fallback_payload(
             "reason_summary": reason,
             "candidate_assessments": [],
         })
-    elif task in {
-        LLMTask.RETRIEVAL_VALIDATION,
-        LLMTask.REMINDER_ACTION_VALIDATION,
-    }:
+    elif task == LLMTask.REMINDER_ACTION_VALIDATION:
+        payload.update({
+            "validation_result": "FAIL",
+            "selected_candidate_keys": [],
+            "confidence": 0.0,
+            "clarification_question": (
+                "Could you clarify which reminder you want to change and "
+                "the exact result you want?"
+            ),
+            "candidate_assessments": [],
+        })
+    elif task == LLMTask.RETRIEVAL_VALIDATION:
         operation = _first_enum(schema, "operation") or "delete"
         payload.update({
             "operation": operation,
@@ -656,26 +638,8 @@ def structured_fallback_payload(
             payload["hitl_reason"] = "llm_structured_fallback"
     elif task == LLMTask.REMINDER_CONTENT_FINALIZATION:
         payload.update({
-            "operation": _first_enum(schema, "operation") or "add",
-            "selected_candidate_key": "",
-            "field_bindings": [
-                {"field": field, "source": "extracted_action"}
-                for field in (
-                    "subject",
-                    "reminder_summary",
-                    "raw_reminder",
-                    "notification_time",
-                    "event_time",
-                    "user_timezone",
-                    "original_time_text",
-                    "recurrence_rule",
-                    "recurrence_timezone",
-                    "supporting_question",
-                    "supporting_response",
-                )
-            ],
+            "approved": False,
             "confidence": 0.0,
-            "reason_summary": reason,
         })
     elif task == LLMTask.ACTION_PLANNING:
         payload.update({"confidence": 0.0, "reason_summary": reason})

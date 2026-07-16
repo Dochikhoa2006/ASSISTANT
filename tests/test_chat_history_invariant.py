@@ -141,7 +141,6 @@ def test_every_registry_prompt_preserves_complete_or_explicitly_empty_history() 
         "knowledge_action_extraction",
         "knowledge_content_finalization",
         "reminder_action_extraction",
-        "reminder_content_finalization",
         "risky_action_validation",
         "knowledge_retrieval_validation",
         "question_generation",
@@ -156,6 +155,11 @@ def test_every_registry_prompt_preserves_complete_or_explicitly_empty_history() 
             assert payload["chat_history"] == history
             assert len(payload["chat_history"]) == 12
 
+        finalization_payload = PromptContext(
+            stage="reminder_content_finalization"
+        ).stage_payload()
+        assert "chat_history" not in finalization_payload
+
     with canonical_chat_history_scope([]):
         payload = PromptContext(stage="intent_classifier").stage_payload()
         assert "chat_history" in payload
@@ -169,6 +173,7 @@ def test_every_registry_prompt_preserves_complete_or_explicitly_empty_history() 
             "clarification_merge",
             "knowledge_action_validation",
             "reminder_action_validation",
+            "reminder_content_finalization",
         }:
             continue
         assert CHAT_HISTORY_PROMPT_RULE in DEFAULT_PROMPT_REGISTRY.system(template_name)
@@ -267,6 +272,48 @@ def test_reminder_validation_prompt_contains_only_extraction_and_retrieval() -> 
     assert safe_payload == payload
     system_prompt = DEFAULT_PROMPT_REGISTRY.system(
         "reminder_action_validation"
+    )
+    assert CHAT_HISTORY_PROMPT_RULE not in system_prompt
+    assert "chat_history" not in system_prompt
+    assert "raw query" not in system_prompt.casefold()
+    assert "rewritten query" not in system_prompt.casefold()
+
+
+def test_reminder_finalization_prompt_contains_only_model_one_response() -> None:
+    history = [{"hop_id": "forbidden-hop", "text": "forbidden history"}]
+    first_model_response = {
+        "action": "modify",
+        "retrieval_text": "Payroll",
+        "field_values": [{"field": "subject", "value": "Final payroll"}],
+        "confidence": 0.99,
+    }
+
+    with canonical_chat_history_scope(history):
+        context = PromptContext(
+            stage="reminder_content_finalization",
+            user_id="forbidden-user",
+            rewritten_query="forbidden rewritten query",
+            metadata={"forbidden": "metadata"},
+            platform_context={"forbidden": "platform"},
+            chat_history=history,
+            extra={
+                "first_model_response": first_model_response,
+                "operation": "forbidden-operation-copy",
+                "proposed_field_bindings": ["forbidden-binding"],
+                "selected_candidate_manifest": {"forbidden": "sql"},
+                "validation_summary": {"forbidden": "model-2"},
+                "forbidden_extra": "must not survive",
+            },
+        )
+        payload = context.stage_payload()
+        safe_payload = context.safe_payload()
+
+    assert payload == {"first_model_response": first_model_response}
+    assert safe_payload == payload
+    serialized = json.dumps(payload, sort_keys=True)
+    assert "forbidden" not in serialized
+    system_prompt = DEFAULT_PROMPT_REGISTRY.system(
+        "reminder_content_finalization"
     )
     assert CHAT_HISTORY_PROMPT_RULE not in system_prompt
     assert "chat_history" not in system_prompt

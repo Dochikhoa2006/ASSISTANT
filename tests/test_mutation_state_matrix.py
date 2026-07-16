@@ -13,7 +13,6 @@ from assistant_rag.branch_orchestration import (
 from assistant_rag.branches import (
     KnowledgeFactsBranch,
     ReminderBranch,
-    _validated_reminder_from_dict,
 )
 from assistant_rag.config import ReminderTargetResolverConfig
 from assistant_rag.contracts import (
@@ -830,62 +829,7 @@ def test_reminder_modify_persists_full_optional_fields_with_none_aware_replaceme
     assert row["source_hop_id"] == original["source_hop_id"]
 
 
-def test_validated_reminder_confirmation_payload_rehydrates_all_fields() -> None:
-    later = BASE_TIME + timedelta(days=1)
-    action = _validated_reminder_from_dict(
-        {
-            "action": ReminderAction.MODIFY.value,
-            "validation_result": ActionValidationResult.EXECUTE.value,
-            "target_reminder_ids": ["reminder-1"],
-            "observed_status": ReminderStatus.SCHEDULED.value,
-            "observed_version": 4,
-            "observed_reminder_time": BASE_TIME.isoformat(),
-            "subject": "Payroll",
-            "event_time": BASE_TIME.isoformat(),
-            "reminder_time": BASE_TIME.isoformat(),
-            "reminder_summary": "Run payroll",
-            "raw_reminder": "Remind me to run payroll.",
-            "supporting_question": "Should this include contractors?",
-            "supporting_response": "Yes.",
-            "user_timezone": "Asia/Ho_Chi_Minh",
-            "original_time_text": "tomorrow morning",
-            "recurrence_rule": "weekly",
-            "recurrence_timezone": "Asia/Ho_Chi_Minh",
-            "next_fire_time": later.isoformat(),
-            "parent_recurring_reminder_id": "parent-1",
-            "replacement_subject": "Quarterly payroll",
-            "replacement_time": later.isoformat(),
-            "replacement_summary": "",
-            "replacement_recurrence_rule": "",
-            "replacement_recurrence_timezone": "",
-            "confidence": 0.97,
-            "matched_fields": ["subject", "reminder_summary"],
-            "reason_summary": "Validated reminder update.",
-            "requires_hitl": True,
-            "factuality_concern": True,
-            "hitl_reason": "factuality_confirmation",
-        }
-    )
-
-    assert action.observed_reminder_time == BASE_TIME
-    assert action.event_time == BASE_TIME
-    assert action.reminder_time == BASE_TIME
-    assert action.next_fire_time == later
-    assert action.replacement_time == later
-    assert action.supporting_question == "Should this include contractors?"
-    assert action.supporting_response == "Yes."
-    assert action.recurrence_rule == "weekly"
-    assert action.recurrence_timezone == "Asia/Ho_Chi_Minh"
-    assert action.parent_recurring_reminder_id == "parent-1"
-    assert action.replacement_summary == ""
-    assert action.replacement_recurrence_rule == ""
-    assert action.replacement_recurrence_timezone == ""
-    assert action.requires_hitl
-    assert action.factuality_concern
-    assert action.hitl_reason == "factuality_confirmation"
-
-
-def test_reminder_add_exact_duplicate_is_a_safe_transactional_noop(
+def test_reminder_repository_does_not_override_llm2_add_authorization_with_duplicate_detection(
     repository: SQLiteRepository,
 ) -> None:
     existing = _seed_reminder(repository)
@@ -902,9 +846,9 @@ def test_reminder_add_exact_duplicate_is_a_safe_transactional_noop(
     result = _reminder_transaction(repository, [action])
 
     assert result.committed
-    assert result.results[0].status == "skipped"
-    assert result.results[0].domain_entity_id is None
-    assert repository.table_count("reminders") == reminders_before
+    assert result.results[0].status == "committed"
+    assert result.results[0].domain_entity_id is not None
+    assert repository.table_count("reminders") == reminders_before + 1
 
 
 @pytest.mark.parametrize("failure", ("missing", "stale_version", "wrong_status"))
@@ -1101,21 +1045,20 @@ def test_knowledge_pass_executes_directly_without_pending_confirmation(
 
 
 @pytest.mark.parametrize(
-    ("action_type", "confidence", "requires_confirmation"),
+    ("action_type", "confidence"),
     (
-        (ReminderAction.DELETE, 1.0, True),
-        (ReminderAction.MODIFY, 0.50, True),
-        (ReminderAction.MODIFY, 1.0, False),
-        (ReminderAction.TURN_ON, 1.0, False),
-        (ReminderAction.TURN_OFF, 1.0, False),
+        (ReminderAction.DELETE, 1.0),
+        (ReminderAction.MODIFY, 0.50),
+        (ReminderAction.MODIFY, 1.0),
+        (ReminderAction.TURN_ON, 1.0),
+        (ReminderAction.TURN_OFF, 1.0),
     ),
 )
-def test_reminder_confirmation_policy_matrix(
+def test_reminder_validated_actions_execute_without_danger_or_pending_confirmation(
     repository: SQLiteRepository,
     config,
     action_type: ReminderAction,
     confidence: float,
-    requires_confirmation: bool,
 ) -> None:
     initial_status = (
         ReminderStatus.CANCELLED
@@ -1154,21 +1097,17 @@ def test_reminder_confirmation_policy_matrix(
         repository,
     )
 
-    if requires_confirmation:
-        assert result.response_type is ResponseType.REMINDER_ACTION
-        assert len(result.actions_pending_confirmation) == 1
-        unchanged = _reminder_row(repository, original["reminder_id"])
-        assert unchanged["status"] == original["status"]
-        assert unchanged["version"] == original["version"]
-    else:
-        assert result.response_type is ResponseType.REMINDER_ACTION
-        assert result.actions_pending_confirmation == []
-        assert len(result.reminder_operation_results) == 1
-        assert result.reminder_operation_results[0].status == "committed"
+    assert result.response_type is ResponseType.REMINDER_ACTION
+    assert result.actions_pending_confirmation == []
+    assert len(result.reminder_operation_results) == 1
+    assert result.reminder_operation_results[0].status == "committed"
+    assert repository.connection.execute(
+        "SELECT * FROM pending_action_confirmations"
+    ).fetchall() == []
     assert detector.calls == 1
 
 
-def test_reminder_branch_exact_duplicate_is_safe_noop(
+def test_reminder_branch_does_not_recheck_duplicate_after_llm2_execute(
     repository: SQLiteRepository,
     config,
 ) -> None:
@@ -1205,7 +1144,8 @@ def test_reminder_branch_exact_duplicate_is_safe_noop(
         repository,
     )
 
-    assert result.response_type is ResponseType.SAFE_NOOP
+    assert result.response_type is ResponseType.REMINDER_ACTION
     assert result.actions_pending_confirmation == []
-    assert repository.table_count("reminders") == 1
+    assert result.reminder_operation_results[0].status == "committed"
+    assert repository.table_count("reminders") == 2
     assert detector.calls == 1

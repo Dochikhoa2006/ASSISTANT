@@ -27,9 +27,6 @@ from .contracts import ChatRequest, Intent
 _SUPPORTED_POLICY_INTENTS = frozenset({Intent.KNOWLEDGE_FACTS, Intent.REMINDER})
 _SUPPORTED_CONFIRMATION_ACTION_NAMES = {
     Intent.KNOWLEDGE_FACTS: frozenset({"add", "delete", "modify"}),
-    Intent.REMINDER: frozenset(
-        {"add", "delete", "modify", "turn_on", "turn_off"}
-    ),
 }
 
 
@@ -125,12 +122,9 @@ def _has_bound_confirmation_policy_signal(
     """Check lifecycle binding without authorizing or returning the action."""
 
     metadata = request.metadata or {}
-    validated_key = (
-        "validated_knowledge_actions"
-        if intent is Intent.KNOWLEDGE_FACTS
-        else "validated_reminder_actions"
-    )
-    actions = list(metadata.get(validated_key) or [])
+    if intent not in _SUPPORTED_CONFIRMATION_ACTION_NAMES:
+        return False
+    actions = list(metadata.get("validated_knowledge_actions") or [])
     if (
         not request.confirmation_token
         or not metadata.get("confirmation_approved")

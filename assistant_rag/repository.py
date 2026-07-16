@@ -131,10 +131,6 @@ class AssistantRepository(ABC):
         pass
 
     @abstractmethod
-    def find_active_reminder_duplicates(self, *, user_id: str, subject: str, reminder_time: datetime, statuses: tuple[str, ...] = ("scheduled", "notified"), limit: int = 20) -> dict[str, Any]:
-        pass
-
-    @abstractmethod
     def update_reminder_status(self, cursor: sqlite3.Cursor, *, user_id: str, reminder_id: str, status: str, expected_version: int | None=None, expected_status: str | None=None) -> None:
         pass
 

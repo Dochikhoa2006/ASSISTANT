@@ -607,7 +607,7 @@ class ValidatedReminderAction:
     recurrence_timezone: Optional[str] = None
     next_fire_time: datetime | None = None
     parent_recurring_reminder_id: Optional[str] = None
-    # Legacy callers default to background timing. The three-stage reminder
+    # Legacy callers default to background timing. The reminder mutation
     # pipeline disables it only when an explicit notification timestamp has
     # already been validated and must not be overwritten by autoscan.
     timing_plan_required: bool = True
@@ -624,6 +624,7 @@ class ValidatedReminderAction:
     requires_hitl: bool = False
     factuality_concern: bool = False
     hitl_reason: Optional[str] = None
+    clarification_question: Optional[str] = None
 
 
 @dataclass(frozen=True)

@@ -78,20 +78,14 @@ class QuestionGenerationConfig:
     enabled: bool = True
     clarification_model: str | None = None
     human_supporting_model: str | None = None
-    reminder_supporting_model: str | None = None
     clarification_temperature: float = 0.15
     human_supporting_temperature: float = 0.25
-    reminder_supporting_temperature: float = 0.2
     timeout_seconds: float = 15.0
     clarification_max_tokens: int = 96
     human_supporting_max_tokens: int = 128
-    reminder_supporting_max_tokens: int = 128
     clarification_retry_count: int = 1
     human_supporting_retry_count: int = 1
-    reminder_supporting_retry_count: int = 1
     question_generation_confidence_threshold: float = 0.68
-    reminder_supporting_enabled: bool = True
-    reminder_supporting_min_confidence: float = 0.68
     human_supporting_max_count: int = 1
     fallback_policy: str = "fallback_message"
 
@@ -318,10 +312,6 @@ class AssistantConfig:
     general_purpose: GeneralPurposeConfig = field(default_factory=GeneralPurposeConfig)
     platform_channels: tuple[str, ...] = field(default_factory=tuple)
     default_timezone: str = "UTC"
-    reminder_duplicate_similarity_threshold: float = 0.72
-    reminder_duplicate_time_window_minutes: int = 45
-    confirmation_expiry_minutes: int = 10
-    confirmation_high_confidence_threshold: float = 0.92
     response_type_intent_mapping: dict[ResponseType, Intent] = field(
         default_factory=lambda: dict(RESPONSE_TYPE_INTENT_MAPPING)
     )

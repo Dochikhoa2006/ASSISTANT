@@ -276,8 +276,17 @@ def test_selected_state_branch_calls_extractor_before_considering_action_metadat
 
     result = branch.execute(context, RepositoryMustNotRun())
 
-    assert result.response_type is ResponseType.CLARIFICATION
-    assert result.normal_response_text is None
+    expected_response_type = (
+        ResponseType.SAFE_NOOP
+        if branch_type is ReminderBranch
+        else ResponseType.CLARIFICATION
+    )
+    assert result.response_type is expected_response_type
+    if branch_type is ReminderBranch:
+        assert result.clarification_question is None
+        assert result.normal_response_text
+    else:
+        assert result.normal_response_text is None
     assert result.knowledge_operation_results == []
     assert result.reminder_operation_results == []
     assert len(detector.calls) == 1

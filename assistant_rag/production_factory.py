@@ -42,8 +42,8 @@ from .reminder_mutation import (
     ReminderMutationPipeline,
 )
 from .context_filter import HardRuleContextFilter, TwoLayerContextFilter
-from .generation import LLMClarificationStrategy, LLMHumanInTheLoopStrategy, LLMReminderSupportingStrategy, LLMGeneralHITLStrategy
-from .retrieval_validation import KnowledgeRetrievalValidationStrategy, ReminderRetrievalValidationStrategy
+from .generation import LLMClarificationStrategy, LLMHumanInTheLoopStrategy, LLMGeneralHITLStrategy
+from .retrieval_validation import KnowledgeRetrievalValidationStrategy
 from .settings import ProductionSettings
 from .general_sub_branch import GeneralSubBranchDetector
 from .content_composer import (
@@ -105,20 +105,14 @@ def build_assistant_config(settings: ProductionSettings) -> AssistantConfig:
             enabled=settings.prompt_policy.question_generation_enabled,
             clarification_model=settings.ollama.model_generate_clarification,
             human_supporting_model=settings.ollama.model_generate_human_supporting,
-            reminder_supporting_model=settings.ollama.model_generate_reminder_supporting,
             clarification_temperature=settings.ollama.temperature_generate_clarification,
             human_supporting_temperature=settings.ollama.temperature_generate_human_supporting,
-            reminder_supporting_temperature=settings.ollama.temperature_generate_reminder_supporting,
             timeout_seconds=settings.ollama.timeout_generate_clarification,
             clarification_max_tokens=settings.ollama.num_predict_generate_clarification,
             human_supporting_max_tokens=settings.ollama.num_predict_generate_human_supporting,
-            reminder_supporting_max_tokens=settings.ollama.num_predict_generate_reminder_supporting,
             clarification_retry_count=settings.ollama.json_retry_count_generate_clarification,
             human_supporting_retry_count=settings.ollama.json_retry_count_generate_human_supporting,
-            reminder_supporting_retry_count=settings.ollama.json_retry_count_generate_reminder_supporting,
             question_generation_confidence_threshold=settings.prompt_policy.question_generation_confidence_threshold,
-            reminder_supporting_enabled=settings.prompt_policy.reminder_supporting_question_enabled,
-            reminder_supporting_min_confidence=settings.prompt_policy.reminder_supporting_question_min_confidence,
             human_supporting_max_count=settings.prompt_policy.human_supporting_question_max_count,
             fallback_policy=settings.prompt_policy.question_generation_fallback_policy,
         ),
@@ -145,10 +139,6 @@ def build_assistant_config(settings: ProductionSettings) -> AssistantConfig:
             clarification_expected_response_type_required=settings.prompt_policy.clarification_expected_response_type_required,
         ),
         default_timezone=settings.safety.default_timezone,
-        reminder_duplicate_similarity_threshold=settings.safety.reminder_duplicate_similarity_threshold,
-        reminder_duplicate_time_window_minutes=settings.safety.reminder_duplicate_time_window_minutes,
-        confirmation_expiry_minutes=settings.safety.confirmation_expiry_minutes,
-        confirmation_high_confidence_threshold=settings.safety.confirmation_high_confidence_threshold,
         human_in_the_loop_min_confidence=settings.prompt_policy.human_in_the_loop_min_confidence,
     )
 
@@ -280,12 +270,6 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
         prompt_registry=prompt_registry,
         config=assistant_config.question_generation,
     )
-    reminder_supporting_strategy = LLMReminderSupportingStrategy(
-        llm=llm,
-        prompt_registry=prompt_registry,
-        config=assistant_config.question_generation,
-    )
-
     knowledge_llm_validator = KnowledgeRetrievalValidationStrategy(
         config=assistant_config.retrieval_validation,
         llm=llm,
@@ -332,12 +316,6 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
         validator=reminder_action_validator,
         finalizer=reminder_content_finalizer,
     )
-    reminder_llm_validator = ReminderRetrievalValidationStrategy(
-        config=assistant_config.retrieval_validation,
-        llm=llm,
-        prompts=prompt_registry,
-    )
-
     knowledge_target_resolver = KnowledgeTargetResolver(
         retriever=retriever,
         config=assistant_config,
@@ -345,7 +323,6 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
     )
     reminder_target_resolver = ReminderTargetResolver(
         config=assistant_config,
-        llm_validator=reminder_llm_validator,
     )
     validated_action_builder = ValidatedActionBuilder(
         config=assistant_config,
@@ -412,10 +389,7 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
             Intent.REMINDER: ReminderBranch(
                 config=assistant_config,
                 action_detector=reminder_action_detector,
-                clarification_strategy=clarification_strategy,
                 prompt_registry=prompt_registry,
-                reminder_supporting_strategy=reminder_supporting_strategy,
-                validated_action_builder=validated_action_builder,
                 retriever=retriever,
                 context_filter=context_filter,
                 llm=llm,

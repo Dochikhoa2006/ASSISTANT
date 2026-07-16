@@ -377,42 +377,32 @@ def test_failed_knowledge_extractor_never_falls_back_to_metadata_action() -> Non
 
 
 @pytest.mark.parametrize(
-    ("extraction", "expected_missing"),
+    "extraction",
     [
-        (
-            _extraction(
-                action="add",
-                text_content="Atlas retention is 30 days",
-                original_text="Atlas retention is 14 days",
-            ),
-            "text",
+        _extraction(
+            action="add",
+            text_content="Atlas retention is 30 days",
+            original_text="Atlas retention is 30 days",
         ),
-        (
-            _extraction(
-                action="delete",
-                text_content="Atlas retention is 30 days",
-                replacement_text="Atlas retention is 45 days",
-            ),
-            "target_description",
+        _extraction(
+            action="delete",
+            text_content="Atlas retention is 30 days",
+            replacement_text="Atlas retention is 45 days",
         ),
-        (
-            _extraction(
-                action="modify",
-                text_content="Atlas retention is 30 days",
-                original_text="Atlas retention is 30 days",
-                replacement_text="Atlas retention is 45 days",
-            ),
-            "target_description",
+        _extraction(
+            action="modify",
+            text_content="Atlas retention is 30 days",
+            original_text="Atlas retention is 30 days",
+            replacement_text="Atlas retention is 45 days",
         ),
-        (
-            _extraction(action="modify", original_text="Atlas retention is 30 days"),
-            "replacement_text",
+        _extraction(
+            action="modify",
+            original_text="Atlas retention is 30 days",
         ),
     ],
 )
-def test_knowledge_extractor_enforces_action_specific_content_exclusivity(
+def test_first_guard_forwards_grounded_action_shape_issues_to_model_two(
     extraction: dict[str, Any],
-    expected_missing: str,
 ) -> None:
     query = (
         "Change Atlas retention is 30 days to Atlas retention is 45 days"
@@ -426,11 +416,222 @@ def test_knowledge_extractor_enforces_action_specific_content_exclusivity(
             Intent.KNOWLEDGE_FACTS,
         )
 
-    assert detection.requires_clarification
+    assert not detection.requires_clarification
     assert len(llm.calls) == 1
     assert llm.calls[0]["task"] is LLMTask.KNOWLEDGE_ACTION_EXTRACTION
-    assert expected_missing in detection.missing_fields
-    assert detection.metadata.get("knowledge_actions") is None
+    assert detection.metadata["knowledge_action_extraction_response"] == extraction
+    assert len(detection.metadata["knowledge_actions"]) == 1
+
+
+def test_first_guard_still_rejects_ungrounded_response_content() -> None:
+    query = "Remember that Atlas retention is 30 days"
+    llm = ScriptedLLM(
+        [
+            _extraction(
+                action="add",
+                text_content="Atlas retention is 30 days",
+                original_text="Atlas retention is 14 days",
+            )
+        ]
+    )
+
+    with canonical_chat_history_scope([]):
+        detection = _detector(llm).detect(
+            ChatRequest(user_id=USER_ID, raw_query=query),
+            query,
+            Intent.KNOWLEDGE_FACTS,
+        )
+
+    assert detection.requires_clarification
+    assert detection.metadata == {}
+    assert detection.missing_fields == ["target_description"]
+    assert detection.risk_flags == [
+        "knowledge_content_not_grounded_in_request_context"
+    ]
+
+
+def test_pipeline_guard_one_rejects_divergent_knowledge_action_state_before_validation() -> None:
+    canonical_fact = "Atlas retention is 30 days"
+    llm = ScriptedLLM([])
+    retriever = RecordingKnowledgeRetriever([])
+    branch = _branch(llm, retriever)
+    context = _context(f"Remember that {canonical_fact}", [])
+    context.request.metadata["knowledge_action_extraction_response"] = (
+        _extraction(action="add", text_content=canonical_fact)
+    )
+
+    validated = branch.knowledge_mutation_pipeline.build_action(
+        context=context,
+        action_payload={
+            "action": "add",
+            "text": "A divergent fact that model 1 did not return",
+            "confidence": 0.99,
+        },
+        repository=_repository(),
+    )
+
+    assert validated.hitl_reason == "internal_pipeline_failure"
+    assert "guard 1" in validated.reason_summary.casefold()
+    assert llm.calls == []
+    assert retriever.calls == []
+
+
+def test_best_effort_incomplete_first_response_reaches_model_two_fail() -> None:
+    original = "Atlas retention is 30 days"
+    query = f"Change {original}"
+    extraction = {
+        **_extraction(action="modify", original_text=original),
+        "confidence": 0.20,
+        "missing_fields": ["replacement_text"],
+        "reason_summary": "",
+    }
+    repository = _repository()
+    chunk_id = _seed_knowledge(repository, original)
+    llm = ScriptedLLM(
+        [
+            extraction,
+            _validation(
+                operation="modify",
+                decision="FAIL",
+                selected=[],
+                # A safe FAIL does not need complete candidate coverage in the
+                # post-model-2 guard.
+                assessments=[],
+                clarification_question="What should replace that stored fact?",
+                confidence=0.25,
+                reason="",
+            ),
+        ]
+    )
+    retriever = RecordingKnowledgeRetriever(
+        [_retrieval_result(chunk_id, original)]
+    )
+
+    with canonical_chat_history_scope([]):
+        result = _branch(llm, retriever).execute(
+            _context(query, []),
+            repository,
+        )
+
+    assert result.response_type is ResponseType.CLARIFICATION
+    assert result.clarification_question is not None
+    assert result.clarification_question.text == (
+        "What should replace that stored fact?"
+    )
+    assert [call["task"] for call in llm.calls] == [
+        LLMTask.KNOWLEDGE_ACTION_EXTRACTION,
+        LLMTask.KNOWLEDGE_ACTION_VALIDATION,
+    ]
+    validation_payload = _prompt_payload(llm.calls[1])
+    assert validation_payload["first_model_response"] == extraction
+    assert len(validation_payload["knowledge_retrieval"]) == 1
+    assert repository.table_count("knowledge_chunks") == 1
+
+
+def test_incomplete_first_response_cannot_be_authorized_by_model_two_pass() -> None:
+    extraction = {
+        **_extraction(action="add"),
+        "missing_fields": ["text_content"],
+    }
+    llm = ScriptedLLM(
+        [
+            extraction,
+            _validation(
+                operation="add",
+                decision="PASS",
+                selected=[],
+                assessments=[],
+            ),
+        ]
+    )
+    retriever = RecordingKnowledgeRetriever([])
+    repository = _repository()
+
+    with canonical_chat_history_scope([]):
+        result = _branch(llm, retriever).execute(
+            _context("Remember a fact", []),
+            repository,
+        )
+
+    assert result.response_type is ResponseType.ERROR
+    assert [call["task"] for call in llm.calls] == [
+        LLMTask.KNOWLEDGE_ACTION_EXTRACTION,
+        LLMTask.KNOWLEDGE_ACTION_VALIDATION,
+    ]
+    assert retriever.calls == []
+    assert repository.table_count("knowledge_chunks") == 0
+
+
+def test_advisory_missing_fields_do_not_override_complete_model_state() -> None:
+    fact = "Atlas retention is 30 days"
+    extraction = {
+        **_extraction(action="add", text_content=fact),
+        "missing_fields": ["text_content"],
+    }
+    llm = ScriptedLLM(
+        [
+            extraction,
+            _validation(
+                operation="add",
+                decision="PASS",
+                selected=[],
+                assessments=[],
+                reason="",
+            ),
+        ]
+    )
+    repository = _repository()
+
+    with canonical_chat_history_scope([]):
+        result = _branch(llm, RecordingKnowledgeRetriever([])).execute(
+            _context(f"Remember that {fact}", []),
+            repository,
+        )
+
+    assert result.response_type is ResponseType.KNOWLEDGE_ACTION
+    assert [call["task"] for call in llm.calls] == [
+        LLMTask.KNOWLEDGE_ACTION_EXTRACTION,
+        LLMTask.KNOWLEDGE_ACTION_VALIDATION,
+    ]
+    rows = repository.connection.execute(
+        "SELECT raw_text FROM knowledge_chunks WHERE user_id = ?",
+        (USER_ID,),
+    ).fetchall()
+    assert [row["raw_text"] for row in rows] == [fact]
+
+
+def test_model_two_may_authorize_grounded_low_confidence_model_one_state() -> None:
+    fact = "Atlas retention is 30 days"
+    extraction = {
+        **_extraction(action="add", text_content=fact),
+        "confidence": 0.20,
+    }
+    llm = ScriptedLLM(
+        [
+            extraction,
+            _validation(
+                operation="add",
+                decision="PASS",
+                selected=[],
+                assessments=[],
+                confidence=0.99,
+            ),
+        ]
+    )
+    repository = _repository()
+
+    with canonical_chat_history_scope([]):
+        result = _branch(llm, RecordingKnowledgeRetriever([])).execute(
+            _context(f"Remember that {fact}", []),
+            repository,
+        )
+
+    assert result.response_type is ResponseType.KNOWLEDGE_ACTION
+    assert [call["task"] for call in llm.calls] == [
+        LLMTask.KNOWLEDGE_ACTION_EXTRACTION,
+        LLMTask.KNOWLEDGE_ACTION_VALIDATION,
+    ]
+    assert repository.table_count("knowledge_chunks") == 1
 
 
 @pytest.mark.parametrize(
@@ -932,6 +1133,58 @@ def test_finalizer_integrity_failure_returns_error_without_hitl_or_write() -> No
     assert row["raw_text"] == original
 
 
+def test_repeated_modify_match_is_deferred_to_finalization_guard() -> None:
+    original = "Atlas retention is 30 days"
+    replacement = "Atlas retention is 45 days"
+    stored = f"{original}. Repeated policy: {original}."
+    query = f"Change {original} to {replacement}"
+    repository = _repository()
+    chunk_id = _seed_knowledge(repository, stored)
+    llm = ScriptedLLM(
+        [
+            _extraction(
+                action="modify",
+                original_text=original,
+                replacement_text=replacement,
+            ),
+            _validation(
+                operation="modify",
+                decision="PASS",
+                selected=[chunk_id],
+                assessments=[
+                    _assessment(
+                        chunk_id,
+                        matches=True,
+                        matched_text=original,
+                    )
+                ],
+            ),
+        ]
+    )
+
+    with canonical_chat_history_scope([]):
+        result = _branch(
+            llm,
+            RecordingKnowledgeRetriever(
+                [_retrieval_result(chunk_id, stored)]
+            ),
+        ).execute(_context(query, []), repository)
+
+    assert result.response_type is ResponseType.ERROR
+    # Model 2's response guard accepts the valid candidate decision. The next
+    # finalization state owns unique replacement occurrence and stops before
+    # calling model 3 when that precondition is ambiguous.
+    assert [call["task"] for call in llm.calls] == [
+        LLMTask.KNOWLEDGE_ACTION_EXTRACTION,
+        LLMTask.KNOWLEDGE_ACTION_VALIDATION,
+    ]
+    row = repository.connection.execute(
+        "SELECT raw_text FROM knowledge_chunks WHERE chunk_id = ?",
+        (chunk_id,),
+    ).fetchone()
+    assert row["raw_text"] == stored
+
+
 def test_modify_replacement_cannot_be_sourced_only_from_history() -> None:
     history = [
         {
@@ -1064,6 +1317,9 @@ def test_modify_preserves_long_chunk_then_commits_without_confirmation_gate() ->
         original_text=original,
         replacement_text=replacement,
     )
+    assert finalization_payload["extra"]["first_model_response"] == (
+        validation_payload["first_model_response"]
+    )
     assert set(validation_payload) == {
         "first_model_response",
         "knowledge_retrieval",
@@ -1073,7 +1329,7 @@ def test_modify_preserves_long_chunk_then_commits_without_confirmation_gate() ->
     assert "chat_history" not in serialized_validation
     assert "hop-long" not in serialized_validation
     assert finalization_payload["extra"]["extracted_action_content"] == {
-        "text_content": None,
+        "text_content": "",
         "original_text": original,
         "replacement_text": replacement,
     }
@@ -1098,6 +1354,92 @@ def test_modify_preserves_long_chunk_then_commits_without_confirmation_gate() ->
         (USER_ID,),
     ).fetchall()
     assert [row["raw_text"] for row in active] == [final_content]
+
+
+def test_model_one_state_has_priority_over_conflicting_query_history_and_context() -> None:
+    original = "Atlas retention is 30 days"
+    replacement = "Atlas retention is 45 days"
+    stored = f"{original}. Keep owner Mina unchanged."
+    final_content = stored.replace(original, replacement, 1)
+    query = (
+        "Delete the obsolete Beta note, and change "
+        f"{original} to {replacement}."
+    )
+    history = [
+        {
+            "hop_id": "conflicting-history-hop",
+            "text": "Add a Gamma note and delete the Atlas record.",
+        }
+    ]
+    extraction = _extraction(
+        action="modify",
+        original_text=original,
+        replacement_text=replacement,
+    )
+    repository = _repository()
+    chunk_id = _seed_knowledge(repository, stored)
+    llm = ScriptedLLM(
+        [
+            extraction,
+            _validation(
+                operation="modify",
+                decision="PASS",
+                selected=[chunk_id],
+                assessments=[
+                    _assessment(chunk_id, matches=True, matched_text=original)
+                ],
+            ),
+            {
+                "final_content": final_content,
+                "confidence": 0.99,
+                "reason_summary": "Followed the authoritative model-1 state.",
+            },
+        ]
+    )
+    context = _context(query, history)
+    context.request.metadata["context_note"] = (
+        "Non-authoritative metadata says to add another fact."
+    )
+    context.request.platform_context["workspace_hint"] = (
+        "Non-authoritative platform context says delete."
+    )
+
+    with canonical_chat_history_scope(history):
+        result = _branch(
+            llm,
+            RecordingKnowledgeRetriever(
+                [_retrieval_result(chunk_id, stored)]
+            ),
+        ).execute(context, repository)
+
+    assert result.response_type is ResponseType.KNOWLEDGE_ACTION
+    finalization_call = llm.calls[2]
+    payload = _prompt_payload(finalization_call)
+    assert payload["rewritten_query"] == query
+    assert payload["chat_history"] == history
+    assert payload["metadata"]["context_note"].startswith(
+        "Non-authoritative metadata"
+    )
+    assert payload["platform_context"]["workspace_hint"].startswith(
+        "Non-authoritative platform context"
+    )
+    assert payload["extra"]["first_model_response"] == extraction
+    assert payload["extra"]["operation"] == "modify"
+    assert payload["extra"]["extracted_action_content"] == {
+        "text_content": "",
+        "original_text": original,
+        "replacement_text": replacement,
+    }
+    system_prompt = str(finalization_call["system_prompt"])
+    assert "first_model_response is the highest-priority" in system_prompt
+    assert "follow first_model_response" in system_prompt
+    assert "rewritten query" in system_prompt
+    assert "canonical chat_history" in system_prompt
+    row = repository.connection.execute(
+        "SELECT raw_text FROM knowledge_chunks WHERE user_id = ? AND is_deleted = 0",
+        (USER_ID,),
+    ).fetchone()
+    assert row["raw_text"] == final_content
 
 
 def test_authoritative_empty_history_never_reintroduces_stale_supporting_questions() -> None:
@@ -1156,6 +1498,13 @@ def test_authoritative_empty_history_never_reintroduces_stale_supporting_questio
         payload = _prompt_payload(call)
         assert payload["chat_history"] == []
         assert payload["extra"]["supporting_question_context"] == []
+    assert _prompt_payload(llm.calls[2])["extra"][
+        "first_model_response"
+    ] == _extraction(
+        action="modify",
+        original_text=original,
+        replacement_text=replacement,
+    )
     validation_payload = _prompt_payload(llm.calls[1])
     assert set(validation_payload) == {
         "first_model_response",

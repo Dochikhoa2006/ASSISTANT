@@ -439,20 +439,6 @@ class DeterministicGeneralHITLStrategy:
         )
 
 
-class OptionalReminderSupportingStrategy:
-    def generate(self, context: Any, **kwargs: Any) -> GeneratedQuestion | None:
-        question_text = context.request.metadata.get("reminder_supporting_question")
-        if not question_text:
-            return None
-        return GeneratedQuestion(
-            text=str(question_text),
-            source=QuestionSource.REMINDER_SUPPORTING_QUESTION,
-            purpose="optional_context",
-            confidence=1.0,
-            expected_response_type=ExpectedResponseType.REMINDER_FOLLOWUP_ANSWER,
-        )
-
-
 class DeterministicRetriever:
     def __init__(
         self,
@@ -1353,7 +1339,6 @@ def build_scenario_state(settings: ProductionSettings) -> ScenarioState:
                     default_timezone=config.default_timezone,
                 ),
                 clarification_strategy=clarification_strategy,
-                reminder_supporting_strategy=OptionalReminderSupportingStrategy(),
                 prompt_registry=DEFAULT_PROMPT_REGISTRY,
                 validated_action_builder=validated_builder,
                 retriever=retriever,
@@ -2294,8 +2279,6 @@ def scenario_structured_clarification_fallback_policy(settings: ProductionSettin
         raise AssertionError("clarification JSON generation needs enough token budget for all required fields")
     if default_settings.ollama.num_predict_generate_human_supporting < 160:
         raise AssertionError("human supporting-question JSON generation needs enough token budget")
-    if default_settings.ollama.num_predict_generate_reminder_supporting < 160:
-        raise AssertionError("reminder supporting-question JSON generation needs enough token budget")
     if default_settings.ollama.temperature_generate_clarification != 0.0:
         raise AssertionError("clarification JSON generation must use deterministic sampling")
     if default_settings.ollama.model_generate_clarification_fallback != "qwen3.5:4b":
@@ -2882,7 +2865,6 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         LLMTask.REMINDER_CONTENT_FINALIZATION: "microsoft/Phi-4-mini-instruct-onnx",
         LLMTask.GENERATE_CLARIFICATION: "qwen3.5:4b",
         LLMTask.GENERATE_HUMAN_SUPPORTING: "qwen3.5:4b",
-        LLMTask.GENERATE_REMINDER_SUPPORTING: "qwen3.5:4b",
         LLMTask.CLARIFICATION_MERGE: "qwen3.5:4b",
         LLMTask.ANSWER: "microsoft/Phi-4-mini-instruct-onnx",
         LLMTask.WRITING: "microsoft/Phi-4-mini-instruct-onnx",
@@ -4113,35 +4095,6 @@ def scenario_reminder_add(settings: ProductionSettings) -> ScenarioResult:
     return ScenarioResult("reminder_add", True, "reminder add committed")
 
 
-def scenario_reminder_supporting_question_printed(settings: ProductionSettings) -> ScenarioResult:
-    state = build_scenario_state(settings)
-    response = run_request(
-        state,
-        "Remind me to submit payroll tomorrow",
-        metadata={
-            "intent": Intent.REMINDER.value,
-            "reminder_actions": [
-                {
-                    "action": "add",
-                    "subject": "Submit payroll",
-                    "reminder_summary": "Submit payroll",
-                    "reminder_time": "2026-07-10T09:00:00+00:00",
-                }
-            ],
-            "reminder_supporting_question": "Should this reminder repeat every payroll cycle?",
-        },
-    )
-    assert_response(response, ResponseType.REMINDER_ACTION, "Added reminder")
-    expected = "Reminder supporting question: Should this reminder repeat every payroll cycle?"
-    if expected not in response.final_chat_text:
-        raise AssertionError(f"reminder supporting question was not printed: {response.final_chat_text!r}")
-    return ScenarioResult(
-        "reminder_supporting_question_printed",
-        True,
-        "reminder supporting question is visible in final chat text",
-    )
-
-
 def scenario_reminder_modify(settings: ProductionSettings) -> ScenarioResult:
     state = build_scenario_state(settings)
     seed_reminder(
@@ -4341,7 +4294,6 @@ SCENARIOS: tuple[ScenarioFn, ...] = (
     scenario_knowledge_modify_missing_replacement,
     scenario_knowledge_three_llm_pipeline,
     scenario_reminder_add,
-    scenario_reminder_supporting_question_printed,
     scenario_reminder_modify,
     scenario_reminder_turn_off,
     scenario_reminder_turn_on,

@@ -282,7 +282,7 @@ def test_keyed_general_delivery_artifact_and_conversation_side_effects_replay_on
     assert rate_limit_signals == [(False, False), (False, False)]
 
 
-def test_reminder_confirmation_hydrates_reminder_branch_metadata(
+def test_legacy_reminder_confirmation_domain_is_rejected_without_replay(
     repository: SQLiteRepository,
 ) -> None:
     confirmation = repository.create_pending_confirmation(
@@ -313,44 +313,28 @@ def test_reminder_confirmation_hydrates_reminder_branch_metadata(
         expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
     )
     token = str(confirmation["confirmation_token"])
-    pipeline = RecordingPipeline(
-        [
-            _response(
-                "Turned off the reminder.",
-                ResponseType.REMINDER_ACTION,
-                committed_action="turn_off",
-            )
-        ]
-    )
+    pipeline = RecordingPipeline([])
     executor = ChatRequestLifecycleExecutor(
         pipeline=pipeline,  # type: ignore[arg-type]
         repository=repository,
     )
 
-    result = executor.execute(
-        ChatRequest(
-            user_id="user-1",
-            raw_query="Confirm the pending reminder change.",
-            confirmation_token=token,
-            idempotency_key=f"reminder:{token}",
-        ),
-        fallback_request_id="reminder",
-    )
+    with pytest.raises(
+        RequestLifecycleConflict,
+        match="unsupported action domain",
+    ):
+        executor.execute(
+            ChatRequest(
+                user_id="user-1",
+                raw_query="Confirm the pending reminder change.",
+                confirmation_token=token,
+                idempotency_key=f"reminder:{token}",
+            ),
+            fallback_request_id="reminder",
+        )
 
-    expected_actions = [
-        {
-            "action": "turn_off",
-            "validation_result": "execute",
-            "target_reminder_ids": ["reminder-1"],
-            "observed_status": "scheduled",
-            "observed_version": 1,
-        }
-    ]
-    assert result.request.metadata["intent"] == "reminder"
-    assert result.request.metadata["validated_reminder_actions"] == expected_actions
-    assert result.request.metadata["reminder_actions"] == expected_actions
-    assert result.request.metadata["action_authorization"]["action"] == "turn_off"
-    assert _confirmation_status(repository, token) == "confirmed"
+    assert pipeline.requests == []
+    assert _confirmation_status(repository, token) == "pending"
 
 
 def test_pipeline_failure_marks_idempotency_failed_and_retry_can_complete(

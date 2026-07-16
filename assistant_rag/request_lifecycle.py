@@ -65,9 +65,9 @@ def looks_like_mutation(request: ChatRequest) -> bool:
 
 
 def looks_destructive(request: ChatRequest) -> bool:
-    # Every confirmation created by the knowledge/reminder branches protects a
-    # destructive action.  The plain confirmation query does not repeat the
-    # stored action keyword, so it must remain destructive for request limits.
+    # A pending knowledge confirmation protects a destructive action. The
+    # plain confirmation query does not repeat the stored action keyword, so
+    # it must remain destructive for request limits.
     if request.confirmation_token:
         return True
     return any(
@@ -98,16 +98,9 @@ def _confirmation_action_was_committed(
 ) -> bool:
     """Consume a confirmation only after its one validated action committed."""
 
-    expected_actions: list[dict[str, Any]] = []
-    for metadata_key in (
-        "validated_knowledge_actions",
-        "validated_reminder_actions",
-    ):
-        values = request.metadata.get(metadata_key) or []
-        if values:
-            if expected_actions:
-                return False
-            expected_actions = list(values)
+    expected_actions = list(
+        request.metadata.get("validated_knowledge_actions") or []
+    )
     committed_actions = list(response.actions_committed)
     if len(expected_actions) != 1 or len(committed_actions) != 1:
         return False
@@ -252,12 +245,7 @@ class ChatRequestLifecycleExecutor:
         proposed = confirmation.get("proposed_action") or {}
         domain = str(proposed.get("domain") or "")
         metadata = dict(request.metadata or {})
-        if domain == "reminder":
-            actions = list(proposed.get("actions") or [])
-            metadata["validated_reminder_actions"] = actions
-            metadata["reminder_actions"] = actions
-            metadata["intent"] = Intent.REMINDER.value
-        elif domain == "knowledge":
+        if domain == "knowledge":
             actions = list(proposed.get("actions") or [])
             metadata["validated_knowledge_actions"] = actions
             metadata["knowledge_actions"] = actions

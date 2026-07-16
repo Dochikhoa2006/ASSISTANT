@@ -118,9 +118,9 @@ class OllamaSettings:
     num_predict_knowledge_content_finalization: int | None = 2048
     temperature_knowledge_content_finalization: float = 0.0
 
-    # Reminder-only three-stage mutation pipeline. Dedicated task settings keep
-    # its larger structured reminder payloads isolated from generic extraction,
-    # legacy retrieval validation, knowledge mutation, and file generation.
+    # Reminder mutation pipeline; the third model is reserved for MODIFY only.
+    # Dedicated task settings keep its larger structured reminder payloads
+    # isolated from generic extraction, knowledge mutation, and file generation.
     model_reminder_action_extraction: str = "qwen3.5:4b"
     timeout_reminder_action_extraction: float = 24.0
     num_ctx_reminder_action_extraction: int = 8192
@@ -156,14 +156,6 @@ class OllamaSettings:
     num_predict_generate_human_supporting: int | None = 160
     temperature_generate_human_supporting: float = 0.25
     json_retry_count_generate_human_supporting: int = 1
-
-    # Task: GENERATE_REMINDER_SUPPORTING
-    model_generate_reminder_supporting: str = "qwen3.5:4b"
-    timeout_generate_reminder_supporting: float = 15.0
-    num_ctx_generate_reminder_supporting: int = 1536
-    num_predict_generate_reminder_supporting: int | None = 160
-    temperature_generate_reminder_supporting: float = 0.2
-    json_retry_count_generate_reminder_supporting: int = 1
 
     # Task: CLARIFICATION_MERGE
     model_clarification_merge: str = "qwen3.5:4b"
@@ -337,10 +329,6 @@ class APISettings:
 @dataclass(frozen=True)
 class SafetySettings:
     default_timezone: str = "UTC"
-    reminder_duplicate_similarity_threshold: float = 0.72
-    reminder_duplicate_time_window_minutes: int = 45
-    confirmation_expiry_minutes: int = 10
-    confirmation_high_confidence_threshold: float = 0.92
     allow_missing_idempotency_key: bool = True
 
 
@@ -390,9 +378,7 @@ class PromptPolicySettings:
     knowledge_modify_requires_replacement_text: bool = True
     context_filter_allowed_reminder_statuses: tuple[str, ...] = ("scheduled", "notified")
     question_generation_enabled: bool = True
-    reminder_supporting_question_enabled: bool = True
     question_generation_confidence_threshold: float = 0.68
-    reminder_supporting_question_min_confidence: float = 0.68
     human_supporting_question_max_count: int = 1
     question_generation_fallback_policy: str = "fallback_message"
     mutation_partial_execution_policy: MutationPartialExecutionPolicy = MutationPartialExecutionPolicy.ALL_OR_NOTHING
@@ -734,12 +720,6 @@ class ProductionSettings:
                 num_predict_generate_human_supporting=_get_int("OLLAMA_GENERATE_HUMAN_SUPPORTING_NUM_PREDICT", OllamaSettings.num_predict_generate_human_supporting) if os.getenv("OLLAMA_GENERATE_HUMAN_SUPPORTING_NUM_PREDICT") else OllamaSettings.num_predict_generate_human_supporting,
                 temperature_generate_human_supporting=_get_float("OLLAMA_GENERATE_HUMAN_SUPPORTING_TEMPERATURE", OllamaSettings.temperature_generate_human_supporting),
                 json_retry_count_generate_human_supporting=_get_int("OLLAMA_GENERATE_HUMAN_SUPPORTING_JSON_RETRY_COUNT", OllamaSettings.json_retry_count_generate_human_supporting),
-                model_generate_reminder_supporting=os.getenv("OLLAMA_GENERATE_REMINDER_SUPPORTING_MODEL", OllamaSettings.model_generate_reminder_supporting),
-                timeout_generate_reminder_supporting=_get_float("OLLAMA_GENERATE_REMINDER_SUPPORTING_TIMEOUT", OllamaSettings.timeout_generate_reminder_supporting),
-                num_ctx_generate_reminder_supporting=_get_int("OLLAMA_GENERATE_REMINDER_SUPPORTING_NUM_CTX", OllamaSettings.num_ctx_generate_reminder_supporting),
-                num_predict_generate_reminder_supporting=_get_int("OLLAMA_GENERATE_REMINDER_SUPPORTING_NUM_PREDICT", OllamaSettings.num_predict_generate_reminder_supporting) if os.getenv("OLLAMA_GENERATE_REMINDER_SUPPORTING_NUM_PREDICT") else OllamaSettings.num_predict_generate_reminder_supporting,
-                temperature_generate_reminder_supporting=_get_float("OLLAMA_GENERATE_REMINDER_SUPPORTING_TEMPERATURE", OllamaSettings.temperature_generate_reminder_supporting),
-                json_retry_count_generate_reminder_supporting=_get_int("OLLAMA_GENERATE_REMINDER_SUPPORTING_JSON_RETRY_COUNT", OllamaSettings.json_retry_count_generate_reminder_supporting),
                 model_clarification_merge=os.getenv("OLLAMA_CLARIFICATION_MERGE_MODEL", OllamaSettings.model_clarification_merge),
                 timeout_clarification_merge=_get_float("OLLAMA_CLARIFICATION_MERGE_TIMEOUT", OllamaSettings.timeout_clarification_merge),
                 num_ctx_clarification_merge=_get_int("OLLAMA_CLARIFICATION_MERGE_NUM_CTX", OllamaSettings.num_ctx_clarification_merge),
@@ -932,22 +912,6 @@ class ProductionSettings:
             ),
             safety=SafetySettings(
                 default_timezone=os.getenv("ASSISTANT_DEFAULT_TIMEZONE", SafetySettings.default_timezone),
-                reminder_duplicate_similarity_threshold=_get_float(
-                    "ASSISTANT_REMINDER_DUPLICATE_SIMILARITY_THRESHOLD",
-                    SafetySettings.reminder_duplicate_similarity_threshold,
-                ),
-                reminder_duplicate_time_window_minutes=_get_int(
-                    "ASSISTANT_REMINDER_DUPLICATE_TIME_WINDOW_MINUTES",
-                    SafetySettings.reminder_duplicate_time_window_minutes,
-                ),
-                confirmation_expiry_minutes=_get_int(
-                    "ASSISTANT_CONFIRMATION_EXPIRY_MINUTES",
-                    SafetySettings.confirmation_expiry_minutes,
-                ),
-                confirmation_high_confidence_threshold=_get_float(
-                    "ASSISTANT_CONFIRMATION_HIGH_CONFIDENCE_THRESHOLD",
-                    SafetySettings.confirmation_high_confidence_threshold,
-                ),
                 allow_missing_idempotency_key=_get_bool(
                     "ASSISTANT_ALLOW_MISSING_IDEMPOTENCY_KEY",
                     SafetySettings.allow_missing_idempotency_key,
@@ -1030,17 +994,9 @@ class ProductionSettings:
                     "PROMPT_QUESTION_GENERATION_ENABLED",
                     PromptPolicySettings.question_generation_enabled,
                 ),
-                reminder_supporting_question_enabled=_get_bool(
-                    "PROMPT_REMINDER_SUPPORTING_QUESTION_ENABLED",
-                    PromptPolicySettings.reminder_supporting_question_enabled,
-                ),
                 question_generation_confidence_threshold=_get_float(
                     "PROMPT_QUESTION_GENERATION_CONFIDENCE_THRESHOLD",
                     PromptPolicySettings.question_generation_confidence_threshold,
-                ),
-                reminder_supporting_question_min_confidence=_get_float(
-                    "PROMPT_REMINDER_SUPPORTING_QUESTION_MIN_CONFIDENCE",
-                    PromptPolicySettings.reminder_supporting_question_min_confidence,
                 ),
                 human_supporting_question_max_count=_get_int(
                     "PROMPT_HUMAN_SUPPORTING_QUESTION_MAX_COUNT",

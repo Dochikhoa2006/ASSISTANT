@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import datetime, timezone
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -13,27 +12,33 @@ from assistant_rag.branches import ReminderBranch
 from assistant_rag.chat_history import canonical_chat_history_scope
 from assistant_rag.contracts import (
     ChatRequest,
-    ExpectedResponseType,
-    GeneratedQuestion,
     Intent,
     PipelineContext,
-    QuestionSource,
     ReminderAction,
     ResponseType,
 )
 from assistant_rag.database import SQLiteRepository
-from assistant_rag.llm import LLMTask
+from assistant_rag.llm import (
+    LLMTask,
+    structured_fallback_payload,
+    validate_json_schema,
+)
 from assistant_rag.production_factory import build_assistant_config
-from assistant_rag.prompts import DEFAULT_PROMPT_REGISTRY
+from assistant_rag.prompts import (
+    DEFAULT_PROMPT_REGISTRY,
+    REMINDER_ACTION_EXTRACTION_SCHEMA,
+    REMINDER_ACTION_VALIDATION_SCHEMA,
+    REMINDER_CONTENT_FINALIZATION_SCHEMA,
+)
 from assistant_rag.reminder_mutation import (
     REMINDER_EDITABLE_FIELDS,
     LLMReminderActionDetector,
     ReminderActionValidationStrategy,
     ReminderContentFinalizationStrategy,
+    ReminderMutationCandidate,
     ReminderMutationPipeline,
 )
 from assistant_rag.reminder_timing import ReminderTimingPlanner
-from assistant_rag.request_lifecycle import ChatRequestLifecycleExecutor
 from assistant_rag.settings import ProductionSettings
 
 
@@ -259,6 +264,119 @@ def _prompt_payload(call: dict[str, Any]) -> dict[str, Any]:
     return json.loads(prompt[len(prefix) :])
 
 
+def test_all_reminder_llm_contracts_are_minimal_and_have_no_clarification_component() -> None:
+    assert REMINDER_ACTION_EXTRACTION_SCHEMA["required"] == [
+        "action",
+        "retrieval_text",
+        "field_values",
+        "confidence",
+    ]
+    extraction_fields = set(
+        REMINDER_ACTION_EXTRACTION_SCHEMA["properties"]["field_values"]
+        ["items"]["properties"]["field"]["enum"]
+    )
+    assert {
+        "notification_time",
+        "event_time",
+        "user_timezone",
+        "original_time_text",
+    } <= extraction_fields
+    assert {"supporting_question", "supporting_response"}.isdisjoint(
+        extraction_fields
+    )
+    properties = REMINDER_ACTION_VALIDATION_SCHEMA["properties"]
+    decisions = set(properties["validation_result"]["enum"])
+
+    assert REMINDER_ACTION_VALIDATION_SCHEMA["required"] == [
+        "validation_result",
+        "selected_candidate_keys",
+        "confidence",
+        "clarification_question",
+        "candidate_assessments",
+    ]
+    assessment_properties = properties["candidate_assessments"]["items"][
+        "properties"
+    ]
+    assert set(assessment_properties) == {
+        "candidate_key",
+        "match_kind",
+        "confidence",
+        "evidence_field",
+        "matched_text",
+    }
+    assert not decisions & {
+        "EXECUTE",
+        "SKIP_NOT_FOUND",
+        "SKIP_ALREADY_EXISTS",
+        "REJECT_UNSAFE_TRANSITION",
+        "CLARIFY_AMBIGUOUS_TARGET",
+        "CLARIFY_MISSING_FIELDS",
+    }
+    assert decisions == {"PASS", "FAIL"}
+    assert not {
+        "ambiguous",
+        "requires_hitl",
+        "factuality_concern",
+        "hitl_reason",
+        "operation",
+        "should_execute",
+        "reason_summary",
+    } & set(properties)
+    assert REMINDER_CONTENT_FINALIZATION_SCHEMA["required"] == [
+        "approved",
+        "confidence",
+    ]
+    assert "clarification_strategy" not in ReminderBranch.__dataclass_fields__
+    assert "validated_action_builder" not in ReminderBranch.__dataclass_fields__
+    assert "reminder_supporting_strategy" not in ReminderBranch.__dataclass_fields__
+
+
+@pytest.mark.parametrize(
+    ("task", "schema", "expected_keys"),
+    (
+        (
+            LLMTask.REMINDER_ACTION_EXTRACTION,
+            REMINDER_ACTION_EXTRACTION_SCHEMA,
+            {"action", "retrieval_text", "field_values", "confidence"},
+        ),
+        (
+            LLMTask.REMINDER_ACTION_VALIDATION,
+            REMINDER_ACTION_VALIDATION_SCHEMA,
+            {
+                "validation_result",
+                "selected_candidate_keys",
+                "confidence",
+                "clarification_question",
+                "candidate_assessments",
+            },
+        ),
+        (
+            LLMTask.REMINDER_CONTENT_FINALIZATION,
+            REMINDER_CONTENT_FINALIZATION_SCHEMA,
+            {"approved", "confidence"},
+        ),
+    ),
+)
+def test_reminder_structured_fallbacks_match_minimal_schemas(
+    task: LLMTask,
+    schema: dict[str, Any],
+    expected_keys: set[str],
+) -> None:
+    fallback = structured_fallback_payload(
+        task=task,
+        schema=schema,
+        user_prompt="Runtime context:\n{}",
+        error=ValueError("invalid output"),
+    )
+
+    validate_json_schema(fallback, schema)
+    assert set(fallback) == expected_keys
+
+
+def test_reminder_repository_has_no_standalone_duplicate_detector() -> None:
+    assert not hasattr(_repository(), "find_active_reminder_duplicates")
+
+
 def _extraction(
     *,
     action: str,
@@ -272,17 +390,32 @@ def _extraction(
 ) -> dict[str, Any]:
     record = _empty_record()
     record.update(values)
-    return {
-        "action": action,
-        "toggle_direction": toggle_direction,
+    returned_action = (
+        toggle_direction if action == "toggle" and toggle_direction else action
+    )
+    supplied_fields = (
+        [
+            field
+            for field in REMINDER_EDITABLE_FIELDS
+            if action == "add" and record[field]
+        ]
+        if action == "add"
+        else list(changed_fields)
+        if changed_fields is not None
+        else []
+    )
+    response = {
+        "action": returned_action,
         "retrieval_text": retrieval_text,
-        "changed_fields": list(changed_fields or []),
-        **record,
-        "time_semantics": time_semantics,
+        "field_values": [
+            {"field": field, "value": record[field]}
+            for field in supplied_fields
+        ],
         "confidence": confidence,
-        "missing_fields": list(missing_fields or []),
-        "reason_summary": "One grounded reminder action was extracted.",
     }
+    if action != "toggle" and toggle_direction:
+        response["toggle_direction"] = toggle_direction
+    return response
 
 
 def _add_extraction(
@@ -326,24 +459,46 @@ def _validation(
     assessments: list[dict[str, Any]],
     should_execute: bool,
     confidence: float = 0.99,
-    requires_hitl: bool = False,
-    factuality_concern: bool = False,
-    ambiguous: bool = False,
-    hitl_reason: str = "",
     reason: str = "The reminder action was validated.",
+    clarification_question: str | None = None,
 ) -> dict[str, Any]:
+    decision = (
+        result
+        if result in {"PASS", "FAIL"}
+        else "PASS"
+        if result == "EXECUTE"
+        else "FAIL"
+    )
     return {
-        "operation": operation,
-        "validation_result": result,
+        "validation_result": decision,
         "selected_candidate_keys": selected,
         "confidence": confidence,
-        "ambiguous": ambiguous,
-        "should_execute": should_execute,
-        "requires_hitl": requires_hitl,
-        "factuality_concern": factuality_concern,
-        "hitl_reason": hitl_reason,
-        "reason_summary": reason,
-        "candidate_assessments": assessments,
+        "clarification_question": (
+            ""
+            if decision == "PASS"
+            else clarification_question
+            or "Could you clarify the reminder change you want?"
+        ),
+        "candidate_assessments": [
+            {
+                "candidate_key": item["candidate_key"],
+                "match_kind": (
+                    "EQUIVALENT"
+                    if operation == "add" and item["matches_target"]
+                    else "TARGET"
+                    if item["matches_target"]
+                    else "NONE"
+                ),
+                "confidence": item["confidence"],
+                "evidence_field": (
+                    item["matched_fields"][0]
+                    if item["matched_fields"]
+                    else ""
+                ),
+                "matched_text": item["matched_text"],
+            }
+            for item in assessments
+        ],
     }
 
 
@@ -374,28 +529,13 @@ def _finalization(
     changed_fields: list[str] | None = None,
     confidence: float = 0.99,
 ) -> dict[str, Any]:
-    changed = set(changed_fields or [])
     return {
-        "operation": operation,
-        "selected_candidate_key": selected_candidate_key,
-        "field_bindings": [
-            {
-                "field": field,
-                "source": (
-                    "extracted_action"
-                    if operation == "add"
-                    or (operation == "modify" and field in changed)
-                    else "selected_candidate"
-                ),
-            }
-            for field in REMINDER_EDITABLE_FIELDS
-        ],
+        "approved": True,
         "confidence": confidence,
-        "reason_summary": "Every field was bound to its exact trusted source.",
     }
 
 
-def test_add_runs_three_stages_with_evidence_isolated_validation_prompt() -> None:
+def test_add_runs_two_stages_with_evidence_isolated_validation_prompt() -> None:
     query = (
         "Add a reminder: Submit payroll at "
         f"{BASE_TIME} in UTC."
@@ -410,14 +550,10 @@ def test_add_runs_three_stages_with_evidence_isolated_validation_prompt() -> Non
             extraction,
             _validation(
                 operation="add",
-                result="EXECUTE",
+                result="PASS",
                 selected=[],
                 assessments=[],
                 should_execute=True,
-            ),
-            _finalization(
-                operation="add",
-                selected_candidate_key="",
             ),
         ]
     )
@@ -439,14 +575,12 @@ def test_add_runs_three_stages_with_evidence_isolated_validation_prompt() -> Non
     assert [call["task"] for call in llm.calls] == [
         LLMTask.REMINDER_ACTION_EXTRACTION,
         LLMTask.REMINDER_ACTION_VALIDATION,
-        LLMTask.REMINDER_CONTENT_FINALIZATION,
     ]
-    for call in (llm.calls[0], llm.calls[2]):
-        payload = _prompt_payload(call)
-        assert "raw_query" not in payload
-        assert payload["rewritten_query"] == query
-        assert payload["chat_history"] == history
-        assert forbidden_raw_query not in json.dumps(payload)
+    extraction_prompt = _prompt_payload(llm.calls[0])
+    assert "raw_query" not in extraction_prompt
+    assert extraction_prompt["rewritten_query"] == query
+    assert extraction_prompt["chat_history"] == history
+    assert forbidden_raw_query not in json.dumps(extraction_prompt)
     validation_payload = _prompt_payload(llm.calls[1])
     assert validation_payload == {
         "first_model_response": extraction,
@@ -462,7 +596,6 @@ def test_add_runs_three_stages_with_evidence_isolated_validation_prompt() -> Non
     assert "metadata" not in validation_payload
     assert "platform_context" not in validation_payload
     assert "extra" not in validation_payload
-
     rows = repository.list_reminders(user_id=USER_ID)
     assert len(rows) == 1
     row = rows[0]
@@ -498,12 +631,11 @@ def test_intent_selected_reminder_branch_starts_with_llm_and_ignores_action_meta
             _add_extraction(subject="Payroll", reminder_time=BASE_TIME),
             _validation(
                 operation="add",
-                result="EXECUTE",
+                result="PASS",
                 selected=[],
                 assessments=[],
                 should_execute=True,
             ),
-            _finalization(operation="add", selected_candidate_key=""),
         ]
     )
     context = _context(query, [])
@@ -517,7 +649,6 @@ def test_intent_selected_reminder_branch_starts_with_llm_and_ignores_action_meta
     assert [call["task"] for call in llm.calls] == [
         LLMTask.REMINDER_ACTION_EXTRACTION,
         LLMTask.REMINDER_ACTION_VALIDATION,
-        LLMTask.REMINDER_CONTENT_FINALIZATION,
     ]
     extraction_payload = _prompt_payload(llm.calls[0])
     for key in poisoned_metadata:
@@ -538,12 +669,13 @@ def test_failed_reminder_extractor_never_falls_back_to_metadata_action() -> None
     with canonical_chat_history_scope([]):
         result = _branch(llm).execute(context, _repository())
 
-    assert result.response_type is ResponseType.CLARIFICATION
+    assert result.response_type is ResponseType.SAFE_NOOP
+    assert result.clarification_question is None
     assert len(llm.calls) == 1
     assert llm.calls[0]["task"] is LLMTask.REMINDER_ACTION_EXTRACTION
 
 
-def test_modify_full_long_candidate_changes_one_field_and_preserves_every_other_field() -> None:
+def test_modify_model_three_receives_only_model_one_state_and_preserves_sql_fields() -> None:
     raw_tail = "RAW-TAIL-BLUE-LANTERN"
     supporting_tail = "TAIL-SUPPORT-CODE-73"
     raw_reminder = f"{'raw context ' * 1800}{raw_tail}"
@@ -565,17 +697,18 @@ def test_modify_full_long_candidate_changes_one_field_and_preserves_every_other_
         "Final payroll review."
     )
     history = [{"hop_id": "history-long", "text": "Continue payroll planning"}]
+    extraction = _extraction(
+        action="modify",
+        retrieval_text=supporting_tail,
+        changed_fields=["subject"],
+        subject="Final payroll review",
+    )
     llm = ScriptedLLM(
         [
-            _extraction(
-                action="modify",
-                retrieval_text=supporting_tail,
-                changed_fields=["subject"],
-                subject="Final payroll review",
-            ),
+            extraction,
             _validation(
                 operation="modify",
-                result="EXECUTE",
+                result="PASS",
                 selected=[reminder_id],
                 assessments=[
                     _assessment(
@@ -608,27 +741,18 @@ def test_modify_full_long_candidate_changes_one_field_and_preserves_every_other_
     assert supporting_tail in validation_serialized
     assert raw_reminder in validation_serialized
     assert supporting_question in validation_serialized
+    assert finalization_payload == {"first_model_response": extraction}
+    assert set(finalization_payload) == {"first_model_response"}
     assert raw_reminder not in finalization_serialized
     assert supporting_question not in finalization_serialized
-    assert len(finalization_serialized) < 12_000
-    finalization_extra = finalization_payload["extra"]
-    assert "candidate_reminders" not in finalization_extra
-    assert "extracted_action" not in finalization_extra
-    selected_manifest = finalization_extra["selected_candidate_manifest"]
-    raw_manifest = next(
-        item
-        for item in selected_manifest["field_manifest"]
-        if item["field"] == "raw_reminder"
-    )
-    supporting_manifest = next(
-        item
-        for item in selected_manifest["field_manifest"]
-        if item["field"] == "supporting_question"
-    )
-    assert raw_manifest["character_count"] == len(raw_reminder)
-    assert raw_manifest["bounded_preview"].endswith(raw_tail)
-    assert supporting_manifest["character_count"] == len(supporting_question)
-    assert supporting_manifest["bounded_preview"].endswith(supporting_tail)
+    assert query not in finalization_serialized
+    assert "history-long" not in finalization_serialized
+    assert "chat_history" not in finalization_serialized
+    assert "reminder_retrieval" not in finalization_serialized
+    assert "selected_candidate" not in finalization_serialized
+    assert "validation" not in finalization_serialized
+    assert "metadata" not in finalization_serialized
+    assert "platform_context" not in finalization_serialized
 
     old_row = _reminder_row(repository, reminder_id)
     assert old_row["status"] == "cancelled"
@@ -649,14 +773,14 @@ def test_modify_full_long_candidate_changes_one_field_and_preserves_every_other_
 @pytest.mark.parametrize(
     "failure",
     (
-        "missing_field",
-        "duplicate_field",
-        "unknown_field",
-        "wrong_source",
+        "rejected",
+        "low_confidence",
+        "missing_approved",
+        "wrong_type",
         "extra_root_field",
     ),
 )
-def test_finalization_requires_one_exact_binding_for_every_editable_field(
+def test_finalization_requires_one_exact_high_confidence_approval(
     failure: str,
 ) -> None:
     repository = _repository()
@@ -668,32 +792,31 @@ def test_finalization_requires_one_exact_binding_for_every_editable_field(
     )
     before = _reminder_row(repository, reminder_id)
     finalization = _finalization(
-        operation="delete",
+        operation="modify",
         selected_candidate_key=reminder_id,
     )
-    bindings = finalization["field_bindings"]
-    if failure == "missing_field":
-        bindings.pop()
-    elif failure == "duplicate_field":
-        bindings[-1] = dict(bindings[0])
-    elif failure == "unknown_field":
-        bindings[-1] = {
-            "field": "unknown_field",
-            "source": "selected_candidate",
-        }
-    elif failure == "wrong_source":
-        bindings[0]["source"] = "extracted_action"
+    if failure == "rejected":
+        finalization["approved"] = False
+    elif failure == "low_confidence":
+        finalization["confidence"] = 0.1
+    elif failure == "missing_approved":
+        finalization.pop("approved")
+    elif failure == "wrong_type":
+        finalization["approved"] = "yes"
     else:
-        finalization["final_reminder"] = {
-            field: "must not be accepted" for field in REMINDER_EDITABLE_FIELDS
-        }
+        finalization["field_bindings"] = []
 
     llm = ScriptedLLM(
         [
-            _extraction(action="delete", retrieval_text="Binding contract target"),
+            _extraction(
+                action="modify",
+                retrieval_text="Binding contract target",
+                changed_fields=["subject"],
+                subject="Updated binding contract target",
+            ),
             _validation(
-                operation="delete",
-                result="EXECUTE",
+                operation="modify",
+                result="PASS",
                 selected=[reminder_id],
                 assessments=[
                     _assessment(
@@ -711,19 +834,23 @@ def test_finalization_requires_one_exact_binding_for_every_editable_field(
 
     with canonical_chat_history_scope([]):
         result = _branch(llm).execute(
-            _context("Delete the Binding contract target reminder.", []),
+            _context(
+                "Modify the Binding contract target reminder subject to "
+                "Updated binding contract target.",
+                [],
+            ),
             repository,
         )
 
-    assert result.response_type is ResponseType.CLARIFICATION
-    assert result.clarification_question is not None
+    assert result.response_type is ResponseType.ERROR
+    assert result.clarification_question is None
     assert len(llm.calls) == 3
     after = _reminder_row(repository, reminder_id)
     assert after["status"] == before["status"]
     assert after["version"] == before["version"]
 
 
-def test_delete_confirmation_replay_reruns_all_three_isolated_stages() -> None:
+def test_delete_executes_immediately_without_pending_confirmation() -> None:
     repository = _repository()
     reminder_id = _seed_reminder(
         repository,
@@ -733,7 +860,6 @@ def test_delete_confirmation_replay_reruns_all_three_isolated_stages() -> None:
         recurrence_rule=None,
         recurrence_timezone=None,
     )
-    original = _reminder_row(repository, reminder_id)
     query = "Delete the Legacy review reminder."
     history = [{"hop_id": "delete-history", "text": "Legacy review context"}]
     llm = ScriptedLLM(
@@ -741,7 +867,7 @@ def test_delete_confirmation_replay_reruns_all_three_isolated_stages() -> None:
             _extraction(action="delete", retrieval_text="Legacy review"),
             _validation(
                 operation="delete",
-                result="EXECUTE",
+                result="PASS",
                 selected=[reminder_id],
                 assessments=[
                     _assessment(
@@ -753,95 +879,31 @@ def test_delete_confirmation_replay_reruns_all_three_isolated_stages() -> None:
                 ],
                 should_execute=True,
             ),
-            _finalization(
-                operation="delete",
-                selected_candidate_key=reminder_id,
-            ),
-        ]
-    )
-    branch = _branch(llm)
-
-    with canonical_chat_history_scope(history):
-        pending = branch.execute(_context(query, history), repository)
-
-    assert pending.response_type is ResponseType.REMINDER_ACTION
-    assert pending.actions_pending_confirmation
-    assert _reminder_row(repository, reminder_id)["status"] == "scheduled"
-    assert len(llm.calls) == 3
-
-    token = pending.actions_pending_confirmation[0]["confirmation_token"]
-    lifecycle = ChatRequestLifecycleExecutor(
-        pipeline=SimpleNamespace(),  # type: ignore[arg-type]
-        repository=repository,
-    )
-    prepared, confirmation_to_mark = lifecycle._hydrate_confirmation(
-        ChatRequest(
-            user_id=USER_ID,
-            raw_query="Confirm",
-            confirmation_token=token,
-        )
-    )
-    replay_context = PipelineContext(
-        request=prepared,
-        rewritten_query="Confirm",
-        last_qa_state=None,
-        conversation_results=[],
-        intent=Intent.REMINDER,
-        chat_history=history,
-    )
-    replay_extraction = _extraction(
-        action="delete",
-        retrieval_text="Legacy review",
-    )
-    llm.responses.extend(
-        [
-            replay_extraction,
-            _validation(
-                operation="delete",
-                result="EXECUTE",
-                selected=[reminder_id],
-                assessments=[
-                    _assessment(
-                        reminder_id,
-                        matches=True,
-                        matched_fields=["subject"],
-                        matched_text="Legacy review",
-                    )
-                ],
-                should_execute=True,
-            ),
-            _finalization(
-                operation="delete",
-                selected_candidate_key=reminder_id,
-            ),
         ]
     )
     with canonical_chat_history_scope(history):
-        committed = branch.execute(replay_context, repository)
+        result = _branch(llm).execute(_context(query, history), repository)
 
-    assert confirmation_to_mark == token
-    assert committed.response_type is ResponseType.REMINDER_ACTION
-    assert len(llm.calls) == 6
-    assert [call["task"] for call in llm.calls[-3:]] == [
+    assert result.response_type is ResponseType.REMINDER_ACTION
+    assert result.actions_pending_confirmation == []
+    assert [call["task"] for call in llm.calls] == [
         LLMTask.REMINDER_ACTION_EXTRACTION,
         LLMTask.REMINDER_ACTION_VALIDATION,
-        LLMTask.REMINDER_CONTENT_FINALIZATION,
     ]
-    confirmation_payload = _prompt_payload(llm.calls[-3])
-    assert confirmation_payload["extra"]["confirmation_replay"] is True
-    assert len(
-        confirmation_payload["extra"]["trusted_confirmation_action_context"]
-    ) == 1
-    validation_payload = _prompt_payload(llm.calls[-2])
+    extraction_payload = _prompt_payload(llm.calls[0])
+    assert "confirmation_replay" not in extraction_payload["extra"]
+    assert "trusted_confirmation_action_context" not in extraction_payload["extra"]
+    validation_payload = _prompt_payload(llm.calls[1])
     assert set(validation_payload) == {
         "first_model_response",
         "reminder_retrieval",
     }
-    assert validation_payload["first_model_response"] == replay_extraction
-    assert "Confirm" not in json.dumps(validation_payload)
     assert "chat_history" not in validation_payload
     assert "delete-history" not in json.dumps(validation_payload)
     assert _reminder_row(repository, reminder_id)["status"] == "dismissed"
+    assert repository.connection.execute(
+        "SELECT * FROM pending_action_confirmations"
+    ).fetchall() == []
 
 
 @pytest.mark.parametrize(
@@ -851,7 +913,7 @@ def test_delete_confirmation_replay_reruns_all_three_isolated_stages() -> None:
         ("turn_off", "Turn off the Payroll reminder.", "scheduled", "cancelled"),
     ),
 )
-def test_toggle_directions_run_three_stages_and_only_change_status(
+def test_toggle_directions_run_two_stages_and_only_change_status(
     action: str,
     query: str,
     initial_status: str,
@@ -866,7 +928,7 @@ def test_toggle_directions_run_three_stages_and_only_change_status(
             _toggle_extraction(direction=action, retrieval_text="Payroll"),
             _validation(
                 operation=action,
-                result="EXECUTE",
+                result="PASS",
                 selected=[reminder_id],
                 assessments=[
                     _assessment(
@@ -878,10 +940,6 @@ def test_toggle_directions_run_three_stages_and_only_change_status(
                 ],
                 should_execute=True,
             ),
-            _finalization(
-                operation=action,
-                selected_candidate_key=reminder_id,
-            ),
         ]
     )
 
@@ -892,7 +950,6 @@ def test_toggle_directions_run_three_stages_and_only_change_status(
     assert [call["task"] for call in llm.calls] == [
         LLMTask.REMINDER_ACTION_EXTRACTION,
         LLMTask.REMINDER_ACTION_VALIDATION,
-        LLMTask.REMINDER_CONTENT_FINALIZATION,
     ]
     updated = _reminder_row(repository, reminder_id)
     assert updated["status"] == expected_status
@@ -900,7 +957,7 @@ def test_toggle_directions_run_three_stages_and_only_change_status(
 
 
 @pytest.mark.parametrize("direction", ("turn_on", "turn_off"))
-def test_first_llm_uses_one_toggle_action_then_maps_direction_downstream(
+def test_first_llm_emits_one_direct_lifecycle_action(
     direction: str,
 ) -> None:
     query = f"{direction.replace('_', ' ').title()} the Payroll reminder."
@@ -923,7 +980,7 @@ def test_first_llm_uses_one_toggle_action_then_maps_direction_downstream(
     assert not result.requires_clarification
     assert len(result.metadata["reminder_actions"]) == 1
     action = result.metadata["reminder_actions"][0]
-    assert action["extracted_action"] == "toggle"
+    assert action["extracted_action"] == direction
     assert action["toggle_direction"] == direction
     assert action["action"] == direction
     prompt = _prompt_payload(llm.calls[0])
@@ -931,21 +988,22 @@ def test_first_llm_uses_one_toggle_action_then_maps_direction_downstream(
         "add",
         "delete",
         "modify",
-        "toggle",
+        "turn_on",
+        "turn_off",
     ]
-    assert prompt["extra"]["toggle_directions"] == ["turn_on", "turn_off"]
+    assert "toggle_directions" not in prompt["extra"]
 
 
 @pytest.mark.parametrize(
     ("payload", "expected_risk"),
     (
         (
-            _extraction(action="turn_on", retrieval_text="Payroll"),
-            "low_confidence_or_incomplete_reminder_extraction",
+            {**_extraction(action="turn_on", retrieval_text="Payroll"), "action": "toggle"},
+            "invalid_reminder_action_extraction",
         ),
         (
-            _extraction(action="toggle", retrieval_text="Payroll"),
-            "toggle_reminder_requires_exact_direction",
+            {**_extraction(action="turn_on", retrieval_text="Payroll"), "action": "enable"},
+            "invalid_reminder_action_extraction",
         ),
         (
             _extraction(
@@ -953,7 +1011,7 @@ def test_first_llm_uses_one_toggle_action_then_maps_direction_downstream(
                 toggle_direction="turn_on",
                 retrieval_text="Payroll",
             ),
-            "non_toggle_reminder_forbids_toggle_direction",
+            "invalid_reminder_action_extraction",
         ),
     ),
 )
@@ -984,7 +1042,7 @@ def test_first_llm_external_action_and_toggle_shape_fail_closed(
     assert len(llm.calls) == 1
 
 
-def test_first_llm_modify_carries_every_reminder_section_in_one_action() -> None:
+def test_first_llm_modify_carries_every_mutable_reminder_section_in_one_action() -> None:
     notification_time = "2035-04-05T08:30:00+00:00"
     event_time = "2035-04-05T10:00:00+00:00"
     original_time_text = (
@@ -993,9 +1051,7 @@ def test_first_llm_modify_carries_every_reminder_section_in_one_action() -> None
     query = (
         "Modify the Payroll reminder: set title to Quarterly Payroll; "
         "summary to Prepare quarterly payroll; content to Submit payroll report; "
-        f"{original_time_text}; timezone UTC; recurrence FREQ=WEEKLY in UTC; "
-        "supporting question Should finance approve?; "
-        "supporting response Finance approved."
+        f"{original_time_text}; timezone UTC; recurrence FREQ=WEEKLY in UTC."
     )
     values = {
         "subject": "Quarterly Payroll",
@@ -1007,15 +1063,18 @@ def test_first_llm_modify_carries_every_reminder_section_in_one_action() -> None
         "original_time_text": original_time_text,
         "recurrence_rule": "FREQ=WEEKLY",
         "recurrence_timezone": "UTC",
-        "supporting_question": "Should finance approve?",
-        "supporting_response": "Finance approved",
     }
+    mutable_fields = [
+        field
+        for field in REMINDER_EDITABLE_FIELDS
+        if field not in {"supporting_question", "supporting_response"}
+    ]
     llm = ScriptedLLM(
         [
             _extraction(
                 action="modify",
                 retrieval_text="Payroll",
-                changed_fields=list(REMINDER_EDITABLE_FIELDS),
+                changed_fields=mutable_fields,
                 time_semantics="both",
                 **values,
             )
@@ -1044,8 +1103,12 @@ def test_first_llm_modify_carries_every_reminder_section_in_one_action() -> None
     assert action["action"] == "modify"
     assert action["extracted_action"] == "modify"
     assert action["toggle_direction"] == ""
-    assert action["changed_fields"] == list(REMINDER_EDITABLE_FIELDS)
-    assert {field: action[field] for field in REMINDER_EDITABLE_FIELDS} == values
+    assert action["changed_fields"] == mutable_fields
+    expected_record = _empty_record()
+    expected_record.update(values)
+    assert {
+        field: action[field] for field in REMINDER_EDITABLE_FIELDS
+    } == expected_record
     assert len(llm.calls) == 1
 
 
@@ -1066,7 +1129,7 @@ def test_first_llm_modify_carries_every_reminder_section_in_one_action() -> None
                 action="delete",
                 retrieval_text="Payroll",
             ).items()
-            if key != "toggle_direction"
+            if key != "field_values"
         },
         {
             **_extraction(
@@ -1075,7 +1138,7 @@ def test_first_llm_modify_carries_every_reminder_section_in_one_action() -> None
                 changed_fields=["subject"],
                 subject="Quarterly Payroll",
             ),
-            "changed_fields": "subject",
+            "field_values": "subject",
         },
     ),
 )
@@ -1168,11 +1231,15 @@ def test_reminder_first_llm_receives_complete_context_and_field_contract() -> No
         "add",
         "delete",
         "modify",
-        "toggle",
+        "turn_on",
+        "turn_off",
     }
-    assert set(prompt["extra"]["field_semantics"]) == set(
-        REMINDER_EDITABLE_FIELDS
-    )
+    model_mutation_fields = set(REMINDER_EDITABLE_FIELDS) - {
+        "supporting_question",
+        "supporting_response",
+    }
+    assert set(prompt["extra"]["editable_fields"]) == model_mutation_fields
+    assert set(prompt["extra"]["field_semantics"]) == model_mutation_fields
     assert prompt["extra"]["context_policy"] == {
         "current_turn_defines_action_and_new_values": True,
         "history_resolves_existing_target_only": True,
@@ -1180,9 +1247,19 @@ def test_reminder_first_llm_receives_complete_context_and_field_contract() -> No
         "runtime_now_resolves_relative_time": True,
         "metadata_cannot_supply_action_payload": True,
     }
+    assert prompt["extra"]["time_normalization_contract"] == {
+        "owner": "reminder_action_extraction_model",
+        "output_timezone": "UTC",
+        "output_format": "ISO-8601 with explicit +00:00 offset",
+        "required_companion_fields": [
+            "user_timezone",
+            "original_time_text",
+        ],
+        "omit_unresolvable_time_instead_of_guessing": True,
+    }
 
 
-def test_duplicate_add_stops_after_validation_without_finalizer_write_or_hitl() -> None:
+def test_llm2_duplicate_fail_reasks_without_finalizer_or_write() -> None:
     repository = _repository()
     reminder_id = _seed_reminder(
         repository,
@@ -1195,12 +1272,15 @@ def test_duplicate_add_stops_after_validation_without_finalizer_write_or_hitl() 
         supporting_response=None,
     )
     query = f"Add a reminder: Submit payroll at {BASE_TIME} in UTC."
+    question = (
+        "That reminder already exists. Do you want to change the existing one?"
+    )
     llm = ScriptedLLM(
         [
             _add_extraction(),
             _validation(
                 operation="add",
-                result="SKIP_ALREADY_EXISTS",
+                result="FAIL",
                 selected=[],
                 assessments=[
                     _assessment(
@@ -1212,6 +1292,7 @@ def test_duplicate_add_stops_after_validation_without_finalizer_write_or_hitl() 
                 ],
                 should_execute=False,
                 reason="The equivalent reminder already exists.",
+                clarification_question=question,
             ),
         ]
     )
@@ -1219,26 +1300,29 @@ def test_duplicate_add_stops_after_validation_without_finalizer_write_or_hitl() 
     with canonical_chat_history_scope([]):
         result = _branch(llm).execute(_context(query, []), repository)
 
-    assert result.response_type is ResponseType.REMINDER_ACTION
-    assert result.clarification_question is None
+    assert result.response_type is ResponseType.CLARIFICATION
+    assert result.clarification_question is not None
+    assert result.clarification_question.text == question
     assert result.actions_pending_confirmation == []
     assert len(llm.calls) == 2
     assert repository.table_count("reminders") == 1
 
 
-def test_not_found_stops_after_validation_without_finalizer_write_or_hitl() -> None:
+def test_not_found_fail_reasks_without_finalizer_or_write() -> None:
     repository = _repository()
     query = "Delete the Missing payroll reminder."
+    question = "Which reminder did you want to delete?"
     llm = ScriptedLLM(
         [
             _extraction(action="delete", retrieval_text="Missing payroll"),
             _validation(
                 operation="delete",
-                result="SKIP_NOT_FOUND",
+                result="FAIL",
                 selected=[],
                 assessments=[],
                 should_execute=False,
                 reason="No SQL reminder matched the target.",
+                clarification_question=question,
             ),
         ]
     )
@@ -1246,30 +1330,35 @@ def test_not_found_stops_after_validation_without_finalizer_write_or_hitl() -> N
     with canonical_chat_history_scope([]):
         result = _branch(llm).execute(_context(query, []), repository)
 
-    assert result.response_type is ResponseType.REMINDER_ACTION
-    assert result.clarification_question is None
+    assert result.response_type is ResponseType.CLARIFICATION
+    assert result.clarification_question is not None
+    assert result.clarification_question.text == question
     assert result.actions_pending_confirmation == []
     assert len(llm.calls) == 2
     assert repository.table_count("reminders") == 0
 
 
-def test_factuality_flag_conditionally_clarifies_without_finalizer_or_write() -> None:
-    fact = "1 + 1 = 3"
-    query = f"Add a reminder: {fact} at {BASE_TIME} in UTC."
-    extraction = _add_extraction(subject=fact)
+def test_incomplete_best_effort_extraction_reaches_validator_and_reasks() -> None:
+    query = "Add a Payroll reminder."
+    extraction = _extraction(
+        action="add",
+        retrieval_text="Payroll",
+        subject="Payroll",
+        confidence=0.91,
+        missing_fields=["raw_reminder", "notification_time"],
+    )
+    question = "What should the Payroll reminder say, and when should it notify you?"
     llm = ScriptedLLM(
         [
             extraction,
             _validation(
                 operation="add",
-                result="CLARIFY_MISSING_FIELDS",
+                result="FAIL",
                 selected=[],
                 assessments=[],
                 should_execute=False,
-                requires_hitl=True,
-                factuality_concern=True,
-                hitl_reason="factuality_concern",
-                reason="The asserted arithmetic is false.",
+                reason="The best-effort extraction is incomplete.",
+                clarification_question=question,
             ),
         ]
     )
@@ -1280,12 +1369,51 @@ def test_factuality_flag_conditionally_clarifies_without_finalizer_or_write() ->
 
     assert result.response_type is ResponseType.CLARIFICATION
     assert result.clarification_question is not None
+    assert result.clarification_question.text == question
+    assert [call["task"] for call in llm.calls] == [
+        LLMTask.REMINDER_ACTION_EXTRACTION,
+        LLMTask.REMINDER_ACTION_VALIDATION,
+    ]
+    assert _prompt_payload(llm.calls[1]) == {
+        "first_model_response": extraction,
+        "reminder_retrieval": [],
+    }
+    assert repository.table_count("reminders") == 0
+
+
+def test_unsafe_factuality_fail_reasks_without_finalizer_or_write() -> None:
+    fact = "1 + 1 = 3"
+    query = f"Add a reminder: {fact} at {BASE_TIME} in UTC."
+    extraction = _add_extraction(subject=fact)
+    question = "Did you mean to use the statement 1 + 1 = 3 in this reminder?"
+    llm = ScriptedLLM(
+        [
+            extraction,
+            _validation(
+                operation="add",
+                result="FAIL",
+                selected=[],
+                assessments=[],
+                should_execute=False,
+                reason="The asserted arithmetic is false.",
+                clarification_question=question,
+            ),
+        ]
+    )
+    repository = _repository()
+
+    with canonical_chat_history_scope([]):
+        result = _branch(llm).execute(_context(query, []), repository)
+
+    assert result.response_type is ResponseType.CLARIFICATION
+    assert result.clarification_question is not None
+    assert result.clarification_question.text == question
     assert len(llm.calls) == 2
     assert repository.table_count("reminders") == 0
 
 
 @pytest.mark.parametrize("failure", ("missing_assessment", "invented_id", "low_confidence"))
-def test_invalid_validation_contracts_fail_closed_before_finalization(
+def test_invalid_validation_contracts_error_before_finalization(
     failure: str,
 ) -> None:
     repository = _repository()
@@ -1312,7 +1440,7 @@ def test_invalid_validation_contracts_fail_closed_before_finalization(
             _extraction(action="delete", retrieval_text="Payroll"),
             _validation(
                 operation="delete",
-                result="EXECUTE",
+                result="PASS",
                 selected=selected,
                 assessments=assessments,
                 should_execute=True,
@@ -1324,45 +1452,21 @@ def test_invalid_validation_contracts_fail_closed_before_finalization(
     with canonical_chat_history_scope([]):
         result = _branch(llm).execute(_context(query, []), repository)
 
-    assert result.response_type is ResponseType.CLARIFICATION
-    assert result.clarification_question is not None
+    assert result.response_type is ResponseType.ERROR
+    assert result.clarification_question is None
     assert len(llm.calls) == 2
     assert _reminder_row(repository, reminder_id)["status"] == "scheduled"
 
 
-@pytest.mark.parametrize(
-    ("query", "history", "payload", "expected_risk"),
-    (
-        (
-            "Delete the Payroll reminder.",
-            [],
-            _extraction(
-                action="delete",
-                retrieval_text="Payroll",
-                changed_fields=["subject"],
-                subject="Payroll",
-            ),
-            "invalid_target_only_reminder_content_contract",
-        ),
-        (
-            "Modify the Payroll reminder.",
-            [{"text": "The new title should be Quarterly payroll"}],
-            _extraction(
-                action="modify",
-                retrieval_text="Payroll",
-                changed_fields=["subject"],
-                subject="Quarterly payroll",
-            ),
-            "reminder_content_not_grounded_in_current_turn",
-        ),
-    ),
-)
-def test_extraction_shape_and_grounding_fail_closed(
-    query: str,
-    history: list[dict[str, Any]],
-    payload: dict[str, Any],
-    expected_risk: str,
-) -> None:
+def test_first_guard_rejects_ungrounded_replacement_before_isolated_validator() -> None:
+    query = "Modify the Payroll reminder."
+    history = [{"text": "The new title should be Quarterly payroll"}]
+    payload = _extraction(
+        action="modify",
+        retrieval_text="Payroll",
+        changed_fields=["subject"],
+        subject="Quarterly payroll",
+    )
     llm = ScriptedLLM([payload])
     detector = LLMReminderActionDetector(
         llm=llm,
@@ -1379,8 +1483,289 @@ def test_extraction_shape_and_grounding_fail_closed(
 
     assert result.requires_clarification
     assert result.metadata == {}
-    assert expected_risk in result.risk_flags
+    assert "reminder_content_not_grounded_in_current_turn" in result.risk_flags
     assert len(llm.calls) == 1
+
+
+def test_pipeline_guard_one_rejects_divergent_reminder_action_state_before_validation() -> None:
+    first_response = _add_extraction()
+    values = _empty_record()
+    values.update(
+        {
+            item["field"]: item["value"]
+            for item in first_response["field_values"]
+        }
+    )
+    action_payload = {
+        "action": "add",
+        "extracted_action": "add",
+        "toggle_direction": "",
+        "retrieval_text": "A divergent target model 1 did not return",
+        "changed_fields": [],
+        "time_semantics": "both",
+        "runtime_now_utc": "2035-04-01T00:00:00+00:00",
+        "confidence": 0.99,
+        **values,
+    }
+    context = _context("Add the Submit payroll reminder.", [])
+    context.request.metadata["reminder_action_extraction_response"] = (
+        first_response
+    )
+    llm = ScriptedLLM([])
+    branch = _branch(llm)
+
+    validated = branch.reminder_mutation_pipeline.build_action(
+        context=context,
+        action_payload=action_payload,
+        repository=_repository(),
+    )
+
+    assert validated.hitl_reason == "internal_pipeline_failure"
+    assert "guard 1" in validated.reason_summary.casefold()
+    assert llm.calls == []
+
+
+def test_first_guard_forwards_grounded_action_field_mismatch_to_model_two() -> None:
+    query = "Delete the Payroll reminder."
+    extraction = _extraction(
+        action="delete",
+        retrieval_text="Payroll",
+        changed_fields=["subject"],
+        subject="Payroll",
+    )
+    question = "Do you want to delete the reminder or change its subject?"
+    llm = ScriptedLLM(
+        [
+            extraction,
+            _validation(
+                operation="delete",
+                result="FAIL",
+                selected=[],
+                assessments=[],
+                should_execute=False,
+                confidence=0.20,
+                clarification_question=question,
+            ),
+        ]
+    )
+    repository = _repository()
+    reminder_id = _seed_reminder(repository, subject="Payroll")
+
+    with canonical_chat_history_scope([]):
+        result = _branch(llm).execute(_context(query, []), repository)
+
+    assert result.response_type is ResponseType.CLARIFICATION
+    assert result.clarification_question is not None
+    assert result.clarification_question.text == question
+    assert [call["task"] for call in llm.calls] == [
+        LLMTask.REMINDER_ACTION_EXTRACTION,
+        LLMTask.REMINDER_ACTION_VALIDATION,
+    ]
+    assert _prompt_payload(llm.calls[1])["first_model_response"] == extraction
+    assert _reminder_row(repository, reminder_id)["status"] == "scheduled"
+
+
+def test_second_guard_accepts_low_confidence_partial_fail_with_question() -> None:
+    config = build_assistant_config(ProductionSettings())
+    llm = ScriptedLLM(
+        [
+            _validation(
+                operation="delete",
+                result="FAIL",
+                selected=[],
+                assessments=[],
+                should_execute=False,
+                confidence=0.20,
+            )
+        ]
+    )
+    validator = ReminderActionValidationStrategy(
+        config=config,
+        llm=llm,
+        prompts=DEFAULT_PROMPT_REGISTRY,
+    )
+    fields = _empty_record()
+    fields.update(
+        subject="Payroll",
+        reminder_summary="Prepare payroll",
+        raw_reminder="Remind me to prepare payroll.",
+    )
+    candidate = ReminderMutationCandidate(
+        candidate_key="reminder-1",
+        status="scheduled",
+        version=1,
+        fields=fields,
+        deterministic_score=1.0,
+    )
+    first_response = _extraction(action="delete", retrieval_text="Payroll")
+    action_payload = {
+        "action": "delete",
+        "changed_fields": [],
+        "time_semantics": "unchanged",
+        **_empty_record(),
+    }
+
+    result = validator.validate(
+        context=_context("FORBIDDEN_QUERY", []),
+        action_payload=action_payload,
+        candidates=[candidate],
+        first_model_response=first_response,
+    )
+
+    assert result.validation_result.value == "clarify_missing_fields"
+    assert result.confidence == 0.20
+    assert result.hitl_reason == "reminder_validation_fail"
+    assert result.clarification_question == (
+        "Could you clarify the reminder change you want?"
+    )
+    assert result.candidate_assessments == ()
+
+
+@pytest.mark.parametrize(
+    ("decision", "question"),
+    (
+        ("FAIL", ""),
+        ("PASS", "Why should this pass?"),
+    ),
+)
+def test_second_guard_errors_on_invalid_decision_question_pair(
+    decision: str,
+    question: str,
+) -> None:
+    extraction = _add_extraction()
+    validation = _validation(
+        operation="add",
+        result=decision,
+        selected=[],
+        assessments=[],
+        should_execute=decision == "PASS",
+    )
+    validation["clarification_question"] = question
+    llm = ScriptedLLM([extraction, validation])
+    repository = _repository()
+    query = f"Add a reminder: Submit payroll at {BASE_TIME} in UTC."
+
+    with canonical_chat_history_scope([]):
+        result = _branch(llm).execute(_context(query, []), repository)
+
+    assert result.response_type is ResponseType.ERROR
+    assert result.clarification_question is None
+    assert len(llm.calls) == 2
+    assert repository.table_count("reminders") == 0
+
+
+def test_model_two_can_authorize_complete_low_confidence_model_one_state() -> None:
+    repository = _repository()
+    reminder_id = _seed_reminder(repository, subject="Payroll")
+    query = "Delete the Payroll reminder."
+    llm = ScriptedLLM(
+        [
+            _extraction(
+                action="delete",
+                retrieval_text="Payroll",
+                confidence=0.20,
+            ),
+            _validation(
+                operation="delete",
+                result="PASS",
+                selected=[reminder_id],
+                assessments=[
+                    _assessment(
+                        reminder_id,
+                        matches=True,
+                        matched_fields=["subject"],
+                        matched_text="Payroll",
+                    )
+                ],
+                should_execute=True,
+            ),
+        ]
+    )
+
+    with canonical_chat_history_scope([]):
+        result = _branch(llm).execute(_context(query, []), repository)
+
+    assert result.response_type is ResponseType.REMINDER_ACTION
+    assert len(llm.calls) == 2
+    assert _reminder_row(repository, reminder_id)["status"] == "dismissed"
+
+
+@pytest.mark.parametrize(
+    "invalid_time",
+    (
+        "not-a-calendar-time",
+        "2035-04-05T09:30:00",
+        "2035-04-05T09:30:00+07:00",
+    ),
+)
+def test_second_guard_errors_on_pass_for_non_normalized_model_one_time(
+    invalid_time: str,
+) -> None:
+    query = f"Add Payroll at {invalid_time} in UTC."
+    extraction = _extraction(
+        action="add",
+        retrieval_text="Payroll",
+        subject="Payroll",
+        raw_reminder="Payroll",
+        notification_time=invalid_time,
+        user_timezone="UTC",
+        original_time_text=invalid_time,
+    )
+    llm = ScriptedLLM(
+        [
+            extraction,
+            _validation(
+                operation="add",
+                result="PASS",
+                selected=[],
+                assessments=[],
+                should_execute=True,
+            ),
+        ]
+    )
+    repository = _repository()
+
+    with canonical_chat_history_scope([]):
+        result = _branch(llm).execute(_context(query, []), repository)
+
+    assert result.response_type is ResponseType.ERROR
+    assert len(llm.calls) == 2
+    assert _prompt_payload(llm.calls[1])["first_model_response"] == extraction
+    assert repository.table_count("reminders") == 0
+
+
+def test_second_guard_errors_on_pass_for_invalid_model_one_timezone() -> None:
+    invalid_timezone = "Invalid/Reminder_Zone"
+    query = f"Add Payroll at {BASE_TIME} in {invalid_timezone}."
+    extraction = _extraction(
+        action="add",
+        retrieval_text="Payroll",
+        subject="Payroll",
+        raw_reminder="Payroll",
+        notification_time=BASE_TIME,
+        user_timezone=invalid_timezone,
+        original_time_text=BASE_TIME,
+    )
+    llm = ScriptedLLM(
+        [
+            extraction,
+            _validation(
+                operation="add",
+                result="PASS",
+                selected=[],
+                assessments=[],
+                should_execute=True,
+            ),
+        ]
+    )
+    repository = _repository()
+
+    with canonical_chat_history_scope([]):
+        result = _branch(llm).execute(_context(query, []), repository)
+
+    assert result.response_type is ResponseType.ERROR
+    assert len(llm.calls) == 2
+    assert repository.table_count("reminders") == 0
 
 
 def test_single_extracted_reminder_action_is_not_rechecked_by_raw_keywords() -> None:
@@ -1507,14 +1892,10 @@ def test_add_persists_distinct_notification_and_event_times_independently() -> N
             extraction,
             _validation(
                 operation="add",
-                result="EXECUTE",
+                result="PASS",
                 selected=[],
                 assessments=[],
                 should_execute=True,
-            ),
-            _finalization(
-                operation="add",
-                selected_candidate_key="",
             ),
         ]
     )
@@ -1524,7 +1905,7 @@ def test_add_persists_distinct_notification_and_event_times_independently() -> N
         result = _branch(llm).execute(_context(query, []), repository)
 
     assert result.response_type is ResponseType.REMINDER_ACTION
-    assert len(llm.calls) == 3
+    assert len(llm.calls) == 2
     rows = repository.list_reminders(user_id=USER_ID)
     assert len(rows) == 1
     assert rows[0]["reminder_time"] == notification_time
@@ -1565,14 +1946,10 @@ def test_notification_only_add_is_planned_and_never_replanned_by_autoscan() -> N
             extraction,
             _validation(
                 operation="add",
-                result="EXECUTE",
+                result="PASS",
                 selected=[],
                 assessments=[],
                 should_execute=True,
-            ),
-            _finalization(
-                operation="add",
-                selected_candidate_key="",
             ),
         ]
     )
@@ -1582,7 +1959,7 @@ def test_notification_only_add_is_planned_and_never_replanned_by_autoscan() -> N
         result = _branch(llm).execute(_context(query, []), repository)
 
     assert result.response_type is ResponseType.REMINDER_ACTION
-    assert len(llm.calls) == 3
+    assert len(llm.calls) == 2
     rows = repository.list_reminders(user_id=USER_ID)
     assert len(rows) == 1
     assert rows[0]["reminder_time"] == notification_time
@@ -1622,14 +1999,10 @@ def test_event_only_add_uses_pending_planner_storage_fallback() -> None:
             extraction,
             _validation(
                 operation="add",
-                result="EXECUTE",
+                result="PASS",
                 selected=[],
                 assessments=[],
                 should_execute=True,
-            ),
-            _finalization(
-                operation="add",
-                selected_candidate_key="",
             ),
         ]
     )
@@ -1639,7 +2012,7 @@ def test_event_only_add_uses_pending_planner_storage_fallback() -> None:
         result = _branch(llm).execute(_context(query, []), repository)
 
     assert result.response_type is ResponseType.REMINDER_ACTION
-    assert len(llm.calls) == 3
+    assert len(llm.calls) == 2
     rows = repository.list_reminders(user_id=USER_ID)
     assert len(rows) == 1
     # reminder_time is the required pending-planner source placeholder until
@@ -1692,8 +2065,13 @@ def test_modify_one_time_keeps_notification_and_event_times_independent(
     extraction = _extraction(
         action="modify",
         retrieval_text="Project review",
-        changed_fields=[changed_time_field, "original_time_text"],
+        changed_fields=[
+            changed_time_field,
+            "user_timezone",
+            "original_time_text",
+        ],
         time_semantics=time_semantics,
+        user_timezone="UTC",
         original_time_text=original_time_text,
         **{changed_time_field: new_time},
     )
@@ -1705,7 +2083,7 @@ def test_modify_one_time_keeps_notification_and_event_times_independent(
             extraction,
             _validation(
                 operation="modify",
-                result="EXECUTE",
+                result="PASS",
                 selected=[reminder_id],
                 assessments=[
                     _assessment(
@@ -1720,7 +2098,11 @@ def test_modify_one_time_keeps_notification_and_event_times_independent(
             _finalization(
                 operation="modify",
                 selected_candidate_key=reminder_id,
-                changed_fields=[changed_time_field, "original_time_text"],
+                changed_fields=[
+                    changed_time_field,
+                    "user_timezone",
+                    "original_time_text",
+                ],
             ),
         ]
     )
@@ -1810,14 +2192,10 @@ def test_relevance_ranking_considers_exact_older_target_before_candidate_slicing
             _extraction(action="delete", retrieval_text=target_text),
             _validation(
                 operation="delete",
-                result="EXECUTE",
+                result="PASS",
                 selected=[target_id],
                 assessments=assessments,
                 should_execute=True,
-            ),
-            _finalization(
-                operation="delete",
-                selected_candidate_key=target_id,
             ),
         ]
     )
@@ -1826,8 +2204,9 @@ def test_relevance_ranking_considers_exact_older_target_before_candidate_slicing
         result = _branch(llm).execute(_context(query, []), repository)
 
     assert result.response_type is ResponseType.REMINDER_ACTION
-    assert result.actions_pending_confirmation
-    assert len(llm.calls) == 3
+    assert result.actions_pending_confirmation == []
+    assert _reminder_row(repository, target_id)["status"] == "dismissed"
+    assert len(llm.calls) == 2
     validation_candidates = _prompt_payload(llm.calls[1])[
         "reminder_retrieval"
     ]
@@ -1843,7 +2222,7 @@ def test_relevance_ranking_considers_exact_older_target_before_candidate_slicing
         ("turn_off", "Turn off the Payroll reminder.", "cancelled"),
     ),
 )
-def test_toggle_already_in_requested_state_is_stage_two_safe_noop(
+def test_toggle_already_in_requested_state_is_stage_two_fail_with_question(
     action: str,
     query: str,
     already_status: str,
@@ -1851,13 +2230,14 @@ def test_toggle_already_in_requested_state_is_stage_two_safe_noop(
     repository = _repository()
     reminder_id = _seed_reminder(repository, status=already_status)
     original = _reminder_row(repository, reminder_id)
+    question = "That reminder is already in this state. What would you like to change?"
     llm = ScriptedLLM(
         [
             _toggle_extraction(direction=action, retrieval_text="Payroll"),
             _validation(
                 operation=action,
-                result="SKIP_ALREADY_EXISTS",
-                selected=[reminder_id],
+                result="FAIL",
+                selected=[],
                 assessments=[
                     _assessment(
                         reminder_id,
@@ -1869,6 +2249,7 @@ def test_toggle_already_in_requested_state_is_stage_two_safe_noop(
                 ],
                 should_execute=False,
                 reason="The reminder is already in the requested state.",
+                clarification_question=question,
             ),
         ]
     )
@@ -1876,8 +2257,9 @@ def test_toggle_already_in_requested_state_is_stage_two_safe_noop(
     with canonical_chat_history_scope([]):
         result = _branch(llm).execute(_context(query, []), repository)
 
-    assert result.response_type is ResponseType.REMINDER_ACTION
-    assert result.clarification_question is None
+    assert result.response_type is ResponseType.CLARIFICATION
+    assert result.clarification_question is not None
+    assert result.clarification_question.text == question
     assert result.actions_pending_confirmation == []
     assert len(llm.calls) == 2
     updated = _reminder_row(repository, reminder_id)
@@ -1885,11 +2267,12 @@ def test_toggle_already_in_requested_state_is_stage_two_safe_noop(
     assert updated["version"] == original["version"]
 
 
-def test_modify_setting_existing_value_is_stage_two_safe_noop() -> None:
+def test_modify_setting_existing_value_is_stage_two_fail_with_question() -> None:
     repository = _repository()
     reminder_id = _seed_reminder(repository, subject="Payroll")
     original = _reminder_row(repository, reminder_id)
     query = "Modify the Payroll reminder subject to Payroll."
+    question = "The subject is already Payroll. What different subject do you want?"
     llm = ScriptedLLM(
         [
             _extraction(
@@ -1900,8 +2283,8 @@ def test_modify_setting_existing_value_is_stage_two_safe_noop() -> None:
             ),
             _validation(
                 operation="modify",
-                result="SKIP_ALREADY_EXISTS",
-                selected=[reminder_id],
+                result="FAIL",
+                selected=[],
                 assessments=[
                     _assessment(
                         reminder_id,
@@ -1912,6 +2295,7 @@ def test_modify_setting_existing_value_is_stage_two_safe_noop() -> None:
                 ],
                 should_execute=False,
                 reason="The requested subject already has that value.",
+                clarification_question=question,
             ),
         ]
     )
@@ -1919,8 +2303,9 @@ def test_modify_setting_existing_value_is_stage_two_safe_noop() -> None:
     with canonical_chat_history_scope([]):
         result = _branch(llm).execute(_context(query, []), repository)
 
-    assert result.response_type is ResponseType.REMINDER_ACTION
-    assert result.clarification_question is None
+    assert result.response_type is ResponseType.CLARIFICATION
+    assert result.clarification_question is not None
+    assert result.clarification_question.text == question
     assert result.actions_pending_confirmation == []
     assert len(llm.calls) == 2
     updated = _reminder_row(repository, reminder_id)
@@ -1929,7 +2314,7 @@ def test_modify_setting_existing_value_is_stage_two_safe_noop() -> None:
     assert repository.table_count("reminders") == 1
 
 
-def test_compatible_and_incompatible_same_target_requires_ambiguity_hitl() -> None:
+def test_compatible_and_incompatible_same_target_fail_reasks() -> None:
     repository = _repository()
     compatible_id = _seed_reminder(
         repository,
@@ -1948,12 +2333,13 @@ def test_compatible_and_incompatible_same_target_requires_ambiguity_hitl() -> No
     compatible_before = _reminder_row(repository, compatible_id)
     incompatible_before = _reminder_row(repository, incompatible_id)
     query = "Turn on the Payroll reminder."
+    question = "Which Payroll reminder do you want to turn on?"
     llm = ScriptedLLM(
         [
             _toggle_extraction(direction="turn_on", retrieval_text="Payroll"),
             _validation(
                 operation="turn_on",
-                result="CLARIFY_AMBIGUOUS_TARGET",
+                result="FAIL",
                 selected=[],
                 assessments=[
                     _assessment(
@@ -1972,10 +2358,8 @@ def test_compatible_and_incompatible_same_target_requires_ambiguity_hitl() -> No
                     ),
                 ],
                 should_execute=False,
-                requires_hitl=True,
-                ambiguous=True,
-                hitl_reason="ambiguous_target",
                 reason="Two reminder rows share the requested target.",
+                clarification_question=question,
             ),
         ]
     )
@@ -1985,6 +2369,7 @@ def test_compatible_and_incompatible_same_target_requires_ambiguity_hitl() -> No
 
     assert result.response_type is ResponseType.CLARIFICATION
     assert result.clarification_question is not None
+    assert result.clarification_question.text == question
     assert len(llm.calls) == 2
     compatible_after = _reminder_row(repository, compatible_id)
     incompatible_after = _reminder_row(repository, incompatible_id)
@@ -1994,7 +2379,7 @@ def test_compatible_and_incompatible_same_target_requires_ambiguity_hitl() -> No
     assert incompatible_after["version"] == incompatible_before["version"]
 
 
-def test_validation_and_finalization_candidates_include_recurrence_linkage() -> None:
+def test_validation_candidates_include_recurrence_linkage_without_model_three() -> None:
     repository = _repository()
     parent_id = _seed_reminder(
         repository,
@@ -2020,7 +2405,7 @@ def test_validation_and_finalization_candidates_include_recurrence_linkage() -> 
             ),
             _validation(
                 operation="turn_off",
-                result="EXECUTE",
+                result="PASS",
                 selected=[child_id],
                 assessments=[
                     _assessment(
@@ -2033,10 +2418,6 @@ def test_validation_and_finalization_candidates_include_recurrence_linkage() -> 
                 ],
                 should_execute=True,
             ),
-            _finalization(
-                operation="turn_off",
-                selected_candidate_key=child_id,
-            ),
         ]
     )
 
@@ -2044,7 +2425,7 @@ def test_validation_and_finalization_candidates_include_recurrence_linkage() -> 
         result = _branch(llm).execute(_context(query, []), repository)
 
     assert result.response_type is ResponseType.REMINDER_ACTION
-    assert len(llm.calls) == 3
+    assert len(llm.calls) == 2
     validation_candidates = _prompt_payload(llm.calls[1])[
         "reminder_retrieval"
     ]
@@ -2056,37 +2437,26 @@ def test_validation_and_finalization_candidates_include_recurrence_linkage() -> 
     assert child["next_fire_time"] == next_fire_time
     assert child["parent_recurring_reminder_id"] == parent_id
 
-    finalization_candidate = _prompt_payload(llm.calls[2])["extra"][
-        "selected_candidate_manifest"
-    ]
-    assert finalization_candidate["candidate_key"] == child_id
-    assert finalization_candidate["next_fire_time_present"] is True
-    assert finalization_candidate["parent_recurring_reminder_present"] is True
-
-
 @pytest.mark.parametrize(
-    ("action", "query", "initial_status", "expected_status", "pending"),
+    ("action", "query", "initial_status", "expected_status"),
     (
         (
             "delete",
             "Delete the Legacy timezone reminder.",
             "scheduled",
-            "scheduled",
-            True,
+            "dismissed",
         ),
         (
             "turn_off",
             "Turn off the Legacy timezone reminder.",
             "scheduled",
             "cancelled",
-            False,
         ),
         (
             "turn_on",
             "Turn on the Legacy timezone reminder.",
             "cancelled",
             "scheduled",
-            False,
         ),
     ),
 )
@@ -2095,7 +2465,6 @@ def test_target_only_actions_do_not_normalize_legacy_invalid_timezone(
     query: str,
     initial_status: str,
     expected_status: str,
-    pending: bool,
 ) -> None:
     repository = _repository()
     reminder_id = _seed_reminder(
@@ -2107,7 +2476,6 @@ def test_target_only_actions_do_not_normalize_legacy_invalid_timezone(
         user_timezone="Legacy/Invalid",
         recurrence_timezone="Legacy/Invalid",
     )
-    original = _reminder_row(repository, reminder_id)
     llm = ScriptedLLM(
         [
             (
@@ -2123,7 +2491,7 @@ def test_target_only_actions_do_not_normalize_legacy_invalid_timezone(
             ),
             _validation(
                 operation=action,
-                result="EXECUTE",
+                result="PASS",
                 selected=[reminder_id],
                 assessments=[
                     _assessment(
@@ -2135,10 +2503,6 @@ def test_target_only_actions_do_not_normalize_legacy_invalid_timezone(
                 ],
                 should_execute=True,
             ),
-            _finalization(
-                operation=action,
-                selected_candidate_key=reminder_id,
-            ),
         ]
     )
 
@@ -2147,15 +2511,14 @@ def test_target_only_actions_do_not_normalize_legacy_invalid_timezone(
 
     assert result.response_type is ResponseType.REMINDER_ACTION
     assert result.clarification_question is None
-    assert bool(result.actions_pending_confirmation) is pending
-    assert len(llm.calls) == 3
+    assert result.actions_pending_confirmation == []
+    assert len(llm.calls) == 2
     assert _reminder_row(repository, reminder_id)["status"] == expected_status
 
 
-def test_generated_supporting_question_does_not_overwrite_finalized_fields() -> None:
+def test_reminder_branch_does_not_create_supporting_fields_before_autoscan() -> None:
     finalized_question = "Which checklist should I use?"
     finalized_response = "Use checklist A"
-    generated_question = "Should this reminder repeat next quarter?"
     query = (
         "Add a Submit payroll reminder at "
         f"{BASE_TIME} in UTC. Supporting question: {finalized_question} "
@@ -2171,8 +2534,6 @@ def test_generated_supporting_question_does_not_overwrite_finalized_fields() -> 
         event_time=BASE_TIME,
         user_timezone="UTC",
         original_time_text=BASE_TIME,
-        supporting_question=finalized_question,
-        supporting_response=finalized_response,
         time_semantics="both",
     )
     llm = ScriptedLLM(
@@ -2180,44 +2541,65 @@ def test_generated_supporting_question_does_not_overwrite_finalized_fields() -> 
             extraction,
             _validation(
                 operation="add",
-                result="EXECUTE",
+                result="PASS",
                 selected=[],
                 assessments=[],
                 should_execute=True,
             ),
-            _finalization(
-                operation="add",
-                selected_candidate_key="",
-            ),
         ]
     )
 
-    class SupportingStrategy:
-        def generate(self, *_args: Any, **_kwargs: Any) -> GeneratedQuestion:
-            return GeneratedQuestion(
-                text=generated_question,
-                source=QuestionSource.REMINDER_SUPPORTING_QUESTION,
-                purpose="optional_context",
-                confidence=1.0,
-                expected_response_type=(
-                    ExpectedResponseType.REMINDER_FOLLOWUP_ANSWER
-                ),
-            )
-
     repository = _repository()
     branch = _branch(llm)
-    branch.reminder_supporting_strategy = SupportingStrategy()
 
     with canonical_chat_history_scope([]):
         result = branch.execute(_context(query, []), repository)
 
     assert result.response_type is ResponseType.REMINDER_ACTION
-    assert result.reminder_supporting_question is not None
-    assert result.reminder_supporting_question.text == generated_question
+    assert result.reminder_supporting_question is None
+    assert [call["task"] for call in llm.calls] == [
+        LLMTask.REMINDER_ACTION_EXTRACTION,
+        LLMTask.REMINDER_ACTION_VALIDATION,
+    ]
     row = repository.list_reminders(user_id=USER_ID)[0]
-    assert row["supporting_question"] == finalized_question
-    assert row["supporting_response"] == finalized_response
-    assert row["supporting_question"] != generated_question
+    assert not row["supporting_question"]
+    assert not row["supporting_response"]
+
+
+def test_first_model_guard_rejects_removed_supporting_question_fields() -> None:
+    query = "Add a Payroll reminder. Supporting question: Should this repeat?"
+    payload = _extraction(
+        action="add",
+        retrieval_text="Payroll",
+        subject="Payroll",
+        raw_reminder="Payroll",
+        notification_time=BASE_TIME,
+        user_timezone="UTC",
+        original_time_text=BASE_TIME,
+        supporting_question="Should this repeat?",
+    )
+    llm = ScriptedLLM([payload])
+    detector = LLMReminderActionDetector(
+        llm=llm,
+        prompts=DEFAULT_PROMPT_REGISTRY,
+        min_confidence=0.76,
+    )
+
+    with canonical_chat_history_scope([]):
+        result = detector.detect(
+            ChatRequest(
+                user_id=USER_ID,
+                raw_query=query,
+                platform_context={"timezone": "UTC"},
+            ),
+            query,
+            Intent.REMINDER,
+        )
+
+    assert result.metadata == {}
+    assert result.requires_clarification
+    assert "invalid_reminder_action_extraction" in result.risk_flags
+    assert len(llm.calls) == 1
 
 
 def test_foreign_user_reminder_never_reaches_validation_prompt() -> None:
@@ -2235,7 +2617,7 @@ def test_foreign_user_reminder_never_reaches_validation_prompt() -> None:
             _extraction(action="delete", retrieval_text="Missing payroll"),
             _validation(
                 operation="delete",
-                result="SKIP_NOT_FOUND",
+                result="FAIL",
                 selected=[],
                 assessments=[],
                 should_execute=False,
@@ -2246,7 +2628,8 @@ def test_foreign_user_reminder_never_reaches_validation_prompt() -> None:
     with canonical_chat_history_scope([]):
         result = _branch(llm).execute(_context(query, []), repository)
 
-    assert result.response_type is ResponseType.REMINDER_ACTION
+    assert result.response_type is ResponseType.CLARIFICATION
+    assert result.clarification_question is not None
     validation_payload = _prompt_payload(llm.calls[1])
     assert validation_payload["reminder_retrieval"] == []
     assert repository.table_count("reminders") == 1

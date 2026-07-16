@@ -47,7 +47,6 @@ from .errors import (
 )
 from .prompts import DEFAULT_PROMPT_REGISTRY
 from .repository import AssistantRepository
-from .reminder_safety import normalize_subject, token_similarity, utc_minute, within_minutes
 from .recurrence import calculate_next_fire_time
 from .lifecycle import is_artifact_downloadable, is_indexable_conversation_hop, is_indexable_knowledge_chunk
 from .metrics import GLOBAL_METRICS
@@ -1758,39 +1757,6 @@ class SQLiteRepository(AssistantRepository):
         )
         return reminder_id
 
-    def find_active_reminder_duplicates(
-        self,
-        *,
-        user_id: str,
-        subject: str,
-        reminder_time: datetime,
-        statuses: tuple[str, ...] = ("scheduled", "notified"),
-        limit: int = 20,
-    ) -> dict[str, Any]:
-        rows = self.list_reminder_candidates(
-            user_id=user_id,
-            statuses=statuses,
-            time_window=None,
-            limit=limit,
-        )
-        target_subject = normalize_subject(subject)
-        target_minute = utc_minute(reminder_time)
-        similar: list[dict[str, Any]] = []
-        for row in rows:
-            if not row.reminder_time:
-                continue
-            candidate_minute = utc_minute(row.reminder_time)
-            candidate_subject = normalize_subject(row.subject)
-            if candidate_subject == target_subject and candidate_minute == target_minute:
-                return {"type": "exact", "reminder": row}
-            score = token_similarity(subject, row.subject)
-            if score >= 0.65 and within_minutes(reminder_time, row.reminder_time, 30):
-                similar.append({"reminder": row, "similarity": score})
-        if similar:
-            similar.sort(key=lambda item: item["similarity"], reverse=True)
-            return {"type": "similar", "matches": similar}
-        return {"type": "none"}
-
     def update_reminder_status(
         self,
         cursor: sqlite3.Cursor,
@@ -2362,22 +2328,6 @@ class SQLiteRepository(AssistantRepository):
                 )
 
         if action_type is ReminderAction.ADD:
-            if action.reminder_time:
-                duplicate = self.find_active_reminder_duplicates(
-                    user_id=user_id,
-                    subject=action.subject or action.reminder_summary or action.raw_reminder or "",
-                    reminder_time=action.reminder_time,
-                    limit=20,
-                )
-                if duplicate.get("type") == "exact":
-                    return RepositoryActionResult(
-                        action_id=new_id(),
-                        action_type=action_type.value,
-                        status="skipped",
-                        domain_entity_type="reminder",
-                        user_safe_summary="That reminder already exists.",
-                        reason_summary="Exact duplicate reminder detected inside transaction.",
-                    )
             reminder_id = self.add_reminder(
                 cursor,
                 user_id=user_id,

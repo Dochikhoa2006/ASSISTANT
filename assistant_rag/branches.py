@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field, is_dataclass, replace
-from datetime import datetime, timedelta, timezone
-from enum import Enum
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from .config import AssistantConfig
@@ -70,7 +68,6 @@ from .action_detection import (
 from .generation import QuestionGenerationStrategy
 from .branch_orchestration import ValidatedActionBuilder
 from .settings import MutationPartialExecutionPolicy
-from .reminder_safety import ReminderTimeNormalizer, ReminderTimeNormalizationError
 from .chat_history import canonical_chat_history_scope, current_chat_history
 
 
@@ -90,120 +87,7 @@ def _mutation_clarification_message_key(domain: str, missing_fields: list[str]) 
             return "knowledge_missing_content"
         return "knowledge_missing_action"
 
-    if "factuality_confirmation" in missing:
-        return "reminder_factuality_confirmation"
-    if "reminder_validation_clarification" in missing:
-        return "reminder_validation_clarification"
-    if {"reminder_time", "new_reminder_time", "time", "date", "timezone"} & missing:
-        return "reminder_missing_time"
-    if {"subject", "new_subject", "reminder_subject"} & missing:
-        return "reminder_missing_subject"
-    if {"target_description", "target", "reminder_id"} & missing:
-        return "reminder_missing_target"
-    if {"new_reminder_time", "new_subject", "replacement"} & missing:
-        return "reminder_missing_update"
-    return "reminder_missing_action"
-
-
-def _json_safe(value: Any) -> Any:
-    if is_dataclass(value):
-        return {key: _json_safe(val) for key, val in asdict(value).items()}
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, dict):
-        return {str(key): _json_safe(val) for key, val in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    return value
-
-
-def _action_authorization(
-    context: PipelineContext,
-    intent: Intent,
-    action_name: str,
-) -> dict[str, Any]:
-    existing = context.request.metadata.get("action_authorization") or {}
-    if (
-        existing.get("intent") == intent.value
-        and str(existing.get("action") or "").casefold() == action_name.casefold()
-    ):
-        return dict(existing)
-    return {
-        "intent": intent.value,
-        "action": action_name.casefold(),
-        "source": "llm_action_extraction",
-        "reason_summary": "Bound to the dedicated extraction LLM output and validated action.",
-    }
-
-
-def _expires_at(config: AssistantConfig) -> str:
-    return (datetime.now(timezone.utc) + timedelta(minutes=config.confirmation_expiry_minutes)).isoformat()
-
-
-def _pending_confirmation_result(
-    *,
-    response_type: ResponseType,
-    text: str,
-    confirmation: dict[str, Any],
-) -> BranchResult:
-    return BranchResult(
-        response_type=response_type,
-        normal_response_text=text,
-        actions_pending_confirmation=[
-            {
-                "confirmation_token": confirmation["confirmation_token"],
-                "action_type": confirmation["action_type"],
-                "target_entity_type": confirmation["target_entity_type"],
-                "target_entity_id": confirmation.get("target_entity_id"),
-                "expires_at": confirmation["expires_at"],
-                "status": confirmation["status"],
-            }
-        ],
-    )
-
-
-def _parse_dt(value: Any) -> datetime | None:
-    if value is None or isinstance(value, datetime):
-        return value
-    return datetime.fromisoformat(str(value))
-
-
-def _validated_reminder_from_dict(payload: dict[str, Any]) -> ValidatedReminderAction:
-    return ValidatedReminderAction(
-        action=ReminderAction(payload["action"]),
-        validation_result=ActionValidationResult(payload.get("validation_result", ActionValidationResult.EXECUTE.value)),
-        target_reminder_ids=tuple(payload.get("target_reminder_ids") or ()),
-        observed_status=payload.get("observed_status"),
-        observed_version=payload.get("observed_version"),
-        observed_reminder_time=_parse_dt(payload.get("observed_reminder_time")),
-        subject=payload.get("subject"),
-        event_time=_parse_dt(payload.get("event_time")),
-        reminder_time=_parse_dt(payload.get("reminder_time")),
-        reminder_summary=payload.get("reminder_summary"),
-        raw_reminder=payload.get("raw_reminder"),
-        supporting_question=payload.get("supporting_question"),
-        supporting_response=payload.get("supporting_response"),
-        user_timezone=payload.get("user_timezone"),
-        original_time_text=payload.get("original_time_text"),
-        recurrence_rule=payload.get("recurrence_rule"),
-        recurrence_timezone=payload.get("recurrence_timezone"),
-        next_fire_time=_parse_dt(payload.get("next_fire_time")),
-        parent_recurring_reminder_id=payload.get("parent_recurring_reminder_id"),
-        timing_plan_required=bool(payload.get("timing_plan_required", True)),
-        replacement_subject=payload.get("replacement_subject"),
-        replacement_time=_parse_dt(payload.get("replacement_time")),
-        replacement_summary=payload.get("replacement_summary"),
-        replacement_recurrence_rule=payload.get("replacement_recurrence_rule"),
-        replacement_recurrence_timezone=payload.get("replacement_recurrence_timezone"),
-        confidence=float(payload.get("confidence", 1.0)),
-        matched_fields=tuple(payload.get("matched_fields") or ()),
-        reason_summary=payload.get("reason_summary"),
-        requires_hitl=bool(payload.get("requires_hitl", False)),
-        factuality_concern=bool(payload.get("factuality_concern", False)),
-        hitl_reason=payload.get("hitl_reason"),
-    )
+    raise ValueError(f"Clarification messages are not supported for domain: {domain}")
 
 
 def _validated_knowledge_from_dict(payload: dict[str, Any]) -> ValidatedKnowledgeAction:
@@ -628,17 +512,29 @@ class KnowledgeFactsBranch:
             detection = self.action_detector.detect(
                 context.request, context.rewritten_query, Intent.KNOWLEDGE_FACTS
             )
-        if detection.requires_clarification:
+        actions = list(detection.metadata.get("knowledge_actions") or [])
+        # A schema-valid best-effort extraction must reach model 2, which owns
+        # semantic completeness and confidence. Only a failed response guard
+        # with no usable action state clarifies before retrieval validation.
+        if detection.requires_clarification and not actions:
             return self._generate_clarification(
                 context,
                 getattr(detection, "missing_fields", []),
                 "Missing fields for knowledge action.",
             )
-        actions = list(detection.metadata.get("knowledge_actions") or [])
         context.request.metadata.update(detection.metadata)
                     
         if not actions:
             return self._generate_clarification(context, [], "No valid knowledge action detected.")
+        if len(actions) != 1:
+            # Guard 1 hands exactly one canonical model-1 action state to the
+            # validation pipeline. Never truncate a malformed multi-action
+            # detector result by silently taking actions[0].
+            return self._generate_clarification(
+                context,
+                ["single_action"],
+                "Exactly one knowledge action is required.",
+            )
 
         executable_actions = []
         pre_repo_results = []
@@ -837,27 +733,19 @@ class ReminderBranch:
 
     config: AssistantConfig
     action_detector: ActionDetector
-    clarification_strategy: QuestionGenerationStrategy | None = None
-    reminder_supporting_strategy: QuestionGenerationStrategy | None = None
     prompt_registry: PromptRegistry = field(default_factory=lambda: DEFAULT_PROMPT_REGISTRY)
-    validated_action_builder: ValidatedActionBuilder | None = None
     retriever: HybridRetriever | None = None
     context_filter: ContextFilter | None = None
     llm: LLMClient | None = None
     reminder_mutation_pipeline: Any | None = None
 
-    def _generate_clarification(self, context: PipelineContext, missing_fields: list[str], ambiguity_reason: str) -> BranchResult:
-        question = GeneratedQuestion(
-            text=self.prompt_registry.message(
-                _mutation_clarification_message_key("reminder", missing_fields)
-            ),
-            source=QuestionSource.CLARIFICATION_QUESTION,
-            purpose="resolve_missing_info",
-            confidence=1.0,
-        )
+    def _safe_rejection(self) -> BranchResult:
+        """Stop a reminder mutation without generating a clarification question."""
         return BranchResult(
-            response_type=ResponseType.CLARIFICATION,
-            clarification_question=question,
+            response_type=ResponseType.SAFE_NOOP,
+            normal_response_text=self.prompt_registry.message(
+                "reminder_not_confident"
+            ),
         )
 
     def execute(self, context: PipelineContext, repository: AssistantRepository) -> BranchResult:
@@ -873,39 +761,19 @@ class ReminderBranch:
             detection = self.action_detector.detect(
                 context.request, context.rewritten_query, Intent.REMINDER
             )
-        if detection.requires_clarification:
-            return self._generate_clarification(
-                context,
-                getattr(detection, "missing_fields", []),
-                "Missing fields for reminder action.",
-            )
         actions = list(detection.metadata.get("reminder_actions") or [])
         context.request.metadata.update(detection.metadata)
                     
         if not actions:
-            return self._generate_clarification(context, [], "No valid reminder action detected.")
+            return self._safe_rejection()
+        if len(actions) != 1:
+            # Keep the same guard-1 cardinality boundary as knowledge while
+            # preserving the reminder branch's non-generative safe rejection.
+            return self._safe_rejection()
 
         executable_actions = []
         pre_repo_results = []
-        prevalidated_actions = [
-            _validated_reminder_from_dict(action)
-            for action in context.request.metadata.get("validated_reminder_actions", [])
-        ] if context.request.metadata.get("confirmation_approved") else []
-        if prevalidated_actions and (
-            len(actions) != 1
-            or len(prevalidated_actions) != 1
-            or str(actions[0].get("action") or "").casefold()
-            != prevalidated_actions[0].action.value
-        ):
-            return self._generate_clarification(
-                context,
-                ["single_action"],
-                "The confirmation extraction did not match the validated action.",
-            )
         if self.reminder_mutation_pipeline:
-            # Confirmation replays must be re-retrieved from SQL and passed
-            # through the isolated second model and finalizer. No reminder
-            # execution may bypass the three-stage mutation pipeline.
             validated_actions = [
                 self.reminder_mutation_pipeline.build_action(
                     context=context,
@@ -913,63 +781,31 @@ class ReminderBranch:
                     repository=repository,
                 )
             ]
-            if len(validated_actions) != 1:
-                return self._generate_clarification(
-                    context,
-                    ["single_action"],
-                    "Exactly one reminder action is required.",
-                )
-            clarification_needed = False
-            clarification_missing_fields: list[str] = []
             for v_act in validated_actions:
                 if v_act.hitl_reason == "internal_pipeline_failure":
                     return BranchResult(
                         response_type=ResponseType.ERROR,
                         fallback_or_error_message=self.prompt_registry.message(
-                            # TODO: add reminder_pipeline_unavailable prompt key.
-                            "knowledge_pipeline_unavailable"
+                            "reminder_pipeline_unavailable"
                         ),
                     )
-                if v_act.hitl_reason == "reminder_validation_clarification":
-                    clarification_q = getattr(v_act, "clarification_question", None)
-                    if clarification_q and clarification_q.strip():
+                if v_act.hitl_reason == "reminder_validation_fail":
+                    if not (v_act.clarification_question or "").strip():
                         return BranchResult(
-                            response_type=ResponseType.CLARIFICATION,
-                            clarification_question=GeneratedQuestion(
-                                text=clarification_q,
-                                source=QuestionSource.CLARIFICATION_QUESTION,
-                                purpose="reminder_validation_fail",
-                                confidence=v_act.confidence,
+                            response_type=ResponseType.ERROR,
+                            fallback_or_error_message=self.prompt_registry.message(
+                                "reminder_pipeline_unavailable"
                             ),
                         )
-                if v_act.validation_result in (ActionValidationResult.CLARIFY_AMBIGUOUS_TARGET, ActionValidationResult.CLARIFY_MISSING_FIELDS):
-                    clarification_needed = True
-                    if v_act.factuality_concern:
-                        clarification_missing_fields.append(
-                            "factuality_confirmation"
-                        )
-                    elif v_act.hitl_reason:
-                        clarification_missing_fields.append(
-                            "reminder_validation_clarification"
-                        )
-                    elif v_act.action is ReminderAction.ADD:
-                        if not v_act.reminder_time:
-                            clarification_missing_fields.append("reminder_time")
-                        if not v_act.subject:
-                            clarification_missing_fields.append("subject")
-                    elif v_act.action is ReminderAction.MODIFY:
-                        if not v_act.replacement_time and not v_act.replacement_subject:
-                            clarification_missing_fields.append("new_reminder_time")
-                        else:
-                            clarification_missing_fields.append("target_description")
-                    else:
-                        clarification_missing_fields.append("target_description")
-            
-            if clarification_needed:
-                if self.config.mutation_policy.partial_execution_policy == MutationPartialExecutionPolicy.ALL_OR_NOTHING:
-                    return self._generate_clarification(context, clarification_missing_fields, "Action requires clarification.")
-                else:
-                    return self._generate_clarification(context, clarification_missing_fields, "Ambiguous actions block execution.")
+                    return BranchResult(
+                        response_type=ResponseType.CLARIFICATION,
+                        clarification_question=GeneratedQuestion(
+                            text=v_act.clarification_question,
+                            source=QuestionSource.CLARIFICATION_QUESTION,
+                            purpose="reminder_validation_fail",
+                            confidence=v_act.confidence,
+                        ),
+                    )
                     
             from .contracts import RepositoryActionResult
             for v_act in validated_actions:
@@ -1000,7 +836,7 @@ class ReminderBranch:
                         reason_summary=v_act.reason_summary or f"Validation resulted in {v_act.validation_result.value}",
                     ))
                     
-            if not executable_actions and not clarification_needed:
+            if not executable_actions:
                 response_text = self.prompt_registry.message("reminder_no_op") if hasattr(self.prompt_registry, "message") else "No reminder needed to be changed."
                 result = repository.record_action_audit_noop(
                     user_id=context.request.user_id,
@@ -1033,8 +869,7 @@ class ReminderBranch:
             return BranchResult(
                 response_type=ResponseType.ERROR,
                 fallback_or_error_message=self.prompt_registry.message(
-                    # TODO: add reminder_pipeline_unavailable prompt key.
-                    "knowledge_pipeline_unavailable"
+                    "reminder_pipeline_unavailable"
                 ),
             )
 
@@ -1042,253 +877,7 @@ class ReminderBranch:
             "operation_response", self.prompt_registry.message("reminder_updated") if hasattr(self.prompt_registry, "message") else "Reminder updated successfully."
         )
         if len(executable_actions) != 1:
-            return self._generate_clarification(
-                context,
-                ["single_action"],
-                "Exactly one executable reminder action is required.",
-            )
-        warnings: list[str] = []
-        normalized_actions: list[ValidatedReminderAction] = []
-        normalizer = ReminderTimeNormalizer(default_timezone=self.config.default_timezone)
-        request_timezone = context.request.platform_context.get("timezone") if context.request.platform_context else None
-        for action in executable_actions:
-            if not isinstance(action, ValidatedReminderAction):
-                normalized_actions.append(action)
-                continue
-            if action.action not in {ReminderAction.ADD, ReminderAction.MODIFY}:
-                normalized_actions.append(action)
-                continue
-            updated_action = action
-            try:
-                source_time_text = (
-                    action.original_time_text
-                    or context.request.metadata.get("original_time_text")
-                    or context.rewritten_query
-                )
-                normalized_notification = (
-                    normalizer.normalize(
-                        action.reminder_time,
-                        platform_timezone=action.user_timezone or request_timezone,
-                        original_time_text=source_time_text,
-                    )
-                    if action.reminder_time
-                    else None
-                )
-                normalized_event = (
-                    normalizer.normalize(
-                        action.event_time,
-                        platform_timezone=action.user_timezone or request_timezone,
-                        original_time_text=source_time_text,
-                    )
-                    if action.event_time
-                    else None
-                )
-                for normalized in (normalized_notification, normalized_event):
-                    if normalized and normalized.warning and normalized.warning not in warnings:
-                        warnings.append(normalized.warning)
-
-                if action.action is ReminderAction.ADD:
-                    normalized_source = normalized_notification or normalized_event
-                    updated_action = replace(
-                        action,
-                        reminder_time=(
-                            normalized_notification.reminder_time_utc
-                            if normalized_notification
-                            else None
-                        ),
-                        event_time=(
-                            normalized_event.reminder_time_utc
-                            if normalized_event
-                            else None
-                        ),
-                        user_timezone=(
-                            normalized_source.user_timezone
-                            if normalized_source
-                            else action.user_timezone
-                        ),
-                        original_time_text=(
-                            normalized_source.original_time_text
-                            if normalized_source
-                            else action.original_time_text
-                        ),
-                    )
-                elif action.action is ReminderAction.MODIFY:
-                    normalized_replacement = (
-                        normalizer.normalize(
-                            action.replacement_time,
-                            platform_timezone=action.user_timezone or request_timezone,
-                            original_time_text=source_time_text,
-                        )
-                        if action.replacement_time
-                        else None
-                    )
-                    if (
-                        normalized_replacement
-                        and normalized_replacement.warning
-                        and normalized_replacement.warning not in warnings
-                    ):
-                        warnings.append(normalized_replacement.warning)
-                    normalized_source = (
-                        normalized_replacement
-                        or normalized_notification
-                        or normalized_event
-                    )
-                    updated_action = replace(
-                        action,
-                        replacement_time=(
-                            normalized_replacement.reminder_time_utc
-                            if normalized_replacement
-                            else action.replacement_time
-                        ),
-                        reminder_time=(
-                            normalized_notification.reminder_time_utc
-                            if normalized_notification
-                            else action.reminder_time
-                        ),
-                        event_time=(
-                            normalized_event.reminder_time_utc
-                            if normalized_event
-                            else action.event_time
-                        ),
-                        user_timezone=(
-                            normalized_source.user_timezone
-                            if normalized_source
-                            else action.user_timezone
-                        ),
-                        original_time_text=(
-                            normalized_source.original_time_text
-                            if normalized_source
-                            else action.original_time_text
-                        ),
-                    )
-            except ReminderTimeNormalizationError as exc:
-                return self._generate_clarification(context, ["timezone"], str(exc))
-            normalized_actions.append(updated_action)
-        executable_actions = normalized_actions
-
-        if not context.request.metadata.get("confirmation_approved"):
-            for action in executable_actions:
-                if not isinstance(action, ValidatedReminderAction):
-                    continue
-                if action.action is ReminderAction.ADD and action.reminder_time:
-                    duplicate = repository.find_active_reminder_duplicates(
-                        user_id=context.request.user_id,
-                        subject=action.subject or action.reminder_summary or action.raw_reminder or "",
-                        reminder_time=action.reminder_time,
-                    )
-                    if duplicate.get("type") == "exact":
-                        response_text = "That reminder already exists, so I did not create a duplicate."
-                        result = repository.record_action_audit_noop(
-                            user_id=context.request.user_id,
-                            topic_title=context.request.metadata.get("topic_title", "Reminders"),
-                            raw_user_query=context.request.raw_query,
-                            rewritten_user_query=context.rewritten_query,
-                            response_text=response_text,
-                            intent=Intent.REMINDER.value,
-                            response_type=ResponseType.SAFE_NOOP.value,
-                            parent_hop_id=context.request.parent_hop_id,
-                        )
-                        return BranchResult(
-                            response_type=ResponseType.SAFE_NOOP,
-                            normal_response_text=response_text,
-                            reminder_operation_results=list(result.results),
-                            linked_topic_id=getattr(
-                                result,
-                                "audit_topic_id",
-                                None,
-                            ),
-                            linked_hop_id=result.audit_hop_id,
-                            database_write_result={
-                                "conversation_hop_id": result.audit_hop_id,
-                            },
-                            indexing_job_result={
-                                "outbox_job_ids": list(
-                                    getattr(
-                                        result,
-                                        "indexing_outbox_ids",
-                                        (),
-                                    )
-                                ),
-                            },
-                            warnings=warnings,
-                        )
-                    if duplicate.get("type") == "similar":
-                        candidate = duplicate.get("candidate", {})
-                        subject = candidate.get("subject") or "an existing reminder"
-                        question = GeneratedQuestion(
-                            text=f"I found a similar reminder, '{subject}'. Should I keep both, replace the old one, or cancel this new reminder?",
-                            source=QuestionSource.CLARIFICATION_QUESTION,
-                            purpose="resolve_duplicate_reminder",
-                            confidence=1.0,
-                        )
-                        return BranchResult(
-                            response_type=ResponseType.CLARIFICATION,
-                            clarification_question=question,
-                            warnings=warnings,
-                        )
-
-        destructive_turn_off_count = sum(
-            1
-            for action in executable_actions
-            if isinstance(action, ValidatedReminderAction) and action.action is ReminderAction.TURN_OFF
-        )
-        dangerous_reminder_action = any(
-            isinstance(action, ValidatedReminderAction)
-            and (
-                action.action is ReminderAction.DELETE
-                or (
-                    action.action is ReminderAction.MODIFY
-                    and action.confidence < self.config.confirmation_high_confidence_threshold
-                )
-            )
-            for action in executable_actions
-        ) or destructive_turn_off_count > 1
-        if executable_actions and dangerous_reminder_action and not context.request.metadata.get("confirmation_approved"):
-            first_action = executable_actions[0]
-            target_id = None
-            if isinstance(first_action, ValidatedReminderAction) and first_action.target_reminder_ids:
-                target_id = first_action.target_reminder_ids[0]
-            confirmation = repository.create_pending_confirmation(
-                user_id=context.request.user_id,
-                action_type="reminder_mutation",
-                target_entity_type="reminder",
-                target_entity_id=target_id,
-                proposed_action={
-                    "domain": "reminder",
-                    "actions": _json_safe(executable_actions),
-                    "action_authorization": _action_authorization(
-                        context,
-                        Intent.REMINDER,
-                        getattr(getattr(first_action, "action", None), "value", ""),
-                    ),
-                    "operation_response": success_text,
-                    "topic_title": context.request.metadata.get("topic_title", "Reminders"),
-                },
-                target_snapshot={"actions": _json_safe(executable_actions)},
-                expires_at=_expires_at(self.config),
-            )
-            return _pending_confirmation_result(
-                response_type=ResponseType.REMINDER_ACTION,
-                text="Please confirm this reminder change before I apply it.",
-                confirmation=confirmation,
-            )
-        
-        reminder_supporting_question = None
-        if self.reminder_supporting_strategy:
-            reminder_supporting_question = self.reminder_supporting_strategy.generate(
-                context, 
-                action_summary=success_text, 
-                reminder_metadata={"actions": actions}
-            )
-            if reminder_supporting_question and executable_actions:
-                supporting_payload = json.dumps({
-                    "question_text": reminder_supporting_question.text,
-                    "question_source": reminder_supporting_question.source.value,
-                    "purpose": reminder_supporting_question.purpose,
-                    "confidence": reminder_supporting_question.confidence,
-                })
-                if isinstance(executable_actions[0], dict):
-                    executable_actions[0]["supporting_question"] = supporting_payload
+            return self._safe_rejection()
 
         result = repository.transactional_reminder_actions(
             user_id=context.request.user_id,
@@ -1305,7 +894,6 @@ class ReminderBranch:
                 response_type=ResponseType.REMINDER_ACTION,
                 normal_response_text=success_text,
                 human_supporting_questions=[],
-                reminder_supporting_question=reminder_supporting_question,
                 reminder_operation_results=pre_repo_results + list(result.results),
                 linked_topic_id=getattr(result, "audit_topic_id", None),
                 linked_hop_id=result.audit_hop_id,
@@ -1317,7 +905,7 @@ class ReminderBranch:
                         getattr(result, "indexing_outbox_ids", ())
                     ),
                 },
-                warnings=warnings,
+                warnings=[],
             )
 
         return BranchResult(
