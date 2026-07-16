@@ -141,7 +141,6 @@ def test_every_registry_prompt_preserves_complete_or_explicitly_empty_history() 
         "knowledge_action_extraction",
         "knowledge_content_finalization",
         "reminder_action_extraction",
-        "reminder_action_validation",
         "reminder_content_finalization",
         "risky_action_validation",
         "knowledge_retrieval_validation",
@@ -169,6 +168,7 @@ def test_every_registry_prompt_preserves_complete_or_explicitly_empty_history() 
             "last_qa",
             "clarification_merge",
             "knowledge_action_validation",
+            "reminder_action_validation",
         }:
             continue
         assert CHAT_HISTORY_PROMPT_RULE in DEFAULT_PROMPT_REGISTRY.system(template_name)
@@ -211,6 +211,62 @@ def test_knowledge_validation_prompt_contains_only_extraction_and_retrieval() ->
     assert safe_payload == payload
     system_prompt = DEFAULT_PROMPT_REGISTRY.system(
         "knowledge_action_validation"
+    )
+    assert CHAT_HISTORY_PROMPT_RULE not in system_prompt
+    assert "chat_history" not in system_prompt
+    assert "raw query" not in system_prompt.casefold()
+    assert "rewritten query" not in system_prompt.casefold()
+
+
+def test_reminder_validation_prompt_contains_only_extraction_and_retrieval() -> None:
+    history = [{"hop_id": "forbidden-hop", "text": "forbidden history"}]
+    first_model_response = {
+        "action": "delete",
+        "toggle_direction": "",
+        "retrieval_text": "Payroll",
+        "changed_fields": [],
+        "subject": "",
+        "reminder_summary": "",
+        "raw_reminder": "",
+        "notification_time": "",
+        "event_time": "",
+        "user_timezone": "",
+        "original_time_text": "",
+        "recurrence_rule": "",
+        "recurrence_timezone": "",
+        "supporting_question": "",
+        "supporting_response": "",
+        "time_semantics": "unchanged",
+        "confidence": 0.99,
+        "missing_fields": [],
+        "reason_summary": "Extracted one reminder action.",
+    }
+    retrieval = [{"candidate_key": "reminder-1", "subject": "Payroll"}]
+
+    with canonical_chat_history_scope(history):
+        context = PromptContext(
+            stage="reminder_action_validation",
+            user_id="forbidden-user",
+            rewritten_query="forbidden rewritten query",
+            metadata={"forbidden": "metadata"},
+            platform_context={"forbidden": "platform"},
+            chat_history=history,
+            extra={
+                "first_model_response": first_model_response,
+                "reminder_retrieval": retrieval,
+                "forbidden_extra": "must not survive",
+            },
+        )
+        payload = context.stage_payload()
+        safe_payload = context.safe_payload()
+
+    assert payload == {
+        "first_model_response": first_model_response,
+        "reminder_retrieval": retrieval,
+    }
+    assert safe_payload == payload
+    system_prompt = DEFAULT_PROMPT_REGISTRY.system(
+        "reminder_action_validation"
     )
     assert CHAT_HISTORY_PROMPT_RULE not in system_prompt
     assert "chat_history" not in system_prompt

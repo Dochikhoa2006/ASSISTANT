@@ -179,6 +179,7 @@ class LLMReminderActionDetector:
             not in {
                 "intent",
                 "reminder_actions",
+                "reminder_action_extraction_response",
                 "validated_reminder_actions",
                 "action_authorization",
                 "confirmation_approved",
@@ -303,6 +304,7 @@ class LLMReminderActionDetector:
             changed_fields = [item.strip() for item in payload["changed_fields"]]
             missing_fields = [item.strip() for item in payload["missing_fields"]]
             time_semantics = payload["time_semantics"].strip()
+            reason_summary = payload["reason_summary"].strip()
         except (KeyError, TypeError, ValueError):
             return self._failed("invalid_reminder_action_extraction", ["action"])
 
@@ -461,6 +463,17 @@ class LLMReminderActionDetector:
             confidence=confidence,
             metadata={
                 "reminder_actions": [action_payload],
+                "reminder_action_extraction_response": {
+                    "action": extracted_action_name,
+                    "toggle_direction": toggle_direction,
+                    "retrieval_text": retrieval_text,
+                    "changed_fields": changed_fields,
+                    **values,
+                    "time_semantics": time_semantics,
+                    "confidence": confidence,
+                    "missing_fields": missing_fields,
+                    "reason_summary": reason_summary,
+                },
                 "action_authorization": {
                     "intent": Intent.REMINDER.value,
                     "action": action_name,
@@ -589,8 +602,39 @@ class ReminderActionValidationStrategy:
         context: PipelineContext,
         action_payload: dict[str, Any],
         candidates: list[ReminderMutationCandidate],
+        first_model_response: dict[str, Any] | None = None,
     ) -> LLMRetrievalValidationResult:
         operation = _text(action_payload.get("action")).casefold()
+        # ``context`` remains in the compatibility signature, but no request,
+        # query, metadata, platform, or history value may enter LLM2. The
+        # PromptContext stage also enforces this boundary with an exact key
+        # allowlist, matching the knowledge validator's isolation pattern.
+        isolated_first_response = self._validate_first_model_response(
+            first_model_response,
+            requested_operation=operation,
+        )
+        if isolated_first_response is None:
+            return self._clarification(
+                operation,
+                "Reminder validation received an invalid first-model response.",
+                "invalid_first_model_response",
+            )
+
+        reminder_retrieval = [
+            {
+                "candidate_key": candidate.candidate_key,
+                "status": candidate.status,
+                "version": candidate.version,
+                "deterministic_score": candidate.deterministic_score,
+                "next_fire_time": candidate.next_fire_time,
+                "parent_recurring_reminder_id": (
+                    candidate.parent_recurring_reminder_id
+                ),
+                "timing_plan_status": candidate.timing_plan_status,
+                **candidate.fields,
+            }
+            for candidate in candidates
+        ]
         try:
             raw = self.llm.generate_json(
                 task=LLMTask.REMINDER_ACTION_VALIDATION,
@@ -598,46 +642,9 @@ class ReminderActionValidationStrategy:
                 user_prompt=self.prompts.user(
                     PromptContext(
                         stage="reminder_action_validation",
-                        user_id=context.request.user_id,
-                        rewritten_query=context.rewritten_query,
-                        intent=Intent.REMINDER.value,
-                        metadata=context.request.metadata,
-                        platform_context=context.request.platform_context,
-                        chat_history=context.chat_history,
                         extra={
-                            "operation": operation,
-                            "runtime_now_utc": _text(
-                                action_payload.get("runtime_now_utc")
-                            ),
-                            "extracted_action": action_payload,
-                            "candidate_reminders": [
-                                {
-                                    "candidate_key": candidate.candidate_key,
-                                    "status": candidate.status,
-                                    "version": candidate.version,
-                                    "deterministic_score": candidate.deterministic_score,
-                                    "next_fire_time": candidate.next_fire_time,
-                                    "parent_recurring_reminder_id": (
-                                        candidate.parent_recurring_reminder_id
-                                    ),
-                                    "timing_plan_status": candidate.timing_plan_status,
-                                    **candidate.fields,
-                                }
-                                for candidate in candidates
-                            ],
-                            "validation_policy": {
-                                "min_confidence": self.config.retrieval_validation.reminder_llm_validation_min_confidence,
-                                "allowed_statuses": list(
-                                    self._allowed_statuses(ReminderAction(operation))
-                                ),
-                                "no_op_statuses": list(
-                                    self._no_op_statuses(ReminderAction(operation))
-                                ),
-                                "candidate_assessment_cardinality": "exactly_once_each",
-                                "runtime_now_utc": _text(
-                                    action_payload.get("runtime_now_utc")
-                                ),
-                            },
+                            "first_model_response": isolated_first_response,
+                            "reminder_retrieval": reminder_retrieval,
                         },
                     )
                 ),
@@ -658,6 +665,99 @@ class ReminderActionValidationStrategy:
             action_payload=action_payload,
             candidates=candidates,
         )
+
+    @staticmethod
+    def _validate_first_model_response(
+        response: dict[str, Any] | None,
+        *,
+        requested_operation: str,
+    ) -> dict[str, Any] | None:
+        if not isinstance(response, dict) or set(response) != _REMINDER_EXTRACTION_FIELDS:
+            return None
+        string_fields = {
+            "action",
+            "toggle_direction",
+            "retrieval_text",
+            *REMINDER_EDITABLE_FIELDS,
+            "time_semantics",
+            "reason_summary",
+        }
+        if not all(isinstance(response[field], str) for field in string_fields):
+            return None
+        raw_confidence = response["confidence"]
+        raw_changed_fields = response["changed_fields"]
+        raw_missing_fields = response["missing_fields"]
+        if (
+            isinstance(raw_confidence, bool)
+            or not isinstance(raw_confidence, (int, float))
+            or not isfinite(float(raw_confidence))
+            or not 0.0 <= float(raw_confidence) <= 1.0
+            or not isinstance(raw_changed_fields, list)
+            or not all(isinstance(field, str) for field in raw_changed_fields)
+            or not isinstance(raw_missing_fields, list)
+            or raw_missing_fields
+            or not all(isinstance(field, str) for field in raw_missing_fields)
+        ):
+            return None
+
+        extracted_action = _text(response["action"]).casefold()
+        toggle_direction = _text(response["toggle_direction"]).casefold()
+        retrieval_text = _text(response["retrieval_text"])
+        changed_fields = [_text(field) for field in raw_changed_fields]
+        values = {
+            field: _text(response[field]) for field in REMINDER_EDITABLE_FIELDS
+        }
+        time_semantics = _text(response["time_semantics"])
+        reason_summary = _text(response["reason_summary"])
+        if (
+            extracted_action not in _EXTERNAL_REMINDER_ACTIONS
+            or len(changed_fields) != len(set(changed_fields))
+            or any(field not in REMINDER_EDITABLE_FIELDS for field in changed_fields)
+            or time_semantics
+            not in {"notification_time", "event_time", "both", "unchanged"}
+            or not reason_summary
+        ):
+            return None
+
+        if extracted_action == "toggle":
+            if toggle_direction not in _TOGGLE_DIRECTIONS:
+                return None
+            operation = toggle_direction
+        else:
+            if toggle_direction:
+                return None
+            operation = extracted_action
+        if operation != requested_operation:
+            return None
+        if LLMReminderActionDetector._validate_shape(
+            action_name=operation,
+            retrieval_text=retrieval_text,
+            changed_fields=changed_fields,
+            values=values,
+            time_semantics=time_semantics,
+        ) is not None:
+            return None
+        if any(
+            values[field] and _parse_datetime(values[field]) is None
+            for field in _TIME_FIELDS
+        ):
+            return None
+        if any(values[field] for field in _TIME_FIELDS) and not values[
+            "original_time_text"
+        ]:
+            return None
+
+        return {
+            "action": extracted_action,
+            "toggle_direction": toggle_direction,
+            "retrieval_text": retrieval_text,
+            "changed_fields": changed_fields,
+            **values,
+            "time_semantics": time_semantics,
+            "confidence": float(raw_confidence),
+            "missing_fields": [],
+            "reason_summary": reason_summary,
+        }
 
     def _parse(
         self,
@@ -1267,10 +1367,18 @@ class ReminderMutationPipeline:
                 "Reminder candidate retrieval failed safely.",
             )
 
+        first_model_response = context.request.metadata.get(
+            "reminder_action_extraction_response"
+        )
         validation = self.validator.validate(
             context=context,
             action_payload=action_payload,
             candidates=candidates,
+            first_model_response=(
+                dict(first_model_response)
+                if isinstance(first_model_response, dict)
+                else None
+            ),
         )
         if validation.validation_result is not ActionValidationResult.EXECUTE:
             return ValidatedReminderAction(

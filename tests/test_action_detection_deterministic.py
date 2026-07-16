@@ -13,8 +13,10 @@ from assistant_rag.contracts import (
     ChatRequest,
     Intent,
     KnowledgeAction,
+    ReminderAction,
     ResponseType,
     ValidatedKnowledgeAction,
+    ValidatedReminderAction,
 )
 from assistant_rag.settings import MutationPartialExecutionPolicy
 
@@ -204,6 +206,18 @@ def test_branch_executes_only_the_extractor_action_not_poisoned_metadata(
                 )
 
         branch_kwargs["knowledge_mutation_pipeline"] = StaticKnowledgePipeline()
+    else:
+        class StaticReminderPipeline:
+            def build_action(self, **kwargs):
+                assert kwargs["action_payload"] == extracted_action
+                return ValidatedReminderAction(
+                    action=ReminderAction.TURN_ON,
+                    validation_result=ActionValidationResult.EXECUTE,
+                    target_reminder_ids=("reminder-1",),
+                    confidence=1.0,
+                )
+
+        branch_kwargs["reminder_mutation_pipeline"] = StaticReminderPipeline()
     branch = branch_type(**branch_kwargs)
 
     class RecordingRepository:
@@ -251,7 +265,7 @@ def test_branch_executes_only_the_extractor_action_not_poisoned_metadata(
         assert committed_action.action is KnowledgeAction.ADD
         assert committed_action.knowledge_text == extracted_action["text"]
     else:
-        assert committed_action == extracted_action
+        assert committed_action.action is ReminderAction.TURN_ON
 
 
 def test_knowledge_branch_cannot_execute_without_three_stage_pipeline() -> None:
@@ -273,6 +287,39 @@ def test_knowledge_branch_cannot_execute_without_three_stage_pipeline() -> None:
             request=ChatRequest(user_id="user", raw_query="Remember Atlas is blue."),
             rewritten_query="Remember Atlas is blue.",
             intent=Intent.KNOWLEDGE_FACTS,
+            approved_conversation_context=None,
+        ),
+        MustNotWrite(),
+    )
+
+    assert result.response_type is ResponseType.ERROR
+    assert len(detector.calls) == 1
+
+
+def test_reminder_branch_cannot_bypass_llm2_with_legacy_builder() -> None:
+    extracted_action = {"action": "turn_on", "retrieval_text": "Payroll"}
+    detector = ScriptedExtractionDetector(
+        metadata={"reminder_actions": [extracted_action]}
+    )
+
+    class MustNotBuild:
+        def build_reminder_actions(self, *_args, **_kwargs):
+            raise AssertionError("legacy reminder validation bypass was called")
+
+    class MustNotWrite:
+        def __getattr__(self, name: str):
+            raise AssertionError(f"pipeline bypass reached repository method {name}")
+
+    branch = ReminderBranch(
+        config=SimpleNamespace(),
+        action_detector=detector,
+        validated_action_builder=MustNotBuild(),
+    )
+    result = branch.execute(
+        SimpleNamespace(
+            request=ChatRequest(user_id="user", raw_query="Turn on Payroll."),
+            rewritten_query="Turn on Payroll.",
+            intent=Intent.REMINDER,
             approved_conversation_context=None,
         ),
         MustNotWrite(),
@@ -356,7 +403,7 @@ def test_knowledge_branch_revalidates_matching_legacy_confirmation_before_execut
     assert repository.calls == 1
 
 
-def test_reminder_branch_executes_one_matching_prevalidated_confirmation() -> None:
+def test_reminder_branch_revalidates_one_matching_prevalidated_confirmation() -> None:
     action = {
         "action": "turn_off",
         "validation_result": "execute",
@@ -396,6 +443,21 @@ def test_reminder_branch_executes_one_matching_prevalidated_confirmation() -> No
     detector = ScriptedExtractionDetector(
         metadata={"reminder_actions": [action]},
     )
+
+    class RevalidatingPipeline:
+        calls = 0
+
+        def build_action(self, **kwargs):
+            self.calls += 1
+            assert kwargs["action_payload"] == action
+            return ValidatedReminderAction(
+                action=ReminderAction.TURN_OFF,
+                validation_result=ActionValidationResult.EXECUTE,
+                target_reminder_ids=("reminder-1",),
+                confidence=1.0,
+            )
+
+    pipeline = RevalidatingPipeline()
     branch = ReminderBranch(
         config=SimpleNamespace(
             mutation_policy=SimpleNamespace(
@@ -405,7 +467,7 @@ def test_reminder_branch_executes_one_matching_prevalidated_confirmation() -> No
             confirmation_high_confidence_threshold=0.92,
         ),
         action_detector=detector,
-        validated_action_builder=SimpleNamespace(),
+        reminder_mutation_pipeline=pipeline,
     )
 
     result = branch.execute(context, repository)
@@ -413,4 +475,5 @@ def test_reminder_branch_executes_one_matching_prevalidated_confirmation() -> No
     assert result.response_type is ResponseType.REMINDER_ACTION
     assert len(detector.calls) == 1
     assert detector.calls[0][0] is request
+    assert pipeline.calls == 1
     assert repository.calls == 1

@@ -395,7 +395,7 @@ def _finalization(
     }
 
 
-def test_add_runs_exactly_three_llm_stages_with_identical_history_and_query() -> None:
+def test_add_runs_three_stages_with_evidence_isolated_validation_prompt() -> None:
     query = (
         "Add a reminder: Submit payroll at "
         f"{BASE_TIME} in UTC."
@@ -427,6 +427,10 @@ def test_add_runs_exactly_three_llm_stages_with_identical_history_and_query() ->
         _context(forbidden_raw_query, history),
         rewritten_query=query,
     )
+    context.request.metadata["leak_probe"] = "FORBIDDEN_REMINDER_METADATA"
+    context.request.platform_context["leak_probe"] = (
+        "FORBIDDEN_REMINDER_PLATFORM_CONTEXT"
+    )
 
     with canonical_chat_history_scope(history):
         result = _branch(llm).execute(context, repository)
@@ -437,12 +441,27 @@ def test_add_runs_exactly_three_llm_stages_with_identical_history_and_query() ->
         LLMTask.REMINDER_ACTION_VALIDATION,
         LLMTask.REMINDER_CONTENT_FINALIZATION,
     ]
-    for call in llm.calls:
+    for call in (llm.calls[0], llm.calls[2]):
         payload = _prompt_payload(call)
         assert "raw_query" not in payload
         assert payload["rewritten_query"] == query
         assert payload["chat_history"] == history
         assert forbidden_raw_query not in json.dumps(payload)
+    validation_payload = _prompt_payload(llm.calls[1])
+    assert validation_payload == {
+        "first_model_response": extraction,
+        "reminder_retrieval": [],
+    }
+    serialized_validation = json.dumps(validation_payload)
+    assert query not in serialized_validation
+    assert forbidden_raw_query not in serialized_validation
+    assert "FORBIDDEN_REMINDER_METADATA" not in serialized_validation
+    assert "FORBIDDEN_REMINDER_PLATFORM_CONTEXT" not in serialized_validation
+    assert "chat_history" not in validation_payload
+    assert "user_id" not in validation_payload
+    assert "metadata" not in validation_payload
+    assert "platform_context" not in validation_payload
+    assert "extra" not in validation_payload
 
     rows = repository.list_reminders(user_id=USER_ID)
     assert len(rows) == 1
@@ -467,6 +486,10 @@ def test_intent_selected_reminder_branch_starts_with_llm_and_ignores_action_meta
         "validated_reminder_actions": [
             {"action": "delete", "retrieval_text": "Payroll"}
         ],
+        "reminder_action_extraction_response": {
+            "action": "delete",
+            "retrieval_text": "poisoned extraction state",
+        },
         "action_authorization": {"action": "delete"},
         "confirmation_approved": False,
     }
@@ -700,7 +723,7 @@ def test_finalization_requires_one_exact_binding_for_every_editable_field(
     assert after["version"] == before["version"]
 
 
-def test_delete_confirmation_replay_starts_with_extraction_only() -> None:
+def test_delete_confirmation_replay_reruns_all_three_isolated_stages() -> None:
     repository = _repository()
     reminder_id = _seed_reminder(
         repository,
@@ -766,21 +789,58 @@ def test_delete_confirmation_replay_starts_with_extraction_only() -> None:
         intent=Intent.REMINDER,
         chat_history=history,
     )
-    llm.responses.append(
-        _extraction(action="delete", retrieval_text="Legacy review")
+    replay_extraction = _extraction(
+        action="delete",
+        retrieval_text="Legacy review",
+    )
+    llm.responses.extend(
+        [
+            replay_extraction,
+            _validation(
+                operation="delete",
+                result="EXECUTE",
+                selected=[reminder_id],
+                assessments=[
+                    _assessment(
+                        reminder_id,
+                        matches=True,
+                        matched_fields=["subject"],
+                        matched_text="Legacy review",
+                    )
+                ],
+                should_execute=True,
+            ),
+            _finalization(
+                operation="delete",
+                selected_candidate_key=reminder_id,
+            ),
+        ]
     )
     with canonical_chat_history_scope(history):
         committed = branch.execute(replay_context, repository)
 
     assert confirmation_to_mark == token
     assert committed.response_type is ResponseType.REMINDER_ACTION
-    assert len(llm.calls) == 4
-    assert llm.calls[-1]["task"] is LLMTask.REMINDER_ACTION_EXTRACTION
-    confirmation_payload = _prompt_payload(llm.calls[-1])
+    assert len(llm.calls) == 6
+    assert [call["task"] for call in llm.calls[-3:]] == [
+        LLMTask.REMINDER_ACTION_EXTRACTION,
+        LLMTask.REMINDER_ACTION_VALIDATION,
+        LLMTask.REMINDER_CONTENT_FINALIZATION,
+    ]
+    confirmation_payload = _prompt_payload(llm.calls[-3])
     assert confirmation_payload["extra"]["confirmation_replay"] is True
     assert len(
         confirmation_payload["extra"]["trusted_confirmation_action_context"]
     ) == 1
+    validation_payload = _prompt_payload(llm.calls[-2])
+    assert set(validation_payload) == {
+        "first_model_response",
+        "reminder_retrieval",
+    }
+    assert validation_payload["first_model_response"] == replay_extraction
+    assert "Confirm" not in json.dumps(validation_payload)
+    assert "chat_history" not in validation_payload
+    assert "delete-history" not in json.dumps(validation_payload)
     assert _reminder_row(repository, reminder_id)["status"] == "dismissed"
 
 
@@ -1768,8 +1828,8 @@ def test_relevance_ranking_considers_exact_older_target_before_candidate_slicing
     assert result.response_type is ResponseType.REMINDER_ACTION
     assert result.actions_pending_confirmation
     assert len(llm.calls) == 3
-    validation_candidates = _prompt_payload(llm.calls[1])["extra"][
-        "candidate_reminders"
+    validation_candidates = _prompt_payload(llm.calls[1])[
+        "reminder_retrieval"
     ]
     assert target_id in {
         candidate["candidate_key"] for candidate in validation_candidates
@@ -1985,8 +2045,8 @@ def test_validation_and_finalization_candidates_include_recurrence_linkage() -> 
 
     assert result.response_type is ResponseType.REMINDER_ACTION
     assert len(llm.calls) == 3
-    validation_candidates = _prompt_payload(llm.calls[1])["extra"][
-        "candidate_reminders"
+    validation_candidates = _prompt_payload(llm.calls[1])[
+        "reminder_retrieval"
     ]
     child = next(
         candidate
@@ -2188,5 +2248,5 @@ def test_foreign_user_reminder_never_reaches_validation_prompt() -> None:
 
     assert result.response_type is ResponseType.REMINDER_ACTION
     validation_payload = _prompt_payload(llm.calls[1])
-    assert validation_payload["extra"]["candidate_reminders"] == []
+    assert validation_payload["reminder_retrieval"] == []
     assert repository.table_count("reminders") == 1

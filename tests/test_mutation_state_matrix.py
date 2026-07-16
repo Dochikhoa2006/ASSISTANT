@@ -1000,12 +1000,12 @@ class _StaticKnowledgePipeline:
         return self.action
 
 
-class _StaticReminderBuilder:
+class _StaticReminderPipeline:
     def __init__(self, action: ValidatedReminderAction) -> None:
         self.action = action
 
-    def build_reminder_actions(self, *_args, **_kwargs):
-        return [self.action]
+    def build_action(self, **_kwargs):
+        return self.action
 
 
 class _StaticExtractionDetector:
@@ -1146,7 +1146,7 @@ def test_reminder_confirmation_policy_matrix(
     branch = ReminderBranch(
         config=config,
         action_detector=detector,
-        validated_action_builder=_StaticReminderBuilder(action),
+        reminder_mutation_pipeline=_StaticReminderPipeline(action),
     )
 
     result = branch.execute(
@@ -1192,7 +1192,7 @@ def test_reminder_branch_exact_duplicate_is_safe_noop(
     branch = ReminderBranch(
         config=config,
         action_detector=detector,
-        validated_action_builder=_StaticReminderBuilder(action),
+        reminder_mutation_pipeline=_StaticReminderPipeline(action),
     )
 
     result = branch.execute(

@@ -902,26 +902,17 @@ class ReminderBranch:
                 ["single_action"],
                 "The confirmation extraction did not match the validated action.",
             )
-        if self.reminder_mutation_pipeline or self.validated_action_builder:
-            if prevalidated_actions:
-                validated_actions = prevalidated_actions
-            elif self.reminder_mutation_pipeline:
-                validated_actions = [
-                    self.reminder_mutation_pipeline.build_action(
-                        context=context,
-                        action_payload=actions[0],
-                        repository=repository,
-                    )
-                ]
-            else:
-                assert self.validated_action_builder is not None
-                validated_actions = self.validated_action_builder.build_reminder_actions(
-                    context.request.user_id, 
-                    actions, 
-                    context.rewritten_query,
-                    context.rewritten_query,
-                    repository,
+        if self.reminder_mutation_pipeline:
+            # Confirmation replays must be re-retrieved from SQL and passed
+            # through the isolated second model and finalizer. No reminder
+            # execution may bypass the three-stage mutation pipeline.
+            validated_actions = [
+                self.reminder_mutation_pipeline.build_action(
+                    context=context,
+                    action_payload=actions[0],
+                    repository=repository,
                 )
+            ]
             if len(validated_actions) != 1:
                 return self._generate_clarification(
                     context,

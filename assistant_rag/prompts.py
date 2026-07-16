@@ -84,10 +84,12 @@ PRE_CANONICAL_HISTORY_STAGES = frozenset(
     {"query_rewrite", "last_qa", "clarification_merge"}
 )
 
-# This validator is intentionally evidence-isolated. Its user prompt contains
-# only the first knowledge model's structured output and SQL-rehydrated
-# retrieval candidates; raw/rewritten queries and chat history are forbidden.
-HISTORY_ISOLATED_STAGES = frozenset({"knowledge_action_validation"})
+# These validators are intentionally evidence-isolated. Their user prompts
+# contain only the first model's structured output and SQL-rehydrated
+# domain candidates; raw/rewritten queries and chat history are forbidden.
+HISTORY_ISOLATED_STAGES = frozenset(
+    {"knowledge_action_validation", "reminder_action_validation"}
+)
 
 PROMPT_BUDGETS = {
     "query_rewrite": 360,
@@ -345,6 +347,17 @@ class PromptContext:
                     )
                 )
             )
+        if self.stage == "reminder_action_validation":
+            # Apply the same exact two-input evidence isolation used by the
+            # knowledge validator while preserving an empty retrieval list.
+            return _without_raw_user_queries(
+                _redact(
+                    _select_keys(
+                        self.extra,
+                        ("first_model_response", "reminder_retrieval"),
+                    )
+                )
+            )
         return _finalize_stage_payload({
             "stage": self.stage,
             "user_id": self.user_id,
@@ -367,6 +380,8 @@ class PromptContext:
         self._validate_query_source()
         if self.stage == "knowledge_action_validation":
             return self.safe_payload()
+        if self.stage == "reminder_action_validation":
+            return self.safe_payload()
 
         query_max, metadata_max, platform_max, extra_max, max_items, max_depth = _payload_limits_for_stage(self.stage)
         base: dict[str, Any] = {
@@ -375,8 +390,8 @@ class PromptContext:
             "rewritten_query": _compact_value(self.rewritten_query, max_string=query_max, max_items=max_items, max_depth=1),
             "intent": self.intent,
             # Canonical history is intentionally not item-truncated for stages
-            # allowed to receive it. The evidence-isolated knowledge validator
-            # returned above is the sole explicit exception.
+            # allowed to receive it. The evidence-isolated mutation validators
+            # returned above are the explicit exceptions.
             "chat_history": _redact(self.resolved_chat_history()),
         }
 
@@ -659,6 +674,17 @@ def _knowledge_action_validation_safety_rules() -> tuple[str, ...]:
     )
 
 
+def _reminder_action_validation_safety_rules() -> tuple[str, ...]:
+    return (
+        "Use only first_model_response and reminder_retrieval from the isolated runtime payload.",
+        "Never request, infer, or rely on information outside those two supplied inputs.",
+        "Validate only the SQL-rehydrated candidates supplied in reminder_retrieval.",
+        "Select only supplied candidate_key values; never invent candidates, IDs, action fields, replacement fields, or timestamps.",
+        "The structured first_model_response is the sole authority for the requested action, target text, new values, and time semantics.",
+        "Return strict JSON only.",
+    )
+
+
 def _answer_safety_rules() -> tuple[str, ...]:
     return (
         "Answer the current user request directly using validated approved context and general knowledge when appropriate.",
@@ -711,6 +737,8 @@ def _safety_rules_for_stage(name: str) -> tuple[str, ...]:
         return _fast_routing_safety_rules()
     if name == "knowledge_action_validation":
         return _knowledge_action_validation_safety_rules()
+    if name == "reminder_action_validation":
+        return _reminder_action_validation_safety_rules()
     if name in MUTATION_STAGES:
         return _compact_mutation_safety_rules()
     if name in RETRIEVAL_VALIDATION_STAGES:
@@ -1566,36 +1594,35 @@ def _default_templates() -> dict[str, PromptTemplate]:
         "reminder_action_validation": PromptTemplate(
             name="reminder_action_validation",
             role=(
-                "Second-stage reminder mutation validator. Compare the extracted action and fields with every supplied, "
-                "user-owned SQL reminder candidate and decide whether exactly one safe action should execute."
+                "Second-stage reminder mutation validator. Compare the first model's complete structured output with "
+                "every supplied, user-owned SQL reminder candidate and decide whether exactly one safe action should execute."
             ),
             non_responsibilities=(
+                "Do not request or use any context outside the two declared inputs.",
                 "Do not retrieve additional reminders or use conversation, knowledge, BM25, Chroma, or embedding results as reminder rows.",
                 "Do not mutate SQL, schedule notifications, index content, answer the user, or claim success.",
                 "Do not invent candidate keys, reminder IDs, statuses, versions, timestamps, target text, or replacement fields.",
                 "Do not produce the finalized reminder payload.",
             ),
             inputs=(
-                "operation and extracted retrieval_text/changed_fields/reminder fields",
-                "rewritten query",
-                "canonical chat_history",
-                "all bounded SQL candidate reminder snapshots",
-                "deterministic candidate scores as non-authoritative evidence",
-                "minimum confidence, allowed status transitions, duplicate, recurrence, and safety policy",
+                "first_model_response: the complete structured action, target, changed fields, reminder fields, time semantics, confidence, and extraction rationale returned by reminder extraction",
+                "reminder_retrieval: all bounded SQL-rehydrated candidate reminder snapshots and deterministic retrieval evidence",
             ),
             output_contract="Return strict JSON matching REMINDER_ACTION_VALIDATION_SCHEMA.",
             decision_rules=(
-                "Assess every supplied candidate exactly once. A short retrieval_text may match a detail inside a longer subject, summary, raw reminder, time, recurrence, supporting question, or supporting response.",
+                "Derive the internal operation only from first_model_response.action and first_model_response.toggle_direction. Never reinterpret the action from any reminder candidate.",
+                "Assess every supplied reminder_retrieval candidate exactly once. A short retrieval_text may match a detail inside a longer subject, summary, raw reminder, time, recurrence, supporting question, or supporting response.",
                 "Candidate scores are non-gating diagnostic evidence. Never reject a semantic match found in the complete SQL fields solely because a deterministic score is low.",
-                "ADD executes with no selected candidate only when required fields are coherent and no candidate already represents the same reminder. An equivalent existing reminder returns SKIP_ALREADY_EXISTS; a merely similar but meaningfully different reminder requires clarification rather than silent deduplication.",
-                "DELETE and MODIFY execute only when exactly one candidate matches retrieval_text and the configured current-status policy. MODIFY also requires a non-empty changed_fields set whose values are complete and compatible. If every requested replacement already equals the uniquely matched SQL reminder, return SKIP_ALREADY_EXISTS with that one candidate selected and no HITL.",
-                "TURN_ON and TURN_OFF execute only for exactly one matching candidate whose current SQL status permits that exact transition. If the uniquely matched reminder is already in a supplied no_op_status, return SKIP_ALREADY_EXISTS with that one candidate selected and no HITL.",
+                "ADD executes with no selected candidate only when the first_model_response fields are coherent and no candidate already represents the same reminder. An equivalent existing reminder returns SKIP_ALREADY_EXISTS; a merely similar but meaningfully different reminder requires clarification rather than silent deduplication.",
+                "DELETE and MODIFY execute only when exactly one candidate matches first_model_response.retrieval_text and its current status permits the operation. MODIFY also requires a non-empty first_model_response.changed_fields set whose values are complete and compatible. If every requested replacement already equals the uniquely matched SQL reminder, return SKIP_ALREADY_EXISTS with that one candidate selected and no HITL.",
+                "TURN_ON and TURN_OFF execute only for exactly one matching candidate whose current SQL status permits that exact transition. If the uniquely matched reminder is already in the requested state, return SKIP_ALREADY_EXISTS with that one candidate selected and no HITL.",
                 "If two or more candidates plausibly match, or a single occurrence versus recurrence series cannot be represented safely, set ambiguous=true, requires_hitl=true, and return CLARIFY_AMBIGUOUS_TARGET.",
-                "Apply factuality review only to newly asserted ADD fields or MODIFY replacement fields. For an obvious objective impossibility such as 1 + 1 = 3, set factuality_concern=true, requires_hitl=true, and return CLARIFY_MISSING_FIELDS. Never fact-check a DELETE/TURN target, existing SQL content, personal plans, preferences, subjective text, or uncertain real-world claims.",
-                "An impossible calendar value, unusable past notification time, contradictory event/notification semantics, unsafe recurrence, missing target, or incomplete required replacement requires HITL and must not execute.",
-                "selected_candidate_keys may contain only supplied keys. ADD execution and an ADD duplicate select none. DELETE, MODIFY, TURN_ON, and TURN_OFF execution select exactly one; MODIFY or TURN state no-ops also select exactly one. Never allow a second strong semantic match, including an action-incompatible one, on an executable or target no-op decision.",
+                "Apply factuality review only to newly asserted ADD fields or MODIFY replacement fields in first_model_response. For an obvious objective impossibility such as 1 + 1 = 3, set factuality_concern=true, requires_hitl=true, and return CLARIFY_MISSING_FIELDS. Never fact-check a DELETE/TURN target, existing SQL content, personal plans, preferences, subjective text, or uncertain real-world claims.",
+                "An impossible calendar value, contradictory event/notification semantics, unsafe recurrence, missing target, or incomplete required replacement requires HITL and must not execute.",
+                "selected_candidate_keys may contain only keys supplied in reminder_retrieval. ADD execution and an ADD duplicate select none. DELETE, MODIFY, TURN_ON, and TURN_OFF execution select exactly one; MODIFY or TURN state no-ops also select exactly one. Never allow a second strong semantic match, including an action-incompatible one, on an executable or target no-op decision.",
                 "For each matching assessment, matched_text is the exact minimal verbatim excerpt from the fields named by matched_fields; use an empty string and empty matched_fields when matches_target is false. Never paraphrase evidence.",
                 "should_execute is true if and only if validation_result is EXECUTE. requires_hitl is true only for a clarification result. Low confidence, inconsistent evidence, malformed candidates, or unsafe transitions must never execute.",
+                "The isolated runtime payload deliberately contains exactly two inputs. Never assume or request any other context; use only first_model_response and reminder_retrieval.",
             ),
             safety_rules=_safety_rules_for_stage("reminder_action_validation"),
             error_handling=(
