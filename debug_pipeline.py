@@ -80,6 +80,7 @@ from assistant_rag.llm import (
     OllamaModelRouter,
     _structured_attempt_prompt,
     is_structured_fallback,
+    llm_trace_stage_name,
     structured_fallback_payload,
     uses_onnx_runtime,
     validate_json_schema,
@@ -1581,22 +1582,67 @@ def scenario_general_new_conversation(settings: ProductionSettings) -> ScenarioR
 
 def scenario_general_hitl_supporting_question_printed(settings: ProductionSettings) -> ScenarioResult:
     state = build_scenario_state(settings)
+
+    class ForbiddenPlatformSelector:
+        def select(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("PlatformSelector ran while HITL owned the question")
+
+    state.pipeline.platform_selector = ForbiddenPlatformSelector()  # type: ignore[assignment]
     response = run_request(
         state,
-        "Explain the migration plan",
+        "Send an email about the migration plan.",
         metadata={
             "intent": Intent.GENERAL_RESPONSE.value,
-            "normal_response_text": "Start with schema compatibility, then migrate traffic gradually.",
-            "supporting_question": "Which service should I prioritize next?",
+            "normal_response_text": (
+                "Subject: Migration plan\n\n"
+                "Start with schema compatibility, then migrate traffic gradually."
+            ),
+            "supporting_question": "Which recipient email address should receive it?",
         },
     )
     assert_response(response, ResponseType.NORMAL, "schema compatibility")
-    if "Supporting question: Which service should I prioritize next?" not in response.final_chat_text:
+    if "Supporting question: Which recipient email address should receive it?" not in response.final_chat_text:
         raise AssertionError(f"HITL supporting question was not printed: {response.final_chat_text!r}")
+    if response.platform_payload.get("platform_selection", {}).get("source") != "bypassed_active_branch_question":
+        raise AssertionError("active HITL did not bypass PlatformSelector")
+    if response.platform_payload.get("delivery", {}).get("status") != "deferred_by_active_question":
+        raise AssertionError("HITL-owned turn exposed a competing platform delivery state")
+
+    class SupportingAnswerLLM:
+        def generate_json(self, **kwargs: Any) -> dict[str, Any]:
+            properties = kwargs.get("schema", {}).get("properties", {})
+            if "matched_question_index" not in properties:
+                raise AssertionError("supporting-answer scenario received an unrelated schema")
+            return {"matched_question_index": 0, "confidence": 1.0}
+
+    state.pipeline.last_qa_resolver = LLMLastQAResolver(
+        llm=SupportingAnswerLLM(),
+        config=state.pipeline.config.last_qa,
+        prompt_registry=DEFAULT_PROMPT_REGISTRY,
+    )
+    state.pipeline.platform_selector = PlatformSelector(llm=None)
+    resumed = run_request(
+        state,
+        "ops@example.com",
+        metadata={
+            "intent": Intent.GENERAL_RESPONSE.value,
+            "normal_response_text": (
+                "Subject: Migration plan\n\n"
+                "Start with schema compatibility, then migrate traffic gradually."
+            ),
+        },
+    )
+    if resumed.platform_payload.get("platform_selection", {}).get("channel") != "gmail":
+        raise AssertionError("the HITL answer did not resume the deferred Gmail request")
+    if resumed.platform_payload.get("draft", {}).get("recipients") != ["ops@example.com"]:
+        raise AssertionError("the HITL answer was not bound as the deferred recipient")
+    delivery = resumed.platform_payload.get("delivery", {})
+    if delivery.get("status") != "needs_input" or "question" in delivery or not delivery.get("notice"):
+        raise AssertionError("resumed delivery did not remain a notice-only platform operation")
     return ScenarioResult(
         "general_hitl_supporting_question_printed",
         True,
-        "HITL supporting question is visible in final chat text",
+        "one HITL question bypasses PlatformSelector and its answer resumes delivery",
     )
 
 
@@ -1925,6 +1971,43 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
     if not deterministic_draft["draft"]["body"].startswith("Dear Vaiojjr and Koffdo,"):
         raise AssertionError("email body included explanatory text instead of the drafted message")
 
+    # The composing response bundle owns the authored envelope. Supporting
+    # query evidence validates/fills it but must not override its recipient
+    # order, subject, or body, and the bundle cannot invent a new recipient.
+    bundle_priority_query = (
+        "Draft an email to alice@example.com and bob@example.com; "
+        "subject: query fallback subject."
+    )
+    bundle_priority_response = replace(
+        day_off_response,
+        final_chat_text=(
+            "To: mallory@example.com, bob@example.com, alice@example.com\n"
+            "Subject: Bundled composer subject\n\n"
+            "Dear team,\n\nBundled composer body."
+        ),
+        last_qa_state=replace(
+            day_off_response.last_qa_state,
+            last_user_query=bundle_priority_query,
+        ),
+    )
+    bundle_priority_draft = PlatformSelector(llm=None).select(
+        bundle_priority_response,
+        ChatRequest(user_id="platform-test", raw_query=bundle_priority_query),
+    )
+    if bundle_priority_draft["draft"]["recipients"] != [
+        "bob@example.com",
+        "alice@example.com",
+    ]:
+        raise AssertionError(
+            "response-bundler recipient priority or validation regressed"
+        )
+    if bundle_priority_draft["draft"]["subject"] != "Bundled composer subject":
+        raise AssertionError("supporting input overrode the bundled email subject")
+    if bundle_priority_draft["draft"]["body"] != (
+        "Dear team,\n\nBundled composer body."
+    ):
+        raise AssertionError("supporting input overrode the bundled email body")
+
     class ExplodingDraftGmailSender(GmailSender):
         def create_draft(self, _payload: dict[str, Any], _platform_context: dict[str, Any]) -> dict[str, Any]:
             raise AssertionError("a write-email request must not save a remote Gmail draft")
@@ -1970,6 +2053,7 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
         metadata={
             "intent": Intent.GENERAL_RESPONSE.value,
             "normal_response_text": day_off_response.final_chat_text,
+            "supporting_question": "This optional HITL question must be suppressed.",
         },
     )
     if deterministic_pipeline_response.platform_payload["delivery"]["status"] != "draft_ready":
@@ -1978,6 +2062,61 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
         raise AssertionError(f"full pipeline did not surface Gmail draft status: {deterministic_pipeline_response.final_chat_text!r}")
     if "It has not been sent." not in deterministic_pipeline_response.final_chat_text:
         raise AssertionError("local Gmail drafts did not clearly state that no email was sent")
+    if deterministic_pipeline_response.last_qa_state.supporting_questions:
+        raise AssertionError("an actionable explicit Gmail request emitted an unnecessary HITL question")
+    active_draft = deterministic_pipeline_response.last_qa_state.outbound_state
+    if active_draft is None:
+        raise AssertionError("full pipeline did not retain the safe outbound envelope in Last-QA")
+    if active_draft.recipients != ("vaiojjr@gmail.com", "koffdo75@gmail.com"):
+        raise AssertionError("Last-QA outbound state lost one or more draft recipients")
+
+    # The next turn is resolved semantically against the active envelope. It
+    # must neither rediscover the addresses from this short instruction nor
+    # enter broad conversation retrieval.
+    smtp_count_before_follow_up = len(FakeSMTP.instances)
+
+    class SemanticOutboundScenarioLLM:
+        def generate_json(self, **kwargs: Any) -> dict[str, Any]:
+            properties = kwargs.get("schema", {}).get("properties", {})
+            if "outbound_action" not in properties:
+                raise AssertionError("outbound scenario received an unrelated schema")
+            return {"outbound_action": "send", "confidence": 1.0}
+
+    state.pipeline.last_qa_resolver = LLMLastQAResolver(
+        llm=SemanticOutboundScenarioLLM(),
+        config=state.pipeline.config.last_qa,
+        prompt_registry=DEFAULT_PROMPT_REGISTRY,
+    )
+    try:
+        smtplib.SMTP_SSL = FakeSMTP  # type: ignore[assignment]
+        semantic_follow_up = run_request(
+            state,
+            "Please transmit the active draft now.",
+            platform_context={
+                "gmail_username": "sender@example.com",
+                "gmail_app_password": "app-password-for-test",
+            },
+        )
+    finally:
+        smtplib.SMTP_SSL = original_smtp_ssl  # type: ignore[assignment]
+    if semantic_follow_up.platform_payload["delivery"]["status"] != "sent":
+        raise AssertionError(
+            f"semantic outbound follow-up did not send the active draft: {semantic_follow_up.platform_payload!r}"
+        )
+    if semantic_follow_up.platform_payload["platform_selection"].get("source") != "authoritative_outbound_last_qa":
+        raise AssertionError("short follow-up bypassed the authoritative Last-QA outbound path")
+    if len(FakeSMTP.instances) != smtp_count_before_follow_up + 1:
+        raise AssertionError("semantic follow-up did not perform exactly one SMTP dispatch")
+    smtp_count_after_follow_up = len(FakeSMTP.instances)
+    follow_up_message = FakeSMTP.instances[-1].message
+    if str(follow_up_message["To"]) != "vaiojjr@gmail.com, koffdo75@gmail.com":
+        raise AssertionError("semantic follow-up did not preserve the active recipient envelope")
+    if str(follow_up_message["Subject"]) != active_draft.subject:
+        raise AssertionError("semantic follow-up changed the active draft subject")
+    if follow_up_message.get_body(preferencelist=("plain",)).get_content().strip() != active_draft.body:
+        raise AssertionError("semantic follow-up changed the active draft body")
+    if semantic_follow_up.last_qa_state.outbound_state is not None:
+        raise AssertionError("successfully sent outbound state remained active and could be duplicated")
 
     # Even a bad extractor response cannot turn an explicit do-not-send request
     # into an SMTP side effect; raw user intent remains authoritative.
@@ -2004,7 +2143,7 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
         imaplib.IMAP4_SSL = original_imap_ssl  # type: ignore[assignment]
     if drafted["delivery"]["status"] != "draft_saved" or drafted["draft"]["recipients"] != ["alice@example.com", "bob@example.com"]:
         raise AssertionError(f"multi-recipient Gmail draft failed: {drafted!r}")
-    if len(FakeSMTP.instances) != 2:
+    if len(FakeSMTP.instances) != smtp_count_after_follow_up:
         raise AssertionError("draft mode unexpectedly invoked Gmail SMTP sending")
     if len(FakeIMAP.instances) != 1 or FakeIMAP.instances[0].login_args != ("sender@example.com", "app-password-for-test"):
         raise AssertionError("Gmail draft did not use the supplied UI/debug credentials")
@@ -2065,8 +2204,8 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
         imaplib.IMAP4_SSL = original_imap_ssl  # type: ignore[assignment]
     if valid_credentials or "Gmail IMAP draft access failed" not in validation_message:
         raise AssertionError(f"IMAP validation failure was not surfaced safely: {validation_message!r}")
-    failure_question = failed_draft["delivery"].get("question", "")
-    if failed_draft["delivery"]["status"] != "failed" or "Gmail rejected the IMAP sign-in" not in failure_question:
+    failure_notice = failed_draft["delivery"].get("notice", "")
+    if failed_draft["delivery"]["status"] != "failed" or "Gmail rejected the IMAP sign-in" not in failure_notice:
         raise AssertionError(f"draft failure hid the actionable IMAP reason: {failed_draft!r}")
 
     # A generated artifact must be visible to Gmail extraction and travel as a
@@ -2245,6 +2384,8 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
     )
     if missing_credentials["delivery"]["status"] != "needs_input":
         raise AssertionError("Gmail send without credentials was not safely blocked")
+    if "question" in missing_credentials["delivery"] or not missing_credentials["delivery"].get("notice"):
+        raise AssertionError("PlatformSelector turned delivery configuration into a conversational question")
     if len(FakeSMTP.instances) != smtp_connections_before_missing_credentials:
         raise AssertionError("missing Gmail credentials unexpectedly invoked SMTP sending")
     return ScenarioResult(
@@ -2311,6 +2452,33 @@ def scenario_answer_adaptive_token_budget(settings: ProductionSettings) -> Scena
     return ScenarioResult("answer_adaptive_token_budget", True, "answer budgets are tiered and can stop at complete sentences")
 
 
+def scenario_llm_answer_generation_trace(settings: ProductionSettings) -> ScenarioResult:
+    class TraceableAnswerLLM(OllamaLLMClient):
+        def _chat_raw(self, **_kwargs: Any) -> str:
+            return "Synthetic answer used only to verify trace output."
+
+    recorder = start_trace(new_request_id())
+    client = TraceableAnswerLLM(settings.ollama, OllamaModelRouter(settings.ollama))
+    client.chat(
+        task=LLMTask.ANSWER,
+        system_prompt="Generate a concise answer.",
+        user_prompt='Runtime context:\n{"stage":"answer_generation"}',
+    )
+    summary = recorder.summary()
+    stage_names = [stage.stage for stage in summary.stages]
+    if stage_names != ["llm_answer_generation"]:
+        raise AssertionError(f"answer-generation trace label regressed: {stage_names}")
+    if llm_trace_stage_name(LLMTask.ANSWER, engine="onnx") != "llm_answer_generation":
+        raise AssertionError("ONNX answer generation does not share the canonical trace label")
+    if not any("llm_answer_generation" in line for line in _debug_trace_lines(summary)):
+        raise AssertionError("debug trace formatter omitted llm_answer_generation")
+    return ScenarioResult(
+        "llm_answer_generation_trace",
+        True,
+        "answer generation is logged with one stable cross-engine debug trace label",
+    )
+
+
 def scenario_structured_clarification_fallback_policy(settings: ProductionSettings) -> ScenarioResult:
     default_settings = ProductionSettings()
     if default_settings.ollama.num_predict_generate_clarification < 160:
@@ -2321,6 +2489,23 @@ def scenario_structured_clarification_fallback_policy(settings: ProductionSettin
         raise AssertionError("clarification JSON generation must use deterministic sampling")
     if default_settings.ollama.model_generate_clarification_fallback != "qwen3.5:4b":
         raise AssertionError("clarification generation needs an Ollama recovery model")
+    answer_prompt = DEFAULT_PROMPT_REGISTRY.system("answer_generation")
+    if "dedicated HITL stage owns every conversational question" not in answer_prompt:
+        raise AssertionError("answer generation can still compete with HITL question ownership")
+    question_prompt = DEFAULT_PROMPT_REGISTRY.system("question_generation")
+    required_question_rules = (
+        "required user-provided fact is missing",
+        "return should_ask=false for complete or explicit requests",
+        "delivery credentials",
+        "next-step suggestions",
+    )
+    missing_question_rules = [
+        rule for rule in required_question_rules if rule not in question_prompt
+    ]
+    if missing_question_rules:
+        raise AssertionError(
+            f"question necessity policy regressed: {missing_question_rules}"
+        )
 
     schema = {
         "type": "object",
@@ -3101,20 +3286,11 @@ def scenario_intent_branch_ownership_policy(settings: ProductionSettings) -> Sce
         *,
         resolution: Any = None,
     ) -> tuple[Intent, int]:
-        kind_for_intent = {
-            Intent.KNOWLEDGE_FACTS.value: "durable_knowledge",
-            Intent.REMINDER.value: "reminder_lifecycle",
-            Intent.CLARIFICATION.value: "clarification_reply",
-            Intent.GENERAL_RESPONSE.value: "none",
-        }
         intent_value = str(
             payload.get("intent") or Intent.GENERAL_RESPONSE.value
         )
         payload = {
-            "operation_kind": (
-                payload.get("operation_kind")
-                or kind_for_intent[intent_value]
-            ),
+            "intent": intent_value,
             "confidence": payload.get("confidence", 0.0),
         }
         llm = ScriptedIntentLLM(payload)
@@ -3141,7 +3317,7 @@ def scenario_intent_branch_ownership_policy(settings: ProductionSettings) -> Sce
         "Remind me what I said about the deployment plan.",
         {"intent": "general_response", "confidence": 1.0, "multi_intent": False, "requires_clarification": False},
     )
-    durable_kind_wins, _ = classify(
+    final_intent_wins, _ = classify(
         "Retain the deployment preference for future use.",
         {"intent": "reminder", "operation_kind": "durable_knowledge", "confidence": 1.0},
     )
@@ -3186,7 +3362,7 @@ def scenario_intent_branch_ownership_policy(settings: ProductionSettings) -> Sce
         "explicit reminder": reminder,
         "ordinary file save": ordinary_save,
         "conversational remind-me question": conversational_reminder,
-        "durable operation kind wins over a conflicting label": durable_kind_wins,
+        "final intent ignores an obsolete conflicting alias": final_intent_wins,
         "model-selected knowledge with missing fields": model_knowledge,
         "general request despite advisory flags": general,
         "ungrounded clarification": ungrounded_clarification,
@@ -3197,7 +3373,7 @@ def scenario_intent_branch_ownership_policy(settings: ProductionSettings) -> Sce
         "explicit reminder": Intent.REMINDER,
         "ordinary file save": Intent.GENERAL_RESPONSE,
         "conversational remind-me question": Intent.GENERAL_RESPONSE,
-        "durable operation kind wins over a conflicting label": Intent.KNOWLEDGE_FACTS,
+        "final intent ignores an obsolete conflicting alias": Intent.REMINDER,
         "model-selected knowledge with missing fields": Intent.KNOWLEDGE_FACTS,
         "general request despite advisory flags": Intent.GENERAL_RESPONSE,
         "ungrounded clarification": Intent.GENERAL_RESPONSE,
@@ -3211,9 +3387,9 @@ def scenario_intent_branch_ownership_policy(settings: ProductionSettings) -> Sce
 
     prompt = DEFAULT_PROMPT_REGISTRY.system("intent_classifier")
     required_prompt_rules = (
-        "Choose one operation_kind. Runtime code maps",
-        "durable_knowledge is mutation-only",
-        "reminder_lifecycle is mutation-only",
+        "Choose one final branch name directly",
+        "knowledge_facts is mutation-only",
+        "reminder is mutation-only",
         "Every request to search, find, list, show, inspect, look up, retrieve, recall, read, or answer",
         "a new request is never clarification.",
     )
@@ -3226,7 +3402,7 @@ def scenario_intent_branch_ownership_policy(settings: ProductionSettings) -> Sce
 
 
 def scenario_last_qa_relationship_policy(settings: ProductionSettings) -> ScenarioResult:
-    """Only evidence-backed Last-QA relationships may bypass broad retrieval."""
+    """Only state-bound evidence may bypass retrieval; the model gets a minimal decision."""
     config = build_assistant_config(ProductionSettings()).last_qa
     supporting_question = GeneratedQuestion(
         text="Which report format do you prefer?",
@@ -3309,11 +3485,10 @@ def scenario_last_qa_relationship_policy(settings: ProductionSettings) -> Scenar
 
     prompt = DEFAULT_PROMPT_REGISTRY.system("last_qa")
     required_rules = (
-        "Use this precedence: reminder_notification_reply, supporting_question_answer, normal_follow_up",
-        "Copy that question verbatim into matched_question.",
-        "Text such as 'done', 'yes', or 'thanks' without those IDs is not a reminder reply.",
-        "A new standalone request, even on a similar topic, is unrelated.",
-        "clarification_merge runs first",
+        "matched_question_index and confidence",
+        "Use index=-1 when no question is answered.",
+        "Do not classify normal follow-ups, reminder replies, or clarification answers",
+        "merely topically similar, use -1.",
     )
     missing = [rule for rule in required_rules if rule not in prompt]
     if missing:
@@ -4325,6 +4500,7 @@ SCENARIOS: tuple[ScenarioFn, ...] = (
     scenario_platform_gmail_multi_recipient_delivery,
     scenario_general_new_conversation_skips_sub_branch_llm,
     scenario_answer_adaptive_token_budget,
+    scenario_llm_answer_generation_trace,
     scenario_structured_clarification_fallback_policy,
     scenario_mutation_clarification_fast_path,
     scenario_last_qa_mandatory_before_classification,

@@ -15,9 +15,21 @@ from typing import Any, Protocol
 from urllib import request as urlrequest
 
 from .artifacts import artifact_mime_type, resolve_generated_artifacts
-from .contracts import BundledResponse, ChatRequest, ResponseType
-from .llm import LLMClient, LLMTask, is_structured_fallback
+from .contracts import (
+    BundledResponse,
+    ChatRequest,
+    OutboundFollowUpAction,
+    OutboundMessageState,
+    ResponseType,
+)
+from .llm import (
+    LLMClient,
+    LLMTask,
+    is_structured_fallback,
+    validate_json_schema,
+)
 from .chat_history import CHAT_HISTORY_PROMPT_RULE, inject_chat_history
+from .prompts import DEFAULT_PROMPT_REGISTRY, PromptContext, PromptRegistry
 
 
 logger = logging.getLogger(__name__)
@@ -52,6 +64,19 @@ PLATFORM_RECIPIENT_EXTRACTION_SCHEMA = {
 }
 
 
+OUTBOUND_REVISION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["recipients", "subject", "body", "artifact_ids"],
+    "properties": {
+        "recipients": {"type": "array", "items": {"type": "string"}},
+        "subject": {"type": "string"},
+        "body": {"type": "string"},
+        "artifact_ids": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+
 # A terminal period is ordinary sentence punctuation, not part of an address.
 # Do not reject otherwise-valid recipients written at the end of a sentence.
 _EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w+-])")
@@ -80,6 +105,14 @@ _FILE_DELIVERY_WORDS = re.compile(
     re.I,
 )
 _SUBJECT_LINE = re.compile(r"^\s*subject\s*:\s*(.+?)\s*$", re.I | re.M)
+_BUNDLED_RECIPIENT_LINE = re.compile(
+    r"^\s*(?:to|cc|bcc|recipients?)\s*:\s*(.*?)\s*$",
+    re.I | re.M,
+)
+_BUNDLED_ENVELOPE_LINE = re.compile(
+    r"^\s*(?:to|cc|bcc|from|recipients?|subject)\s*:\s*.*$",
+    re.I,
+)
 _EMAIL_SALUTATION = re.compile(r"^\s*(?:dear|hello|hi)\b", re.I | re.M)
 _SAVE_GMAIL_DRAFT = re.compile(
     r"\b(?:save|store|create|add|put)\b[\s\w'-]{0,48}\b(?:gmail(?:'s)?\s+)?drafts?\b"
@@ -166,7 +199,65 @@ def _gmail_recipient_candidates(text: str) -> list[str]:
     return []
 
 
-def _is_explicit_email_message_request(text: str) -> bool:
+def _bundled_message_value(response: BundledResponse, field_name: str) -> Any:
+    """Read a composed envelope field without consulting selector extensions.
+
+    ``final_chat_text`` is the normal composer output. The optional structured
+    containers make the same boundary forward-compatible if a composer supplies
+    fields directly, without adding another LLM extraction schema or call.
+    """
+    payload = response.platform_payload
+    if not isinstance(payload, dict):
+        return None
+    for source in (
+        payload.get("outbound_message"),
+        payload.get("message"),
+        payload,
+    ):
+        if isinstance(source, dict) and source.get(field_name) not in (None, "", []):
+            return source.get(field_name)
+    return None
+
+
+def _bundled_gmail_recipient_candidates(response: BundledResponse) -> list[str]:
+    """Extract only composer-declared envelope recipients, never body mentions."""
+    recipients = _recipient_emails(
+        _bundled_message_value(response, "recipients")
+        or _bundled_message_value(response, "recipient")
+    )
+    seen = {recipient.casefold() for recipient in recipients}
+    for match in _BUNDLED_RECIPIENT_LINE.finditer(response.final_chat_text or ""):
+        for recipient in _recipient_emails(match.group(1)):
+            if recipient.casefold() not in seen:
+                seen.add(recipient.casefold())
+                recipients.append(recipient)
+    return recipients
+
+
+def _prioritized_approved_recipients(
+    preferred: list[str],
+    approved: list[str],
+) -> list[str]:
+    """Prefer bundled order while rejecting inventions and filling omissions."""
+    approved_by_key = {recipient.casefold(): recipient for recipient in approved}
+    recipients: list[str] = []
+    seen: set[str] = set()
+    for recipient in preferred:
+        key = recipient.casefold()
+        if key in approved_by_key and key not in seen:
+            recipients.append(approved_by_key[key])
+            seen.add(key)
+    # The composer may omit one of several explicit recipients. Preserve every
+    # approved address rather than allowing the response to narrow delivery.
+    for recipient in approved:
+        key = recipient.casefold()
+        if key not in seen:
+            recipients.append(recipient)
+            seen.add(key)
+    return recipients
+
+
+def is_explicit_email_message_request(text: str) -> bool:
     """Recognize a request to prepare or send an email with stated recipients.
 
     This deliberately requires both a real email address and message-writing
@@ -207,7 +298,11 @@ def _subject_from_bundled_response(text: str) -> str:
     # first concise, non-salutation line of the already approved bundled text.
     for raw_line in (text or "").splitlines():
         line = _clean(raw_line)
-        if not line or _EMAIL_SALUTATION.match(line):
+        if (
+            not line
+            or _BUNDLED_ENVELOPE_LINE.match(raw_line)
+            or _EMAIL_SALUTATION.match(line)
+        ):
             continue
         return line[:120].rstrip(" .,:;-—")
     return ""
@@ -237,13 +332,13 @@ def _body_from_bundled_response(
         response = "\n\n".join(paragraphs).strip()
     subject = _SUBJECT_LINE.search(response)
     if subject:
-        if not response[:subject.start()].strip():
-            return response[subject.start():].strip()
-        drafted_body = response[subject.end():].strip()
-        salutation = _EMAIL_SALUTATION.search(drafted_body)
-        if salutation:
-            return drafted_body[salutation.start():].strip()
-        return drafted_body
+        response = response[subject.end():].strip()
+    response = "\n".join(
+        line
+        for line in response.splitlines()
+        if not _BUNDLED_ENVELOPE_LINE.match(line)
+    ).strip()
+    response = re.sub(r"\n{3,}", "\n\n", response)
     salutation = _EMAIL_SALUTATION.search(response)
     if salutation:
         return response[salutation.start():].strip()
@@ -259,11 +354,6 @@ def _safe_imap_failure_reason(exc: Exception) -> str:
     if isinstance(exc, (TimeoutError, OSError)):
         return "the Gmail IMAP service could not be reached"
     return "the Gmail IMAP draft service returned an unexpected error"
-
-
-def _public_artifacts(payload: dict[str, Any]) -> list[dict[str, str]]:
-    resolved, _ = resolve_generated_artifacts(payload.get("artifacts"))
-    return resolved
 
 
 @dataclass
@@ -481,6 +571,7 @@ class PlatformSelector:
     """
 
     llm: LLMClient | None = None
+    prompt_registry: PromptRegistry = field(default_factory=lambda: DEFAULT_PROMPT_REGISTRY)
     formatters: dict[str, PlatformFormatter] = field(default_factory=dict)
     senders: dict[str, DeliverySender] = field(default_factory=lambda: {
         "gmail": GmailSender(), "telegram": TelegramSender(), "zalo": ZaloSender(),
@@ -524,9 +615,223 @@ class PlatformSelector:
         message = self._extract(
             channel,
             response,
-            base,
             rewritten_query,
         )
+        return self._complete_delivery(
+            base,
+            message=message,
+            context=context,
+            rewritten_query=rewritten_query,
+        )
+
+    def select_with_outbound_context(
+        self,
+        response: BundledResponse,
+        request: ChatRequest,
+        *,
+        outbound_state: OutboundMessageState | None,
+        outbound_action: OutboundFollowUpAction | None,
+        available_artifacts: list[dict[str, Any]] | None = None,
+        new_artifact_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Apply an authoritative Last-QA action to the active envelope."""
+        if outbound_state is None or outbound_action is None:
+            return self.select(response, request)
+
+        base = dict(response.platform_payload)
+        base["platform_selection"] = {
+            "channel": outbound_state.channel,
+            "confidence": 1.0,
+            "source": "authoritative_outbound_last_qa",
+        }
+        artifacts = list(available_artifacts or [])
+        message = self._message_from_outbound_state(
+            outbound_state,
+            artifacts=artifacts,
+            mode=(
+                "send"
+                if outbound_action
+                in {
+                    OutboundFollowUpAction.SEND,
+                    OutboundFollowUpAction.REVISE_AND_SEND,
+                }
+                else "draft"
+            ),
+        )
+        if outbound_action in {
+            OutboundFollowUpAction.REVISE,
+            OutboundFollowUpAction.REVISE_AND_SEND,
+        }:
+            message = self._revise_outbound_message(
+                message,
+                rewritten_query=response.last_qa_state.last_user_query,
+                artifacts=artifacts,
+                new_artifact_ids=list(new_artifact_ids or []),
+            )
+            if bool(message.pop("_revision_failed", False)):
+                return self._delivery_hold(
+                    base,
+                    "I kept the existing message text and recipients because the requested revision could not be validated. Any generated files remain available, and no message was sent.",
+                    channel=outbound_state.channel,
+                    draft=message,
+                    status="pending_review",
+                )
+        return self._complete_delivery(
+            base,
+            message=message,
+            context=request.platform_context or {},
+            rewritten_query=response.last_qa_state.last_user_query,
+        )
+
+    def _message_from_outbound_state(
+        self,
+        state: OutboundMessageState,
+        *,
+        artifacts: list[dict[str, Any]],
+        mode: str,
+    ) -> dict[str, Any]:
+        artifacts_by_id = {
+            str(item.get("artifact_id") or ""): item
+            for item in artifacts
+            if isinstance(item, dict) and item.get("artifact_id")
+        }
+        declared = [
+            artifacts_by_id[artifact_id]
+            for artifact_id in state.artifact_ids
+            if artifact_id in artifacts_by_id
+        ]
+        attachments, unavailable = resolve_generated_artifacts(declared)
+        missing_ids = [
+            artifact_id
+            for artifact_id in state.artifact_ids
+            if artifact_id not in artifacts_by_id
+        ]
+        for index, artifact_id in enumerate(state.artifact_ids):
+            if artifact_id not in missing_ids:
+                continue
+            filename = (
+                state.attachment_filenames[index]
+                if index < len(state.attachment_filenames)
+                and state.attachment_filenames[index]
+                else artifact_id
+            )
+            if filename not in unavailable:
+                unavailable.append(filename)
+        recipients = list(state.recipients)
+        return {
+            "channel": state.channel,
+            "recipient": ", ".join(recipients),
+            "recipients": recipients,
+            "subject": state.subject,
+            "body": state.body,
+            "mode": mode,
+            "attachments": attachments,
+            "unavailable_attachments": list(dict.fromkeys(unavailable)),
+        }
+
+    def _revise_outbound_message(
+        self,
+        message: dict[str, Any],
+        *,
+        rewritten_query: str,
+        artifacts: list[dict[str, Any]],
+        new_artifact_ids: list[str],
+    ) -> dict[str, Any]:
+        artifacts_by_id = {
+            str(item.get("artifact_id") or ""): item
+            for item in artifacts
+            if isinstance(item, dict) and item.get("artifact_id")
+        }
+        current_ids = [
+            str(item.get("artifact_id") or "")
+            for item in message.get("attachments", [])
+            if isinstance(item, dict) and item.get("artifact_id")
+        ]
+        selected_ids = list(dict.fromkeys([*current_ids, *new_artifact_ids]))
+        revised: dict[str, Any] = {}
+        if self.llm is not None:
+            try:
+                revised = self.llm.generate_json(
+                    task=LLMTask.WRITING,
+                    system_prompt=self.prompt_registry.system("outbound_revision"),
+                    user_prompt=self.prompt_registry.user(
+                        PromptContext(
+                            stage="outbound_revision",
+                            rewritten_query=rewritten_query,
+                            extra={
+                                "active_outbound_message": {
+                                    "recipients": list(message.get("recipients") or []),
+                                    "subject": str(message.get("subject") or ""),
+                                    "body": str(message.get("body") or ""),
+                                    "artifact_ids": current_ids,
+                                },
+                                "available_artifacts": [
+                                    {
+                                        "artifact_id": artifact_id,
+                                        "filename": str(item.get("filename") or ""),
+                                        "is_new_this_turn": artifact_id
+                                        in set(new_artifact_ids),
+                                    }
+                                    for artifact_id, item in artifacts_by_id.items()
+                                ],
+                            },
+                        )
+                    ),
+                    schema=OUTBOUND_REVISION_SCHEMA,
+                )
+                if is_structured_fallback(revised):
+                    revised = {}
+                elif revised:
+                    validate_json_schema(revised, OUTBOUND_REVISION_SCHEMA)
+            except Exception as exc:
+                logger.warning("Outbound draft revision failed: %s", type(exc).__name__)
+                revised = {}
+
+        allowed_recipients = _recipient_emails(
+            [*list(message.get("recipients") or []), rewritten_query]
+        )
+        proposed_recipients = _recipient_emails(revised.get("recipients"))
+        recipients = [
+            recipient
+            for recipient in proposed_recipients
+            if recipient.casefold()
+            in {value.casefold() for value in allowed_recipients}
+        ] or list(message.get("recipients") or [])
+        proposed_ids = [
+            str(value)
+            for value in revised.get("artifact_ids", [])
+            if str(value) in artifacts_by_id
+        ] if isinstance(revised.get("artifact_ids"), list) else []
+        selected_ids = list(
+            dict.fromkeys([*(proposed_ids or selected_ids), *new_artifact_ids])
+        )
+        declared = [
+            artifacts_by_id[artifact_id]
+            for artifact_id in selected_ids
+            if artifact_id in artifacts_by_id
+        ]
+        attachments, unavailable = resolve_generated_artifacts(declared)
+        return {
+            **message,
+            "recipient": ", ".join(recipients),
+            "recipients": recipients,
+            "subject": _clean(revised.get("subject"))
+            or _clean(message.get("subject")),
+            "body": _clean(revised.get("body")) or _clean(message.get("body")),
+            "attachments": attachments,
+            "unavailable_attachments": unavailable,
+            "_revision_failed": not bool(revised),
+        }
+
+    def _complete_delivery(
+        self,
+        base: dict[str, Any],
+        *,
+        message: dict[str, Any],
+        context: dict[str, Any],
+        rewritten_query: str,
+    ) -> dict[str, Any]:
+        channel = str(message.get("channel") or "none")
         unavailable_attachments = list(message.get("unavailable_attachments") or [])
         if unavailable_attachments:
             return self._delivery_hold(
@@ -543,7 +848,10 @@ class PlatformSelector:
         if missing:
             return self._delivery_hold(
                 base,
-                f"To prepare the {channel.title()} message, please provide: {', '.join(missing)}.",
+                (
+                    f"{channel.title()} delivery was not attempted because the required "
+                    f"delivery configuration is incomplete: {', '.join(missing)}."
+                ),
                 channel=channel,
                 draft=message,
             )
@@ -569,7 +877,7 @@ class PlatformSelector:
                         channel=channel,
                         status="failed",
                         message=message,
-                        question=(
+                        notice=(
                             "The Gmail draft could not be saved because "
                             f"{_safe_imap_failure_reason(exc)}. Check the Gmail app password "
                             "and IMAP access, then try again."
@@ -602,9 +910,9 @@ class PlatformSelector:
                 channel=channel,
                 status="failed",
                 message=message,
-                question=(
+                notice=(
                     f"The {channel.title()} message could not be sent. "
-                    "Check the delivery credentials and recipient details, then try again."
+                    "Review the chatbot delivery configuration and recipient details before retrying."
                 ),
             )
         if dispatch.get("status") != "sent":
@@ -616,7 +924,7 @@ class PlatformSelector:
                 status="partial_failure",
                 message=message,
                 provider=_clean(dispatch.get("provider")) or channel,
-                question=(
+                notice=(
                     f"The {channel.title()} message was delivered to "
                     f"{', '.join(delivered) or 'no recipients'}, but was refused for "
                     f"{', '.join(refused) or 'one or more recipients'}."
@@ -637,7 +945,7 @@ class PlatformSelector:
         rewritten_query: str,
     ) -> dict[str, Any]:
         """Choose Gmail deterministically for explicit email messages, else use the LLM."""
-        if _is_explicit_email_message_request(rewritten_query):
+        if is_explicit_email_message_request(rewritten_query):
             return {
                 "channel": "gmail",
                 "confidence": 1.0,
@@ -680,7 +988,7 @@ class PlatformSelector:
                 return {"channel": candidate, "confidence": 1.0, "source": "llm"}
         except Exception:
             pass
-        # Selection failures are safe: continue to the HITL pass-through path
+        # Selection failures are safe: continue to the non-delivery pass-through path
         # rather than accidentally preparing or sending a message.
         return {"channel": "none", "confidence": 0.0, "source": "safe_fallback_llm_error"}
 
@@ -688,15 +996,14 @@ class PlatformSelector:
         self,
         channel: str,
         response: BundledResponse,
-        base: dict[str, Any],
         rewritten_query: str,
     ) -> dict[str, Any]:
         text = rewritten_query
         extracted: dict[str, Any] = {}
-        # Gmail fields are already authoritative without another model call:
-        # recipient addresses and delivery mode come from the rewritten query,
-        # while subject/body come from the bundled response. Non-email channels
-        # still need the model only for opaque recipient IDs.
+        # No second model call is needed for Gmail. The response bundle is the
+        # primary authored-envelope source; rewritten user evidence validates
+        # recipients, fills composer omissions, and retains side-effect authority.
+        # Non-email channels still need the model only for opaque recipient IDs.
         if self.llm is not None and channel != "gmail":
             try:
                 extracted = self.llm.generate_json(
@@ -724,26 +1031,36 @@ class PlatformSelector:
             if recipient.casefold() not in {item.casefold() for item in recipients}:
                 recipients.append(recipient)
         if channel == "gmail":
-            # Literal addresses in the rewritten request are authoritative.
-            # The LLM extractor may neither invent addresses nor narrow the
-            # explicit ordered recipient set.
-            recipients = allowed_gmail_recipients
-        # The bundled answer is the sole message-body authority. Asking an
-        # extractor to repeat it added output tokens and a second opportunity
-        # to alter otherwise approved content.
-        body = _body_from_bundled_response(
-            response.final_chat_text,
-            base.get("artifacts"),
+            recipients = _prioritized_approved_recipients(
+                _bundled_gmail_recipient_candidates(response),
+                allowed_gmail_recipients,
+            )
+        # Structured bundle fields win over its plain-text envelope, and both
+        # win over supporting inputs. This keeps composition authoritative and
+        # avoids latency plus corruption from a redundant extraction LLM.
+        bundled_artifacts = response.platform_payload.get("artifacts")
+        body = _clean(_bundled_message_value(response, "body")) or (
+            _body_from_bundled_response(
+                response.final_chat_text,
+                bundled_artifacts,
+            )
         )
+        bundled_subject = _clean(_bundled_message_value(response, "subject"))
+        subject_line = _SUBJECT_LINE.search(response.final_chat_text or "")
+        if not bundled_subject and subject_line:
+            bundled_subject = _clean(subject_line.group(1))
         subject_match = re.search(r"\bsubject\s*[:=-]\s*([^\n.;]+)", text, re.I)
-        subject = subject_match.group(1).strip(" '\"") if subject_match else ""
+        supporting_subject = (
+            subject_match.group(1).strip(" '\"") if subject_match else ""
+        )
+        subject = bundled_subject or supporting_subject
         if not subject:
             subject = _subject_from_bundled_response(response.final_chat_text)
         attachments: list[dict[str, str]] = []
         unavailable_attachments: list[str] = []
         if channel == "gmail":
             attachments, unavailable_attachments = resolve_generated_artifacts(
-                base.get("artifacts")
+                bundled_artifacts
             )
         if not subject and attachments:
             subject = "Requested file"
@@ -812,7 +1129,7 @@ class PlatformSelector:
         status: str,
         message: dict[str, Any],
         provider: str | None = None,
-        question: str | None = None,
+        notice: str | None = None,
         dispatch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         base["delivery"] = {
@@ -823,8 +1140,8 @@ class PlatformSelector:
         }
         if provider:
             base["delivery"]["provider"] = provider
-        if question:
-            base["delivery"]["question"] = question
+        if notice:
+            base["delivery"]["notice"] = notice
         if dispatch:
             for key in ("delivered_recipients", "refused_recipients"):
                 if key in dispatch:
@@ -841,13 +1158,13 @@ class PlatformSelector:
         ]
         return public
 
-    def _delivery_hold(self, base: dict[str, Any], question: str, *, channel: str | None = None, draft: dict[str, Any] | None = None, status: str = "needs_input") -> dict[str, Any]:
-        """Return a platform-specific delivery requirement."""
+    def _delivery_hold(self, base: dict[str, Any], notice: str, *, channel: str | None = None, draft: dict[str, Any] | None = None, status: str = "needs_input") -> dict[str, Any]:
+        """Return non-conversational delivery state without creating a question."""
         base.update({
             "delivery": {
                 "channel": channel or "none",
                 "status": status,
-                "question": question,
+                "notice": notice,
             },
         })
         if draft:

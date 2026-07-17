@@ -18,6 +18,7 @@ from .llm import (
     OllamaModelRouter,
     _structured_attempt_plan,
     _structured_attempt_prompt,
+    llm_trace_stage_name,
     normalize_structured_output,
     parse_json_object,
     structured_fallback_payload,
@@ -219,7 +220,7 @@ class ONNXLLMClient:
         stream = tokenizer.create_stream()
         generated_text: list[str] = []
 
-        with StageTimer(f"llm_{task.value}_onnx"):
+        with StageTimer(llm_trace_stage_name(task, engine="onnx")):
             generator = og.Generator(model, params)
             generator.append_tokens(tokens)
             stop_reason: str | None = None

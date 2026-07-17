@@ -73,6 +73,7 @@ from .reminder_reply import (
     reminder_reply_hop_entities,
     verified_reminder_state,
 )
+from .platform import is_explicit_email_message_request
 
 
 def _mutation_clarification_message_key(domain: str, missing_fields: list[str]) -> str:
@@ -359,8 +360,22 @@ class GeneralResponseBranch:
                     merged_supporting_detail,
                 )
 
+        completed_explicit_request_reason = ""
+        if is_explicit_email_message_request(context.rewritten_query):
+            completed_explicit_request_reason = "explicit_delivery_request_is_actionable"
+        elif composer_result and composer_result.artifacts:
+            completed_explicit_request_reason = "requested_artifact_was_created"
+
         if self.general_purpose_config is not None:
-            if self.general_hitl_strategy:
+            if completed_explicit_request_reason:
+                hitl_questions = []
+                hitl_result = {
+                    "triggered": False,
+                    "confidence": 1.0,
+                    "question_count": 0,
+                    "reason": completed_explicit_request_reason,
+                }
+            elif self.general_hitl_strategy:
                 hitl_decision = self.general_hitl_strategy.evaluate(
                     context=context,
                     response_text=response,
@@ -370,7 +385,7 @@ class GeneralResponseBranch:
                 hitl_questions = [GeneratedQuestion(
                     text=hitl_decision.question,
                     source=hitl_decision.question_source,
-                    purpose="optional_context",
+                    purpose="resolve_required_context",
                     confidence=hitl_decision.confidence,
                     should_ask=True,
                     expected_response_type=hitl_decision.expected_response_type,

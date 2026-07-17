@@ -141,6 +141,20 @@ class AssistantRepository(ABC):
     def get_generated_artifact(self, *, user_id: str, artifact_id: str, include_deleted: bool = False) -> dict[str, Any]:
         pass
 
+    def bind_generated_artifacts(
+        self,
+        *,
+        user_id: str,
+        artifact_ids: list[str],
+        conversation_hop_id: str,
+    ) -> list[str]:
+        """Bind newly created artifacts after their conversation hop exists.
+
+        Custom repositories may leave this as a no-op. Authoritative SQL
+        implementations enforce user ownership and refuse cross-hop rebinding.
+        """
+        return []
+
     @abstractmethod
     def delete_generated_artifact(self, *, user_id: str, artifact_id: str) -> dict[str, Any]:
         pass

@@ -1926,6 +1926,48 @@ class SQLiteRepository(AssistantRepository):
             raise ValueError("Artifact not found for user")
         return dict(row)
 
+    def bind_generated_artifacts(
+        self,
+        *,
+        user_id: str,
+        artifact_ids: list[str],
+        conversation_hop_id: str,
+    ) -> list[str]:
+        unique_ids = list(dict.fromkeys(str(value) for value in artifact_ids if value))
+        if not unique_ids or not conversation_hop_id:
+            return []
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self.transaction() as cursor:
+            owner = cursor.execute(
+                "SELECT 1 FROM conversation_hops WHERE user_id = ? AND hop_id = ?",
+                (user_id, conversation_hop_id),
+            ).fetchone()
+            if not owner:
+                raise ValueError("Conversation hop not found for user")
+            cursor.execute(
+                f"""
+                UPDATE generated_artifacts
+                SET conversation_hop_id = ?
+                WHERE user_id = ?
+                  AND artifact_id IN ({placeholders})
+                  AND status = 'created'
+                  AND (conversation_hop_id IS NULL OR conversation_hop_id = ?)
+                """,
+                (conversation_hop_id, user_id, *unique_ids, conversation_hop_id),
+            )
+            rows = cursor.execute(
+                f"""
+                SELECT artifact_id FROM generated_artifacts
+                WHERE user_id = ?
+                  AND artifact_id IN ({placeholders})
+                  AND conversation_hop_id = ?
+                  AND status = 'created'
+                """,
+                (user_id, *unique_ids, conversation_hop_id),
+            ).fetchall()
+        bound = {str(row["artifact_id"]) for row in rows}
+        return [artifact_id for artifact_id in unique_ids if artifact_id in bound]
+
     def delete_generated_artifact(self, *, user_id: str, artifact_id: str) -> dict[str, Any]:
         with self.transaction() as cursor:
             cursor.execute(

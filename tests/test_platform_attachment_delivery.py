@@ -13,6 +13,8 @@ from assistant_rag.contracts import (
     BundledResponse,
     ChatRequest,
     LastQAState,
+    OutboundFollowUpAction,
+    OutboundMessageState,
     ResponseType,
 )
 from assistant_rag.llm import LLMTask, structured_fallback_payload
@@ -73,8 +75,16 @@ def _bundled(
     artifact: dict[str, Any] | None,
     *,
     rewritten_query: str = "Create and deliver the artifact.",
+    final_chat_text: str | None = None,
+    platform_payload: dict[str, Any] | None = None,
 ) -> BundledResponse:
-    text = "Subject: Generated Microsoft artifact\n\nThe generated artifact is ready."
+    text = final_chat_text or (
+        "Subject: Generated Microsoft artifact\n\n"
+        "The generated artifact is ready."
+    )
+    payload = dict(platform_payload or {})
+    if artifact is not None:
+        payload["artifacts"] = [artifact]
     return BundledResponse(
         final_chat_text=text,
         response_type=ResponseType.NORMAL,
@@ -83,7 +93,7 @@ def _bundled(
             last_response=text,
             response_type=ResponseType.NORMAL,
         ),
-        platform_payload={"artifacts": [artifact]} if artifact is not None else {},
+        platform_payload=payload,
     )
 
 
@@ -141,10 +151,131 @@ def test_explicit_gmail_delivery_skips_redundant_message_extraction_llm() -> Non
     assert result["platform_selection"]["channel"] == "gmail"
     assert result["draft"]["recipients"] == _RECIPIENTS
     assert result["draft"]["subject"] == "Generated Microsoft artifact"
-    assert result["draft"]["body"] == (
-        "Subject: Generated Microsoft artifact\n\n"
-        "The generated artifact is ready."
+    assert result["draft"]["body"] == "The generated artifact is ready."
+
+
+def test_gmail_envelope_prioritizes_bundled_recipient_order_subject_and_body() -> None:
+    query = (
+        "Draft an email to alice@example.com and bob@example.com; "
+        "subject: Supporting-input subject."
     )
+    result = PlatformSelector(llm=UnexpectedPlatformLLM()).select(
+        _bundled(
+            None,
+            rewritten_query=query,
+            final_chat_text=(
+                "To: bob@example.com, alice@example.com\n"
+                "Subject: Composer-owned subject\n\n"
+                "Dear team,\n\nComposer-owned body."
+            ),
+        ),
+        ChatRequest(user_id="user-1", raw_query=_RAW_QUERY_SENTINEL),
+    )
+
+    assert result["draft"]["recipients"] == [
+        "bob@example.com",
+        "alice@example.com",
+    ]
+    assert result["draft"]["subject"] == "Composer-owned subject"
+    assert result["draft"]["body"] == "Dear team,\n\nComposer-owned body."
+
+
+def test_gmail_bundle_cannot_invent_or_drop_approved_recipients() -> None:
+    query = "Draft an email to alice@example.com and bob@example.com."
+    result = PlatformSelector(llm=None).select(
+        _bundled(
+            None,
+            rewritten_query=query,
+            final_chat_text=(
+                "To: mallory@example.com, alice@example.com\n"
+                "Subject: Approved update\n\nThe approved update is ready."
+            ),
+        ),
+        ChatRequest(user_id="user-1", raw_query=_RAW_QUERY_SENTINEL),
+    )
+
+    assert result["draft"]["recipients"] == [
+        "alice@example.com",
+        "bob@example.com",
+    ]
+    assert "mallory@example.com" not in result["draft"]["recipient"]
+
+
+def test_structured_bundled_envelope_precedes_plain_text_fields() -> None:
+    query = "Draft an email to alice@example.com and bob@example.com."
+    result = PlatformSelector(llm=None).select(
+        _bundled(
+            None,
+            rewritten_query=query,
+            final_chat_text=(
+                "To: alice@example.com, bob@example.com\n"
+                "Subject: Plain-text subject\n\nPlain-text body."
+            ),
+            platform_payload={
+                "outbound_message": {
+                    "recipients": ["bob@example.com", "alice@example.com"],
+                    "subject": "Structured bundle subject",
+                    "body": "Structured bundle body.",
+                }
+            },
+        ),
+        ChatRequest(user_id="user-1", raw_query=_RAW_QUERY_SENTINEL),
+    )
+
+    assert result["draft"]["recipients"] == [
+        "bob@example.com",
+        "alice@example.com",
+    ]
+    assert result["draft"]["subject"] == "Structured bundle subject"
+    assert result["draft"]["body"] == "Structured bundle body."
+
+
+def test_platform_formatter_cannot_override_bundled_envelope_or_artifact(
+    tmp_path: Path,
+) -> None:
+    artifact = _artifact(tmp_path, suffix=".pdf", payload=b"%PDF bundled")
+    replacement = _artifact(
+        tmp_path,
+        suffix=".xlsx",
+        payload=b"formatter replacement",
+    )
+    query = "Draft an email to alice@example.com and bob@example.com."
+
+    class OverridingFormatter:
+        def format(
+            self,
+            _response: BundledResponse,
+            _request: ChatRequest,
+        ) -> dict[str, Any]:
+            return {
+                "recipients": ["mallory@example.com"],
+                "subject": "Formatter subject",
+                "body": "Formatter body.",
+                "artifacts": [replacement],
+            }
+
+    selector = PlatformSelector(llm=None)
+    selector.register("gmail", OverridingFormatter())
+    result = selector.select(
+        _bundled(
+            artifact,
+            rewritten_query=query,
+            final_chat_text=(
+                "To: bob@example.com, alice@example.com\n"
+                "Subject: Bundled subject\n\nBundled body."
+            ),
+        ),
+        ChatRequest(user_id="user-1", raw_query=_RAW_QUERY_SENTINEL),
+    )
+
+    assert result["draft"]["recipients"] == [
+        "bob@example.com",
+        "alice@example.com",
+    ]
+    assert result["draft"]["subject"] == "Bundled subject"
+    assert result["draft"]["body"] == "Bundled body."
+    assert result["draft"]["attachments"][0]["artifact_id"] == artifact["artifact_id"]
+    assert result["artifacts"] == [artifact]
 
 
 def test_ordinary_response_skips_platform_selection_llm() -> None:
@@ -402,6 +533,196 @@ def _assert_wire_message(
     assert attachments[0].get_payload(decode=True) == expected_bytes
 
 
+def test_authoritative_outbound_follow_up_sends_exact_envelope_and_pdf(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pdf_bytes = b"%PDF-1.4 exact follow-up attachment"
+    artifact = _artifact(tmp_path, suffix=".pdf", payload=pdf_bytes)
+    outbound = OutboundMessageState(
+        channel="gmail",
+        status="draft_ready",
+        recipients=tuple(_RECIPIENTS),
+        subject="Health absence notice",
+        body="I am unwell and will remain home today.",
+        artifact_ids=(artifact["artifact_id"],),
+        attachment_filenames=(artifact["filename"],),
+        source_topic_id="topic-mail",
+        source_hop_id="hop-mail",
+    )
+    response = _bundled(
+        None,
+        rewritten_query="Carry out the pending outbound operation.",
+    )
+    CaptureSMTP.instances.clear()
+    monkeypatch.setattr("assistant_rag.platform.smtplib.SMTP_SSL", CaptureSMTP)
+
+    result = PlatformSelector(
+        llm=UnexpectedPlatformLLM(),
+        senders={"gmail": GmailSender()},
+    ).select_with_outbound_context(
+        response,
+        ChatRequest(
+            user_id="user-1",
+            raw_query=_RAW_QUERY_SENTINEL,
+            platform_context={
+                "gmail_username": "sender@example.com",
+                "gmail_app_password": "app-password",
+            },
+        ),
+        outbound_state=outbound,
+        outbound_action=OutboundFollowUpAction.SEND,
+        available_artifacts=[artifact],
+    )
+
+    assert result["platform_selection"]["source"] == "authoritative_outbound_last_qa"
+    assert result["delivery"]["status"] == "sent"
+    assert result["draft"]["subject"] == outbound.subject
+    assert result["draft"]["body"] == outbound.body
+    assert "storage_path" not in result["draft"]["attachments"][0]
+    message = CaptureSMTP.instances[-1].message
+    assert message is not None
+    _assert_wire_message(
+        message,
+        artifact=artifact,
+        expected_bytes=pdf_bytes,
+        expected_mime="application/pdf",
+    )
+
+
+def test_outbound_revision_adds_generated_pdf_then_follow_up_sends_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pdf_bytes = b"%PDF-1.4 medicine details"
+    artifact = _artifact(tmp_path, suffix=".pdf", payload=pdf_bytes)
+
+    class RevisionLLM:
+        calls: list[dict[str, Any]] = []
+
+        def generate_json(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append(kwargs)
+            return {
+                "recipients": list(_RECIPIENTS),
+                "subject": "Medical absence notice",
+                "body": (
+                    "I am sick and need to remain home. The attached PDF "
+                    "contains the medicine details."
+                ),
+                "artifact_ids": [artifact["artifact_id"]],
+            }
+
+    initial = OutboundMessageState(
+        channel="gmail",
+        status="draft_ready",
+        recipients=tuple(_RECIPIENTS),
+        subject="Day-off notice",
+        body="I will be away today.",
+    )
+    response = _bundled(
+        artifact,
+        rewritten_query=(
+            "Update the message to explain that I am sick, and include the "
+            "generated PDF with my medicine details."
+        ),
+    )
+    selector = PlatformSelector(llm=RevisionLLM(), senders={"gmail": GmailSender()})
+    revised = selector.select_with_outbound_context(
+        response,
+        ChatRequest(user_id="user-1", raw_query=_RAW_QUERY_SENTINEL),
+        outbound_state=initial,
+        outbound_action=OutboundFollowUpAction.REVISE,
+        available_artifacts=[artifact],
+        new_artifact_ids=[artifact["artifact_id"]],
+    )
+
+    assert revised["delivery"]["status"] == "draft_ready"
+    assert revised["draft"]["subject"] == "Medical absence notice"
+    assert "medicine details" in revised["draft"]["body"]
+    assert revised["draft"]["attachments"] == [
+        {
+            "artifact_id": artifact["artifact_id"],
+            "filename": artifact["filename"],
+            "storage_url": artifact["storage_url"],
+            "file_type": "pdf",
+        }
+    ]
+
+    revised_state = OutboundMessageState(
+        channel="gmail",
+        status="draft_ready",
+        recipients=tuple(revised["draft"]["recipients"]),
+        subject=revised["draft"]["subject"],
+        body=revised["draft"]["body"],
+        artifact_ids=(artifact["artifact_id"],),
+        attachment_filenames=(artifact["filename"],),
+    )
+    CaptureSMTP.instances.clear()
+    monkeypatch.setattr("assistant_rag.platform.smtplib.SMTP_SSL", CaptureSMTP)
+    sent = selector.select_with_outbound_context(
+        _bundled(None, rewritten_query="Transmit the active message now."),
+        ChatRequest(
+            user_id="user-1",
+            raw_query=_RAW_QUERY_SENTINEL,
+            platform_context={
+                "gmail_username": "sender@example.com",
+                "gmail_app_password": "app-password",
+            },
+        ),
+        outbound_state=revised_state,
+        outbound_action=OutboundFollowUpAction.SEND,
+        available_artifacts=[artifact],
+    )
+
+    assert sent["delivery"]["status"] == "sent"
+    message = CaptureSMTP.instances[-1].message
+    assert message is not None
+    _assert_wire_message(
+        message,
+        artifact=artifact,
+        expected_bytes=pdf_bytes,
+        expected_mime="application/pdf",
+    )
+
+
+def test_outbound_revision_structured_failure_never_sends_or_asks_in_a_loop() -> None:
+    class FallbackRevisionLLM:
+        def generate_json(self, **kwargs: Any) -> dict[str, Any]:
+            return structured_fallback_payload(
+                task=LLMTask.WRITING,
+                schema=kwargs["schema"],
+                user_prompt=kwargs["user_prompt"],
+                error=ValueError("invalid revision output"),
+            )
+
+    sender = RecordingSender()
+    state = OutboundMessageState(
+        channel="gmail",
+        status="draft_ready",
+        recipients=("alice@example.com",),
+        subject="Existing subject",
+        body="Existing body.",
+    )
+
+    result = PlatformSelector(
+        llm=FallbackRevisionLLM(),
+        senders={"gmail": sender},
+    ).select_with_outbound_context(
+        _bundled(None, rewritten_query="Change the active message."),
+        ChatRequest(user_id="user-1", raw_query=_RAW_QUERY_SENTINEL),
+        outbound_state=state,
+        outbound_action=OutboundFollowUpAction.REVISE_AND_SEND,
+    )
+
+    assert result["delivery"]["status"] == "pending_review"
+    assert "?" not in result["delivery"]["notice"]
+    assert "question" not in result["delivery"]
+    assert result["draft"]["subject"] == state.subject
+    assert result["draft"]["body"] == state.body
+    assert sender.send_calls == []
+    assert sender.draft_calls == []
+
+
 @pytest.mark.parametrize(
     ("file_phrase", "suffix", "expected_mime"),
     (
@@ -518,7 +839,8 @@ def test_unavailable_declared_artifact_blocks_gmail_before_dispatch(
     )
 
     assert result["delivery"]["status"] == "failed"
-    assert "missing.xlsx" in result["delivery"]["question"]
+    assert "missing.xlsx" in result["delivery"]["notice"]
+    assert "question" not in result["delivery"]
     assert sender.send_calls == []
     assert sender.draft_calls == []
     assert result["artifacts"][0]["storage_path"] == str(missing_path)

@@ -24,6 +24,7 @@ FAST_ROUTING_STAGES = frozenset(
     {
         "query_rewrite",
         "last_qa",
+        "outbound_follow_up",
         "intent_classifier",
         "general_sub_branch_detector",
         "content_composer_react",
@@ -76,12 +77,13 @@ ANSWER_STAGES = frozenset(
         "generate_pptx_planner",
         "question_generation",
         "gmail_policy",
+        "outbound_revision",
         "clarification_merge",
     }
 )
 
 PRE_CANONICAL_HISTORY_STAGES = frozenset(
-    {"query_rewrite", "last_qa", "clarification_merge"}
+    {"query_rewrite", "last_qa", "outbound_follow_up", "clarification_merge"}
 )
 
 # These mutation stages are intentionally evidence-isolated. Their user
@@ -98,6 +100,7 @@ HISTORY_ISOLATED_STAGES = frozenset(
 PROMPT_BUDGETS = {
     "query_rewrite": 360,
     "last_qa": 700,
+    "outbound_follow_up": 620,
     "intent_classifier": 760,
     "general_sub_branch_detector": 320,
     "content_composer_react": 360,
@@ -120,11 +123,13 @@ PROMPT_BUDGETS = {
     "question_generation": 680,
     "clarification_merge": 680,
     "gmail_policy": 700,
+    "outbound_revision": 1200,
 }
 
 STAGE_PAYLOAD_LIMITS = {
     "query_rewrite": (360, 220, 180, 260, 6, 2),
     "last_qa": (500, 360, 260, 560, 80, 3),
+    "outbound_follow_up": (500, 220, 180, 1800, 20, 3),
     "intent_classifier": (520, 360, 260, 620, 80, 3),
     "general_sub_branch_detector": (420, 260, 220, 320, 5, 2),
     "content_composer_react": (420, 260, 220, 340, 5, 2),
@@ -144,6 +149,7 @@ STAGE_PAYLOAD_LIMITS = {
     "question_generation": (620, 520, 320, 620, 8, 3),
     "clarification_merge": (620, 420, 280, 620, 80, 3),
     "gmail_policy": (620, 520, 360, 640, 8, 4),
+    "outbound_revision": (1200, 220, 180, 3200, 30, 4),
 }
 
 DEFAULT_PAYLOAD_LIMITS = (760, 620, 360, 760, 8, 4)
@@ -295,6 +301,8 @@ FAST_PLATFORM_KEYS = (
 )
 
 FAST_EXTRA_KEYS = (
+    "active_supporting_questions",
+    "active_outbound_state",
     "last_qa_state",
     "last_qa_resolution",
     "schema",
@@ -506,15 +514,19 @@ def _task_guidance(name: str) -> tuple[str, ...]:
             "Preserve language, constraints, times, quotes, code, filenames, IDs, and action.",
         ),
         "last_qa": (
-            "Select one Last-QA relationship and keep every output field consistent with it.",
-            "Skip retrieval only for an exact evidence-backed positive relationship.",
+            "Select one active supporting-question index only for a direct answer.",
+            "Use -1 unless one exact state-bound question is answered.",
+        ),
+        "outbound_follow_up": (
+            "Classify only the latest message's relationship to the active outbound envelope.",
+            "Use none unless send or revision intent is explicit and unambiguous.",
         ),
         "clarification_merge": (
             "Merge only a real answer to a previous clarification.",
             "Fill only the missing slot the user actually answered.",
         ),
         "intent_classifier": (
-            "Map one operation_kind to its matching intent.",
+            "Return the final owning intent directly without an operation alias.",
             "The current explicit request overrides history; missing mutation fields stay in the owning state branch.",
         ),
         "action_detection": (
@@ -539,7 +551,7 @@ def _task_guidance(name: str) -> tuple[str, ...]:
         ),
         "question_generation": (
             "Compact question writer.",
-            "Ask only useful, stage-appropriate questions; otherwise should_ask=false.",
+            "Ask only a required, stage-owned question; otherwise should_ask=false.",
         ),
         "answer_generation": (
             "Write the user-facing non-file response.",
@@ -587,6 +599,10 @@ def _task_guidance(name: str) -> tuple[str, ...]:
         "gmail_policy": (
             "External email safety gate.",
             "Prefer drafts unless send intent and all required fields are explicit.",
+        ),
+        "outbound_revision": (
+            "Revise only the active outbound message from the current instruction.",
+            "Preserve all unmentioned fields and never invent recipients or artifacts.",
         ),
     }
     return guidance.get(name, ())
@@ -650,6 +666,17 @@ def _last_qa_safety_rules() -> tuple[str, ...]:
         "This is a conservative temporary-context gate, not an answer, intent, or execution stage.",
         "Skip broad retrieval only when the declared relationship has the exact required evidence in Last-QA state or trusted reminder metadata.",
         "Do not infer a relationship from topical similarity, a short acknowledgement, or an omitted target.",
+        "Return strict JSON only.",
+    )
+
+
+def _outbound_follow_up_safety_rules() -> tuple[str, ...]:
+    return (
+        "This is a conservative relationship-and-action gate, not an answer or execution stage.",
+        "The supplied active_outbound_state is the one exact trusted referent for an explicit pronoun or elliptical message action; no keyword or recipient rediscovery is required.",
+        "A short message may authorize an action when its semantic command is explicit and it unambiguously targets that sole active envelope.",
+        "Do not authorize from acknowledgement, topical similarity, a question about delivery, an unrelated request, or uncertainty.",
+        "Do not alter content, recipients, artifacts, credentials, or delivery state.",
         "Return strict JSON only.",
     )
 
@@ -770,6 +797,8 @@ def _gmail_safety_rules() -> tuple[str, ...]:
 def _safety_rules_for_stage(name: str) -> tuple[str, ...]:
     if name == "intent_classifier":
         return _intent_routing_safety_rules()
+    if name == "outbound_follow_up":
+        return _outbound_follow_up_safety_rules()
     if name == "last_qa":
         return _last_qa_safety_rules()
     if name in FAST_ROUTING_STAGES:
@@ -1145,26 +1174,41 @@ def _default_templates() -> dict[str, PromptTemplate]:
         ),
         "last_qa": PromptTemplate(
             name="last_qa",
-            role="Classify one Last-QA relationship.",
+            role="Decide whether the current message answers exactly one active optional supporting question.",
             non_responsibilities=(
                 "Do not answer, route final intent, retrieve, mutate, or invent links.",
-                "Do not merge clarification answers; clarification_merge runs first.",
+                "Do not classify normal follow-ups, reminder replies, or clarification answers; code resolves those paths separately.",
                 "Topical similarity alone does not qualify.",
             ),
-            inputs=("rewritten_query", "last_qa_state", "platform reminder metadata when present"),
-            output_contract="Return strict JSON only with interaction_type, question_source, matched_question, and confidence.",
+            inputs=("rewritten_query", "indexed active_supporting_questions"),
+            output_contract="Return strict JSON only with matched_question_index and confidence. Use index=-1 when no question is answered.",
             decision_rules=(
-                "Use this precedence: reminder_notification_reply, supporting_question_answer, normal_follow_up, then unrelated or ambiguous.",
-                "For supporting_question_answer, identify the question source and copy the exact prior question into matched_question. For unrelated or ambiguous, use question_source=none and an empty matched_question.",
-                "A reminder reply needs reminder_id, notification_id, source_topic_id, and source_hop_id. Text such as 'done', 'yes', or 'thanks' without those IDs is not a reminder reply.",
-                "A supporting answer directly answers exactly one active question. Copy that question verbatim into matched_question. A short semantic value can answer it.",
-                "A normal follow-up explicitly references, refines, corrects, or requests detail about the previous answer. A new standalone request, even on a similar topic, is unrelated.",
-                "clarification_answer requires an active mandatory clarification.",
-                "Missing, stale, weak, conflicting, or target-dependent evidence is ambiguous and never skips retrieval.",
-                "Never emit a shape that contradicts the selected interaction_type.",
+                "Choose an index only when the latest message directly supplies the answer requested by that one question.",
+                "A short semantic value can answer a question even without repeating its words.",
+                "Example: for 'Which format?' followed by 'PDF', choose that question's index; for 'Which environment?' followed by 'Explain PDF files', use -1.",
+                "If more than one question could match, or the message is a new request, follow-up, acknowledgement, partial answer, or merely topically similar, use -1.",
             ),
             safety_rules=_safety_rules_for_stage("last_qa"),
-            error_handling=("If uncertain, return interaction_type=ambiguous.",),
+            error_handling=("If uncertain, return matched_question_index=-1.",),
+        ),
+        "outbound_follow_up": PromptTemplate(
+            name="outbound_follow_up",
+            role="Decide whether the current message explicitly acts on the one active outbound message.",
+            non_responsibilities=(
+                "Do not answer, rewrite message content, choose recipients, attach files, or execute delivery.",
+                "Do not treat topical similarity, acknowledgement, or a new request as an outbound action.",
+            ),
+            inputs=("rewritten_query", "active_outbound_state"),
+            output_contract='Return strict JSON: {"outbound_action": "none"|"send"|"revise"|"revise_and_send", "confidence": number}.',
+            decision_rules=(
+                "Use send only for an explicit instruction to transmit the active message now without changing it.",
+                "A concise imperative containing a delivery action plus a pronoun, or an equivalent expression in any language, is send when the sole active envelope is its unambiguous referent.",
+                "Use revise when the user explicitly changes its recipients, subject, body, or attachments without authorizing transmission.",
+                "Use revise_and_send only when the latest message explicitly requests both a change and immediate transmission.",
+                "Use none for unrelated requests, questions about messaging, acknowledgements, vague references, or uncertainty.",
+            ),
+            safety_rules=_safety_rules_for_stage("outbound_follow_up"),
+            error_handling=('On uncertainty, return outbound_action="none".',),
         ),
         "clarification_merge": PromptTemplate(
             name="clarification_merge",
@@ -1204,21 +1248,21 @@ def _default_templates() -> dict[str, PromptTemplate]:
             ),
             inputs=("current query", "trusted recent context"),
             output_contract=(
-                'Return strict JSON only: {"operation_kind":"durable_knowledge|reminder_lifecycle|clarification_reply|none",'
+                'Return strict JSON only: {"intent":"general_response|knowledge_facts|reminder|clarification",'
                 '"confidence":number from 0.0 to 1.0}. Return no other fields.'
             ),
             decision_rules=(
-                "Choose one operation_kind. Runtime code maps durable_knowledge to knowledge_facts, reminder_lifecycle to reminder, clarification_reply to clarification, and none to general_response.",
-                "durable_knowledge is mutation-only: choose it only for one explicit request to add, modify, or delete the user's stored facts, preferences, rules, notes, or project knowledge.",
-                "reminder_lifecycle is mutation-only: choose it only for one explicit request to add, modify, delete, turn on, or turn off a scheduled future notification.",
-                "Every request to search, find, list, show, inspect, look up, retrieve, recall, read, or answer a question about stored knowledge or reminders is informational none and belongs to general_response, even when it mentions an earlier add, modify, delete, enable, or disable action.",
-                "Do not infer reminder_lifecycle from reminder lookup questions, vague plans, third-party facts, discussion of future topics, or lifecycle words used in ordinary conversation.",
-                "Choose clarification_reply only for a direct answer to an active mandatory assistant question; a new request is never clarification.",
-                "Choose none for every other informational question, writing task, or conversation. Confidence measures branch ownership, not mutation completeness; use high confidence for exact category matches, while missing mutation fields remain with their owning state branch.",
+                "Choose one final branch name directly; do not translate it to an operation alias.",
+                "knowledge_facts is mutation-only: choose it only for one explicit request to add, modify, or delete the user's stored facts, preferences, rules, notes, or project knowledge.",
+                "reminder is mutation-only: choose it only for one explicit request to add, modify, delete, turn on, or turn off a scheduled future notification.",
+                "Every request to search, find, list, show, inspect, look up, retrieve, recall, read, or answer a question about stored knowledge or reminders is informational general_response, even when it mentions an earlier add, modify, delete, enable, or disable action.",
+                "Do not infer reminder from reminder lookup questions, vague plans, third-party facts, discussion of future topics, or lifecycle words used in ordinary conversation.",
+                "Choose clarification only for a direct answer to an active mandatory assistant question; a new request is never clarification.",
+                "Choose general_response for every other informational question, writing task, or conversation. Confidence measures branch ownership, not mutation completeness; use high confidence for exact category matches, while missing mutation fields remain with their owning state branch.",
             ),
             safety_rules=_safety_rules_for_stage("intent_classifier"),
             error_handling=(
-                "If the request concerns neither stored personal knowledge, reminder lifecycle, nor an active clarification, return general_response.",
+                "If the request concerns neither stored personal knowledge mutation, reminder lifecycle mutation, nor an active clarification, return general_response.",
                 "If context does not prove an active mandatory question, never return clarification.",
             ),
         ),
@@ -1657,13 +1701,14 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "Keep simple answers concise.",
                 "Use structure and step-by-step detail for complex technical, architecture, or implementation questions.",
                 "For writing tasks, produce polished copy directly in the requested style.",
+                "For email-writing tasks, put every literal recipient in a To: line, then a concise Subject: line, then the authored message body; never invent or silently omit recipients.",
                 "Always follow content_composition_scope when supplied: own the user-facing non-file prose, including any requested email, message, or cover note.",
                 "When a file tool is assigned, do not duplicate the attachment's internal document sections, workbook rows, or presentation slides; that tool owns only the file content.",
-                "Ask at most one focused clarification question only when necessary to answer safely.",
+                "Never append a clarification or supporting question; the dedicated HITL stage owns every conversational question.",
                 "Do not claim side effects unless confirmed by operation results.",
             ),
             safety_rules=_safety_rules_for_stage("answer_generation"),
-            error_handling=("If you cannot answer safely, state what is missing and ask one focused question.",),
+            error_handling=("If you cannot answer safely, state what is missing without phrasing it as a question; HITL owns the ask decision.",),
         ),
         "question_generation": PromptTemplate(
             name="question_generation",
@@ -1682,11 +1727,11 @@ def _default_templates() -> dict[str, PromptTemplate]:
             decision_rules=(
                 "For clarification, ask one short, concrete question for the supplied missing field or ambiguity; do not ask for speculative preferences, architecture, scale, or unrelated context.",
                 "For clarification, generate a new question for the current rewritten_query; never reuse a precomputed clarification_question from request metadata.",
-                "For human_supporting, ask at most one optional next-step question after a useful answer exists.",
+                "For human_supporting, ask at most one question only when a required user-provided fact is missing and the current request cannot otherwise be fulfilled.",
                 "For a human_supporting list contract, return an empty questions array when no question should be asked; every included item is a question to ask and therefore has no should_ask mirror.",
                 "Do not mix question types.",
                 "Use only the fields in the caller-provided data contract; never emit JSON-Schema keys such as type, properties, required, items, or $schema.",
-                "For human_supporting only, return should_ask=false when the question would be redundant, speculative, unsafe, or low-value. Clarification is called only after the branch has already decided one question is required.",
+                "For human_supporting only, return should_ask=false for complete or explicit requests, delivery credentials, optional preferences, next-step suggestions, or any redundant, speculative, unsafe, or low-value question. Clarification is called only after the branch has already decided one question is required.",
             ),
             safety_rules=_safety_rules_for_stage("question_generation"),
             error_handling=("For human_supporting uncertainty, return should_ask=false. For clarification uncertainty, return an empty question with low confidence.",),
@@ -1778,6 +1823,24 @@ def _default_templates() -> dict[str, PromptTemplate]:
             ),
             safety_rules=_safety_rules_for_stage("generate_pptx_planner"),
             error_handling=("If context is unclear, provide a generic but useful deck outline.",),
+        ),
+        "outbound_revision": PromptTemplate(
+            name="outbound_revision",
+            role="Apply the current user's requested changes to one active outbound email draft.",
+            non_responsibilities=(
+                "Do not send, claim delivery, create files, or invent recipients or artifact IDs.",
+                "Do not rewrite fields the user did not ask to change.",
+            ),
+            inputs=("rewritten_query", "active_outbound_message", "available_artifacts"),
+            output_contract="Return strict JSON with recipients, subject, body, and artifact_ids only.",
+            decision_rules=(
+                "Return the complete revised email, preserving every unmentioned recipient and content detail.",
+                "Recipients must come from the active message or literal addresses in the current instruction.",
+                "Artifact IDs must come from available_artifacts. Preserve existing attachments unless removal is explicit, and include newly generated artifacts requested for this message.",
+                "Body must be the email body itself, not commentary about drafting, files, or delivery.",
+            ),
+            safety_rules=_safety_rules_for_stage("gmail_policy"),
+            error_handling=("On uncertainty, preserve the active message fields unchanged.",),
         ),
         "gmail_policy": PromptTemplate(
             name="gmail_policy",

@@ -85,14 +85,8 @@ class SelectedIntentLLM:
         self.intent = intent
 
     def generate_json(self, **_kwargs: Any) -> dict[str, Any]:
-        operation_kind = (
-            "durable_knowledge"
-            if self.intent is Intent.KNOWLEDGE_FACTS
-            else "reminder_lifecycle"
-        )
         return {
             "intent": self.intent.value,
-            "operation_kind": operation_kind,
             "confidence": 1.0,
         }
 

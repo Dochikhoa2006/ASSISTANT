@@ -8,15 +8,17 @@ from typing import Any
 
 from .config import ClassificationConfig, LastQAConfig
 from .contracts import (
-    ChatRequest, Intent, LastQAState, ResponseType, LastQAPath,
-    LastQAInteractionType, QuestionSource, LastQAResolution,
+    ChatRequest, GeneratedQuestion, Intent, LastQAState, ResponseType, LastQAPath,
+    LastQAInteractionType, OutboundFollowUpAction, QuestionSource, LastQAResolution,
     validate_last_qa_resolution
 )
 from .llm import (
     LLMClient,
     LLMTask,
     _has_pending_clarification,
+    _is_authoritative_outbound_action,
     build_intent_conversation_extra,
+    intent_classification_schema,
     is_structured_fallback,
     validate_json_schema,
 )
@@ -348,6 +350,96 @@ class LLMLastQAResolver:
     def __post_init__(self) -> None:
         self.fallback = LastQAResolver()
 
+    def resolve_outbound_follow_up(
+        self,
+        request: ChatRequest,
+        state: LastQAState,
+        rewritten_query: str,
+    ) -> LastQAResolution | None:
+        """Classify a reference to the active outbound envelope semantically.
+
+        The model may authorize only the relationship/action. Recipients,
+        message content, credentials, and attachment paths remain outside this
+        decision and are validated by the platform stage.
+        """
+        outbound = state.outbound_state
+        if outbound is None:
+            return None
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "outbound_action": {
+                    "type": "string",
+                    "enum": [
+                        "none",
+                        OutboundFollowUpAction.SEND.value,
+                        OutboundFollowUpAction.REVISE.value,
+                        OutboundFollowUpAction.REVISE_AND_SEND.value,
+                    ],
+                },
+                "confidence": {"type": "number"},
+            },
+            "required": ["outbound_action", "confidence"],
+        }
+        try:
+            payload = self.llm.generate_json(
+                task=LLMTask.LAST_QA,
+                system_prompt=self.prompt_registry.system("outbound_follow_up"),
+                user_prompt=self.prompt_registry.user(
+                    PromptContext(
+                        stage="outbound_follow_up",
+                        user_id=request.user_id,
+                        rewritten_query=rewritten_query,
+                        extra={
+                            "active_outbound_state": {
+                                "channel": outbound.channel,
+                                "status": outbound.status,
+                                "recipients": list(outbound.recipients),
+                                "subject": outbound.subject,
+                                "body_present": bool(outbound.body),
+                                "attachment_filenames": list(
+                                    outbound.attachment_filenames
+                                ),
+                            }
+                        },
+                    )
+                ),
+                schema=schema,
+            )
+            if is_structured_fallback(payload):
+                return None
+            validate_json_schema(payload, schema)
+            action_value = str(payload.get("outbound_action") or "none")
+            confidence = float(payload.get("confidence", 0.0))
+            if action_value == "none" or confidence < self.config.min_confidence:
+                return None
+            action = OutboundFollowUpAction(action_value)
+        except Exception as exc:
+            _log_llm_fallback("Outbound Last-QA resolver", exc)
+            return None
+
+        resolution = LastQAResolution(
+            path=LastQAPath.LATEST_CONTEXT_INTERACTION,
+            interaction_type=LastQAInteractionType.OUTBOUND_MESSAGE_ACTION,
+            question_source=QuestionSource.NONE,
+            rewritten_query=rewritten_query,
+            state=state,
+            did_merge_query=False,
+            skip_broad_retrieval=True,
+            confidence=confidence,
+            linked_topic_id=outbound.source_topic_id or state.linked_topic_id,
+            linked_hop_id=outbound.source_hop_id or state.linked_hop_id,
+            source_topic_id=outbound.source_topic_id or state.linked_topic_id,
+            source_hop_id=outbound.source_hop_id or state.linked_hop_id,
+            is_authoritative_state=True,
+            merge_reason="active_outbound_message_action",
+            skip_reason="semantic_action_bound_to_active_outbound_state",
+            outbound_action=action,
+        )
+        validate_last_qa_resolution(resolution)
+        return resolution
+
     def merge_clarification_answer(
         self, request: ChatRequest, state: LastQAState, rewritten_query: str
     ) -> dict[str, Any] | None:
@@ -413,6 +505,14 @@ class LLMLastQAResolver:
             validate_last_qa_resolution(res)
             return res
 
+        outbound_resolution = self.resolve_outbound_follow_up(
+            request,
+            state,
+            rewritten_query,
+        )
+        if outbound_resolution is not None:
+            return outbound_resolution
+
         is_clarification = (
             state.response_type == ResponseType.CLARIFICATION or
             (state.clarification_question is not None)
@@ -471,33 +571,44 @@ class LLMLastQAResolver:
             return res
 
         if state.response_type in (ResponseType.NORMAL, ResponseType.KNOWLEDGE_ACTION, ResponseType.REMINDER_ACTION, ResponseType.REMINDER_REPLY, ResponseType.ERROR):
+            active_questions: list[tuple[QuestionSource, GeneratedQuestion]] = [
+                (QuestionSource.HUMAN_SUPPORTING_QUESTION, question)
+                for question in state.supporting_questions
+                if question.text.strip()
+            ]
+            if (
+                state.reminder_supporting_question is not None
+                and state.reminder_supporting_question.text.strip()
+            ):
+                active_questions.append(
+                    (
+                        QuestionSource.REMINDER_SUPPORTING_QUESTION,
+                        state.reminder_supporting_question,
+                    )
+                )
+
+            # No model classification in this state can authorize a retrieval
+            # skip: normal follow-ups require reranked conversation evidence,
+            # while exact reminder replies were resolved above from source IDs.
+            if not active_questions:
+                return self.fallback.resolve(request, rewritten_query, state)
+
+            deterministic_resolution = self.fallback.resolve(
+                request, rewritten_query, state
+            )
+            if deterministic_resolution.skip_broad_retrieval:
+                return deterministic_resolution
+
             schema = {
                 "type": "object",
                 "properties": {
-                    "interaction_type": {
-                        "type": "string",
-                        "enum": [
-                            LastQAInteractionType.CLARIFICATION_ANSWER.value,
-                            LastQAInteractionType.SUPPORTING_QUESTION_ANSWER.value,
-                            LastQAInteractionType.NORMAL_FOLLOW_UP.value,
-                            LastQAInteractionType.REMINDER_NOTIFICATION_REPLY.value,
-                            "unrelated",
-                            "ambiguous",
-                        ],
+                    "matched_question_index": {
+                        "type": "integer",
+                        "default": -1,
                     },
-                    "question_source": {
-                        "type": "string",
-                        "enum": [source.value for source in QuestionSource],
-                    },
-                    "matched_question": {"type": "string"},
                     "confidence": {"type": "number"},
                 },
-                "required": [
-                    "interaction_type",
-                    "question_source",
-                    "matched_question",
-                    "confidence",
-                ],
+                "required": ["matched_question_index", "confidence"],
             }
             try:
                 payload = self.llm.generate_json(
@@ -510,7 +621,18 @@ class LLMLastQAResolver:
                             rewritten_query=rewritten_query,
                             metadata=request.metadata,
                             platform_context=request.platform_context,
-                            extra={"last_qa_state": state.__dict__},
+                            extra={
+                                "active_supporting_questions": [
+                                    {
+                                        "index": index,
+                                        "source": source.value,
+                                        "question": question.text,
+                                    }
+                                    for index, (source, question) in enumerate(
+                                        active_questions
+                                    )
+                                ]
+                            },
                         )
                     ),
                     schema=schema,
@@ -519,23 +641,20 @@ class LLMLastQAResolver:
                     return self.fallback.resolve(request, rewritten_query, state)
                 validate_json_schema(payload, schema)
 
-                it_str = payload.get("interaction_type")
-                qs_str = payload.get("question_source")
-                try:
-                    interaction_type = LastQAInteractionType(it_str) if it_str else None
-                except ValueError:
-                    interaction_type = None
-                try:
-                    question_source = QuestionSource(qs_str) if qs_str else QuestionSource.NONE
-                except ValueError:
-                    question_source = QuestionSource.NONE
-
-                interaction_detected = bool(
-                    interaction_type
-                    and str(it_str) not in {"unrelated", "ambiguous"}
-                )
-                if interaction_detected and float(payload.get("confidence", 0.0)) >= self.config.min_confidence:
-                    if can_skip_broad_retrieval(payload, state, interaction_type, self.config, request):
+                question_index = int(payload["matched_question_index"])
+                confidence = float(payload.get("confidence", 0.0))
+                if (
+                    0 <= question_index < len(active_questions)
+                    and confidence >= self.config.min_confidence
+                ):
+                    question_source, matched_question = active_questions[question_index]
+                    interaction_type = LastQAInteractionType.SUPPORTING_QUESTION_ANSWER
+                    bound_payload = {
+                        "question_source": question_source.value,
+                        "matched_question": matched_question.text,
+                        "confidence": confidence,
+                    }
+                    if can_skip_broad_retrieval(bound_payload, state, interaction_type, self.config, request):
                         md = request.metadata or {}
                         pc = request.platform_context or {}
                         res = LastQAResolution(
@@ -546,10 +665,10 @@ class LLMLastQAResolver:
                             state=state,
                             did_merge_query=False,
                             skip_broad_retrieval=True,
-                            confidence=float(payload.get("confidence", 0.0)),
+                            confidence=confidence,
                             linked_topic_id=state.linked_topic_id,
                             linked_hop_id=state.linked_hop_id,
-                            matched_question=payload.get("matched_question"),
+                            matched_question=matched_question.text,
                             reminder_id=md.get("reminder_id") or pc.get("reminder_id"),
                             notification_id=md.get("notification_id") or pc.get("notification_id"),
                             source_topic_id=md.get("source_topic_id") or pc.get("source_topic_id"),
@@ -601,22 +720,10 @@ class LLMIntentClassifier(IntentClassifierProtocol):
             except ValueError:
                 pass
 
-        schema = {
-            "type": "object",
-            "properties": {
-                "operation_kind": {
-                    "type": "string",
-                    "enum": [
-                        "durable_knowledge",
-                        "reminder_lifecycle",
-                        "clarification_reply",
-                        "none",
-                    ],
-                },
-                "confidence": {"type": "number"},
-            },
-            "required": ["operation_kind", "confidence"],
-        }
+        if _is_authoritative_outbound_action(last_qa_resolution):
+            return Intent.GENERAL_RESPONSE
+
+        schema = intent_classification_schema()
         
         # Include compact approved chat history so intent can resolve safe follow-ups.
         context_extra = build_intent_conversation_extra(
@@ -645,12 +752,7 @@ class LLMIntentClassifier(IntentClassifierProtocol):
             validate_json_schema(payload, schema)
             
             if float(payload.get("confidence", 0.0)) >= self.config.min_confidence:
-                intent = {
-                    "durable_knowledge": Intent.KNOWLEDGE_FACTS,
-                    "reminder_lifecycle": Intent.REMINDER,
-                    "clarification_reply": Intent.CLARIFICATION,
-                    "none": Intent.GENERAL_RESPONSE,
-                }[str(payload["operation_kind"])]
+                intent = Intent(str(payload["intent"]))
                 if (
                     intent is Intent.CLARIFICATION
                     and not _has_pending_clarification(last_qa_resolution)

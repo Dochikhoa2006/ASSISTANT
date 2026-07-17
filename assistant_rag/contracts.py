@@ -26,6 +26,15 @@ class LastQAInteractionType(str, Enum):
     SUPPORTING_QUESTION_ANSWER = "supporting_question_answer"
     CLARIFICATION_ANSWER = "clarification_answer"
     REMINDER_NOTIFICATION_REPLY = "reminder_notification_reply"
+    OUTBOUND_MESSAGE_ACTION = "outbound_message_action"
+
+
+class OutboundFollowUpAction(str, Enum):
+    """A semantic action on the one active outbound message envelope."""
+
+    SEND = "send"
+    REVISE = "revise"
+    REVISE_AND_SEND = "revise_and_send"
 
 
 class QuestionSource(str, Enum):
@@ -235,6 +244,25 @@ class ChatRequest:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class OutboundMessageState:
+    """Safe temporary state for a user-owned outbound message.
+
+    Credentials and storage paths are intentionally excluded. Artifact IDs are
+    rehydrated through the user-scoped repository immediately before delivery.
+    """
+
+    channel: str
+    status: str
+    recipients: tuple[str, ...]
+    subject: str
+    body: str
+    artifact_ids: tuple[str, ...] = field(default_factory=tuple)
+    attachment_filenames: tuple[str, ...] = field(default_factory=tuple)
+    source_topic_id: Optional[str] = None
+    source_hop_id: Optional[str] = None
+
+
 @dataclass
 class LastQAState:
     last_user_query: str
@@ -251,6 +279,7 @@ class LastQAState:
     # identify both supporting-question and purpose-driven replies precisely.
     reminder_state: dict[str, Any] | None = None
     reminder_state_hash: Optional[str] = None
+    outbound_state: OutboundMessageState | None = None
 
 
 @dataclass(frozen=True)
@@ -727,6 +756,7 @@ class LastQAResolution:
     skip_reason: Optional[str] = None
 
     is_authoritative_state: bool = False
+    outbound_action: OutboundFollowUpAction | None = None
 
 
 def validate_last_qa_resolution(resolution: LastQAResolution) -> None:
@@ -742,6 +772,14 @@ def validate_last_qa_resolution(resolution: LastQAResolution) -> None:
     if resolution.skip_broad_retrieval:
         assert resolution.path == LastQAPath.LATEST_CONTEXT_INTERACTION
         assert resolution.did_merge_query is False
+
+    if resolution.interaction_type == LastQAInteractionType.OUTBOUND_MESSAGE_ACTION:
+        assert resolution.path == LastQAPath.LATEST_CONTEXT_INTERACTION
+        assert resolution.skip_broad_retrieval is True
+        assert resolution.state is not None
+        assert resolution.state.outbound_state is not None
+        assert resolution.outbound_action is not None
+        assert resolution.is_authoritative_state is True
 
     if resolution.path == LastQAPath.BROAD_RETRIEVAL_REQUIRED:
         assert resolution.skip_broad_retrieval is False

@@ -235,6 +235,7 @@ def test_compound_email_and_attachment_keep_real_outputs_disjoint(
         "Subject: Q3 handoff\n\nDear Finance team,\n\n"
         "The Q3 tracker is attached for review.\n\nRegards,\nOperations"
     )
+    email_body = email_copy.split("\n\n", 1)[1]
     workbook_plan = "Owner,Forecast,Actual\nOperations,100,90"
     llm = RecordingComposerLLM(answer_text=email_copy, file_plan=workbook_plan)
     composer, config, repository = _real_composer(tmp_path, llm)
@@ -295,7 +296,7 @@ def test_compound_email_and_attachment_keep_real_outputs_disjoint(
         "finance@example.com",
         "operations@example.com",
     ]
-    assert draft["draft"]["body"] == email_copy
+    assert draft["draft"]["body"] == email_body
     assert len(draft["draft"]["attachments"]) == 1
     assert draft["draft"]["attachments"][0]["filename"] == result.artifacts[0]["filename"]
     assert "storage_path" not in draft["draft"]["attachments"][0]
@@ -333,10 +334,10 @@ def test_compound_email_and_attachment_keep_real_outputs_disjoint(
     )
 
     assert sent["delivery"]["status"] == "sent"
-    assert sent["draft"]["body"] == email_copy
+    assert sent["draft"]["body"] == email_body
     assert len(send_sender.calls) == 1
     sent_payload, sent_context = send_sender.calls[0]
-    assert sent_payload["body"] == email_copy
+    assert sent_payload["body"] == email_body
     assert sent_payload["recipients"] == [
         "finance@example.com",
         "operations@example.com",

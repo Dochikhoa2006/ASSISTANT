@@ -30,6 +30,17 @@ def _has_pending_clarification(last_qa_resolution: Any) -> bool:
     )
 
 
+def _is_authoritative_outbound_action(last_qa_resolution: Any) -> bool:
+    interaction = getattr(last_qa_resolution, "interaction_type", None)
+    interaction_value = getattr(interaction, "value", interaction)
+    return bool(
+        last_qa_resolution
+        and interaction_value == "outbound_message_action"
+        and getattr(last_qa_resolution, "outbound_action", None) is not None
+        and getattr(last_qa_resolution, "is_authoritative_state", False)
+    )
+
+
 class LLMTask(str, Enum):
     QUERY_REWRITE = "query_rewrite"
     LAST_QA = "last_qa"
@@ -51,6 +62,21 @@ class LLMTask(str, Enum):
     GENERAL_SUB_BRANCH_DETECTION = "general_sub_branch_detection"
     CONTENT_COMPOSER_REACT = "content_composer_react"
     ACTION_PLANNING = "action_planning"
+
+
+def llm_trace_stage_name(task: LLMTask, *, engine: str | None = None) -> str:
+    """Return the stable trace label for an LLM task.
+
+    Answer generation historically appeared as ``llm_answer`` (and
+    ``llm_answer_onnx``), which obscured its relationship to the canonical
+    ``answer_generation`` pipeline stage.  Keep every other established label
+    intact while making answer-generation timing consistent across engines.
+    """
+
+    if task is LLMTask.ANSWER:
+        return "llm_answer_generation"
+    suffix = f"_{engine}" if engine else ""
+    return f"llm_{task.value}{suffix}"
 
 
 @dataclass(frozen=True)
@@ -179,7 +205,7 @@ class OllamaLLMClient:
         model_override: str | None = None,
         fallback_for: str | None = None,
     ) -> dict[str, Any]:
-        with StageTimer(f"llm_{task.value}"):
+        with StageTimer(llm_trace_stage_name(task)):
             last_error: Exception | None = None
             retry_count = getattr(self.settings, f"json_retry_count_{task.value}", self.settings.structured_retry_count)
             attempt_errors: list[str] = []
@@ -256,7 +282,7 @@ class OllamaLLMClient:
             return payload
 
     def chat(self, *, task: LLMTask, system_prompt: str, user_prompt: str) -> str:
-        with StageTimer(f"llm_{task.value}"):
+        with StageTimer(llm_trace_stage_name(task)):
             try:
                 response = self._chat_raw(
                     task=task,
@@ -622,20 +648,23 @@ def structured_fallback_payload(
         query = str(context.get("raw_query") or context.get("rewritten_query") or "").strip()
         payload.update({"rewritten_query": query})
     elif task == LLMTask.LAST_QA:
-        payload.update({
-            "interaction_type": "ambiguous",
-            "question_source": "none",
-            "matched_question": "",
-            "confidence": 0.0,
-        })
-    elif task == LLMTask.INTENT:
-        if "operation_kind" in (schema.get("properties") or {}):
-            payload.update({"operation_kind": "none", "confidence": 1.0})
+        properties = schema.get("properties") or {}
+        if "outbound_action" in properties:
+            payload.update({"outbound_action": "none", "confidence": 0.0})
+        elif "matched_question_index" in properties:
+            payload.update({"matched_question_index": -1, "confidence": 0.0})
         else:
             payload.update({
-                "intent": Intent.GENERAL_RESPONSE.value,
-                "confidence": 1.0,
+                "interaction_type": "ambiguous",
+                "question_source": "none",
+                "matched_question": "",
+                "confidence": 0.0,
             })
+    elif task == LLMTask.INTENT:
+        payload.update({
+            "intent": Intent.GENERAL_RESPONSE.value,
+            "confidence": 1.0,
+        })
     elif task == LLMTask.REMINDER_ACTION_EXTRACTION:
         payload.update({
             "action": "add",
@@ -820,6 +849,9 @@ def _schema_default_object(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def _schema_default_value(rules: dict[str, Any]) -> Any:
+    if "default" in rules:
+        return rules["default"]
+
     enum_values = rules.get("enum")
     if enum_values:
         return enum_values[0]
@@ -964,6 +996,30 @@ def build_intent_conversation_extra(
     }
 
 
+def intent_classification_schema() -> dict[str, Any]:
+    """Return the minimal final-branch contract shared by both classifiers."""
+
+    return {
+        "type": "object",
+        "properties": {
+            "intent": {
+                "type": "string",
+                # The safe non-mutating route is also the generated example
+                # and fallback default, avoiding first-enum mutation bias.
+                "enum": [
+                    Intent.GENERAL_RESPONSE.value,
+                    Intent.KNOWLEDGE_FACTS.value,
+                    Intent.REMINDER.value,
+                    Intent.CLARIFICATION.value,
+                ],
+                "default": Intent.GENERAL_RESPONSE.value,
+            },
+            "confidence": {"type": "number"},
+        },
+        "required": ["intent", "confidence"],
+    }
+
+
 class OllamaIntentClassifier:
     def __init__(
         self,
@@ -989,25 +1045,9 @@ class OllamaIntentClassifier:
                 return Intent(explicit_intent)
             except ValueError:
                 pass
-        schema = {
-            "type": "object",
-            "properties": {
-                "operation_kind": {
-                    "type": "string",
-                    "enum": [
-                        "durable_knowledge",
-                        "reminder_lifecycle",
-                        "clarification_reply",
-                        "none",
-                    ],
-                },
-                "confidence": {"type": "number"},
-            },
-            "required": [
-                "operation_kind",
-                "confidence",
-            ],
-        }
+        if _is_authoritative_outbound_action(last_qa_resolution):
+            return Intent.GENERAL_RESPONSE
+        schema = intent_classification_schema()
         try:
             payload = self.llm.generate_json(
                 task=LLMTask.INTENT,
@@ -1035,14 +1075,7 @@ class OllamaIntentClassifier:
         if float(payload.get("confidence", 0.0)) < self.min_confidence:
             return Intent.GENERAL_RESPONSE
 
-        operation_kind = str(payload["operation_kind"])
-        operation_intents = {
-            "durable_knowledge": Intent.KNOWLEDGE_FACTS,
-            "reminder_lifecycle": Intent.REMINDER,
-            "clarification_reply": Intent.CLARIFICATION,
-            "none": Intent.GENERAL_RESPONSE,
-        }
-        intent = operation_intents[operation_kind]
+        intent = Intent(str(payload["intent"]))
         if intent is Intent.CLARIFICATION and not _has_pending_clarification(last_qa_resolution):
             return Intent.GENERAL_RESPONSE
         return intent

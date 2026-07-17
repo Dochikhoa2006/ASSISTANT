@@ -12,7 +12,12 @@ import os
 import sqlite3
 import time
 
-from .contracts import LastQAState, ResponseType, ExpectedResponseType
+from .contracts import (
+    ExpectedResponseType,
+    LastQAState,
+    OutboundMessageState,
+    ResponseType,
+)
 
 
 @dataclass
@@ -86,6 +91,48 @@ class DiskCacheLastQAStore:
             ) for q in supp
         ]
 
+        outbound = payload.get("outbound_state")
+        outbound_state = None
+        if isinstance(outbound, dict):
+            recipients = outbound.get("recipients")
+            artifact_ids = outbound.get("artifact_ids")
+            attachment_filenames = outbound.get("attachment_filenames")
+            outbound_state = OutboundMessageState(
+                channel=str(outbound.get("channel") or ""),
+                status=str(outbound.get("status") or ""),
+                recipients=tuple(
+                    str(value)
+                    for value in (recipients if isinstance(recipients, list) else [])
+                    if str(value).strip()
+                ),
+                subject=str(outbound.get("subject") or ""),
+                body=str(outbound.get("body") or ""),
+                artifact_ids=tuple(
+                    str(value)
+                    for value in (artifact_ids if isinstance(artifact_ids, list) else [])
+                    if str(value).strip()
+                ),
+                attachment_filenames=tuple(
+                    str(value)
+                    for value in (
+                        attachment_filenames
+                        if isinstance(attachment_filenames, list)
+                        else []
+                    )
+                    if str(value).strip()
+                ),
+                source_topic_id=(
+                    str(outbound["source_topic_id"])
+                    if outbound.get("source_topic_id")
+                    else None
+                ),
+                source_hop_id=(
+                    str(outbound["source_hop_id"])
+                    if outbound.get("source_hop_id")
+                    else None
+                ),
+            )
+
         return LastQAState(
             last_user_query=payload["last_user_query"],
             last_response=payload["last_response"],
@@ -110,6 +157,7 @@ class DiskCacheLastQAStore:
                 if payload.get("reminder_state_hash")
                 else None
             ),
+            outbound_state=outbound_state,
         )
 
     def save(self, user_id: str, state: LastQAState) -> None:
@@ -127,6 +175,9 @@ class DiskCacheLastQAStore:
             "expected_response_type": state.expected_response_type.value if state.expected_response_type else None,
             "reminder_state": state.reminder_state,
             "reminder_state_hash": state.reminder_state_hash,
+            "outbound_state": (
+                asdict(state.outbound_state) if state.outbound_state else None
+            ),
         }
         self.connection.execute(
             """

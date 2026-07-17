@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -415,6 +415,118 @@ def test_general_response_branch_sub_branch_and_hitl_cross_product(
     )
 
 
+def test_explicit_email_request_skips_optional_general_hitl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(branches_module, "retrieve_knowledge", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        branches_module,
+        "retrieve_reminder_candidates",
+        lambda **_kwargs: [],
+    )
+    context, decision, *_ = _branch_case(GeneralSubBranch.NEW_CONVERSATION_TOPIC)
+    query = "Prepare an email to alex@example.com confirming the approved schedule."
+    context = replace(
+        context,
+        request=ChatRequest(user_id="matrix-user", raw_query=query),
+        rewritten_query=query,
+    )
+    hitl = RecordingGeneralHITL()
+    repository = RecordingRepository()
+    branch = GeneralResponseBranch(
+        retriever=object(),
+        config=SimpleNamespace(
+            retrieval=SimpleNamespace(
+                general_response_reminder_statuses=("scheduled", "notified"),
+                general_response_reminder_limit=4,
+            )
+        ),
+        context_filter=EmptyContextFilter(),
+        sub_branch_detector=FixedSubBranchDetector(decision),
+        content_composer=RecordingComposer(),
+        general_hitl_strategy=hitl,
+        general_purpose_config=GeneralPurposeConfig(
+            hitl_supporting_question_enabled=True,
+        ),
+    )
+
+    result = branch.execute(context, repository)  # type: ignore[arg-type]
+
+    assert hitl.calls == 0
+    assert result.human_supporting_questions == []
+    assert result.human_in_the_loop_result == {
+        "triggered": False,
+        "confidence": 1.0,
+        "question_count": 0,
+        "reason": "explicit_delivery_request_is_actionable",
+    }
+
+
+def test_completed_artifact_request_skips_optional_general_hitl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(branches_module, "retrieve_knowledge", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        branches_module,
+        "retrieve_reminder_candidates",
+        lambda **_kwargs: [],
+    )
+    context, decision, *_ = _branch_case(GeneralSubBranch.NEW_CONVERSATION_TOPIC)
+    query = "Create a PDF report from the approved project summary."
+    context = replace(
+        context,
+        request=ChatRequest(user_id="matrix-user", raw_query=query),
+        rewritten_query=query,
+    )
+
+    class CompletedArtifactComposer:
+        def compose(self, *_args: Any, **_kwargs: Any) -> ContentComposerResult:
+            return ContentComposerResult(
+                final_response_text="Created the requested PDF report.",
+                tool_trace_summary="completed artifact",
+                used_tool_names=("answer_generation", "generate_pdf"),
+                confidence=1.0,
+                fallback_used=False,
+                reason_summary="artifact created",
+                content_warnings=(),
+                artifacts=(
+                    {
+                        "artifact_id": "artifact-pdf",
+                        "filename": "report.pdf",
+                        "file_type": "pdf",
+                        "status": "created",
+                    },
+                ),
+            )
+
+    hitl = RecordingGeneralHITL()
+    result = GeneralResponseBranch(
+        retriever=object(),
+        config=SimpleNamespace(
+            retrieval=SimpleNamespace(
+                general_response_reminder_statuses=("scheduled", "notified"),
+                general_response_reminder_limit=4,
+            )
+        ),
+        context_filter=EmptyContextFilter(),
+        sub_branch_detector=FixedSubBranchDetector(decision),
+        content_composer=CompletedArtifactComposer(),
+        general_hitl_strategy=hitl,
+        general_purpose_config=GeneralPurposeConfig(
+            hitl_supporting_question_enabled=True,
+        ),
+    ).execute(context, RecordingRepository())  # type: ignore[arg-type]
+
+    assert hitl.calls == 0
+    assert result.human_supporting_questions == []
+    assert result.human_in_the_loop_result == {
+        "triggered": False,
+        "confidence": 1.0,
+        "question_count": 0,
+        "reason": "requested_artifact_was_created",
+    }
+
+
 def test_general_branch_keeps_created_artifact_visible_when_hop_write_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -556,6 +668,46 @@ def test_response_bundler_all_response_type_shapes(response_type: ResponseType) 
         response_type in {ResponseType.KNOWLEDGE_ACTION, ResponseType.REMINDER_ACTION}
     )
     assert len(bundled.actions_committed) == expected_committed_count
+
+
+def test_response_bundler_resolves_competing_question_owners_to_one() -> None:
+    clarification = GeneratedQuestion(
+        text="Which record should be updated?",
+        source=QuestionSource.CLARIFICATION_QUESTION,
+        purpose="resolve_missing_info",
+        confidence=1.0,
+    )
+    supporting = GeneratedQuestion(
+        text="Would another example help?",
+        source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+        purpose="optional_context",
+        confidence=0.9,
+    )
+    reminder = GeneratedQuestion(
+        text="Should this reminder repeat?",
+        source=QuestionSource.REMINDER_SUPPORTING_QUESTION,
+        purpose="resolve_recurrence",
+        confidence=0.9,
+    )
+
+    bundled = ResponseBundler().bundle(
+        request=ChatRequest(user_id="matrix-user", raw_query="Update it"),
+        rewritten_query="Update it",
+        branch_result=BranchResult(
+            response_type=ResponseType.CLARIFICATION,
+            clarification_question=clarification,
+            human_supporting_questions=[supporting],
+            reminder_supporting_question=reminder,
+        ),
+    )
+
+    assert bundled.last_qa_state.clarification_question is clarification
+    assert bundled.last_qa_state.supporting_questions == []
+    assert bundled.last_qa_state.reminder_supporting_question is None
+    assert bundled.final_chat_text == (
+        "Clarification question: Which record should be updated?"
+    )
+    assert bundled.warnings == ["question_ownership_conflict_resolved"]
 
 
 class ScriptedPlatformLLM:
@@ -759,12 +911,14 @@ def test_platform_gmail_status_matrix(
         assert len(sender.draft_calls) == 1
     elif case == "needs_input":
         assert sender.send_calls == []
-        assert "Gmail username" in result["delivery"]["question"]
-        assert "Gmail app password" in result["delivery"]["question"]
+        assert "Gmail username" in result["delivery"]["notice"]
+        assert "Gmail app password" in result["delivery"]["notice"]
+        assert "question" not in result["delivery"]
     else:
         assert len(sender.send_calls) == 1
     if case in {"failure", "partial_failure"}:
-        assert result["delivery"]["question"]
+        assert result["delivery"]["notice"]
+        assert "question" not in result["delivery"]
     if case == "partial_failure":
         assert result["delivery"]["delivered_recipients"] == ["alex@example.com"]
         assert result["delivery"]["refused_recipients"] == ["pat@example.com"]

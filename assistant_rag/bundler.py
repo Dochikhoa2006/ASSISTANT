@@ -5,10 +5,56 @@ All branch outputs pass through this module before Chat Output.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from .contracts import BranchResult, BundledResponse, ChatRequest, GeneratedQuestion, LastQAState, ResponseType
 from .prompts import DEFAULT_PROMPT_REGISTRY, PromptRegistry
+
+
+def _exclusive_question_result(branch_result: BranchResult) -> BranchResult:
+    """Keep exactly one authoritative conversational question, if any."""
+
+    clarification = branch_result.clarification_question
+    reminder = branch_result.reminder_supporting_question
+    human = [
+        question
+        for question in branch_result.human_supporting_questions
+        if question.should_ask and question.text.strip()
+    ]
+    candidate_count = (
+        int(clarification is not None)
+        + int(reminder is not None)
+        + len(human)
+    )
+    if clarification is not None:
+        selected_clarification, selected_reminder, selected_human = (
+            clarification,
+            None,
+            [],
+        )
+    elif reminder is not None:
+        selected_clarification, selected_reminder, selected_human = (
+            None,
+            reminder,
+            [],
+        )
+    else:
+        selected_clarification = selected_reminder = None
+        selected_human = human[:1]
+    warnings = list(branch_result.warnings)
+    if (
+        candidate_count > 1
+        and "question_ownership_conflict_resolved" not in warnings
+    ):
+        warnings.append("question_ownership_conflict_resolved")
+    return replace(
+        branch_result,
+        clarification_question=selected_clarification,
+        human_supporting_questions=selected_human,
+        reminder_supporting_question=selected_reminder,
+        warnings=warnings,
+    )
 
 
 def _question_text(question: GeneratedQuestion | dict[str, Any] | str | Any) -> str:
@@ -38,6 +84,7 @@ def render_branch_result_text(
 ) -> str:
     """Render the canonical pre-platform text for persistence and bundling."""
 
+    branch_result = _exclusive_question_result(branch_result)
     parts: list[str] = []
     seen_parts: set[str] = set()
     operation_summaries = [
@@ -103,6 +150,7 @@ class ResponseBundler:
         rewritten_query: str,
         branch_result: BranchResult,
     ) -> BundledResponse:
+        branch_result = _exclusive_question_result(branch_result)
         final_text = render_branch_result_text(
             branch_result,
             self.prompt_registry,

@@ -13,7 +13,8 @@ from assistant_rag.chat_history import (
     last_qa_chat_history,
     select_chat_history,
 )
-from assistant_rag.classification import LastQAResolver
+from assistant_rag.classification import LLMLastQAResolver, LastQAResolver
+from assistant_rag.config import GeneralPurposeConfig, LastQAConfig
 from assistant_rag.contracts import (
     ApprovedConversationContext,
     BranchResult,
@@ -25,12 +26,18 @@ from assistant_rag.contracts import (
     LastQAPath,
     LastQAResolution,
     LastQAState,
+    OutboundFollowUpAction,
+    OutboundMessageState,
     QuestionSource,
+    PipelineContext,
     ResponseType,
     RetrievalResult,
 )
 from assistant_rag.llm import OllamaIntentClassifier
+from assistant_rag.generation import LLMGeneralHITLStrategy
 from assistant_rag.pipeline import AssistantPipeline
+from assistant_rag.platform import PlatformSelector
+from assistant_rag.prompts import DEFAULT_PROMPT_REGISTRY
 from assistant_rag.reminder_reply import build_reminder_state, reminder_state_hash
 
 
@@ -457,6 +464,135 @@ def test_pipeline_routes_each_intent_exactly_once(
     assert current_chat_history() == []
 
 
+def test_active_hitl_question_bypasses_platform_selector_completely() -> None:
+    state = _last_qa_state()
+    store = _Store(state)
+    question = GeneratedQuestion(
+        text="Which environment is required?",
+        source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+        purpose="resolve_required_context",
+        confidence=1.0,
+    )
+
+    class QuestionRouter:
+        def route(self, _context: Any, _repository: Any) -> BranchResult:
+            return BranchResult(
+                response_type=ResponseType.NORMAL,
+                normal_response_text="I need one required detail before continuing.",
+                human_supporting_questions=[question],
+            )
+
+    class ForbiddenPlatformSelector:
+        calls = 0
+
+        def select(self, _bundled: Any, _request: ChatRequest) -> dict[str, Any]:
+            self.calls += 1
+            raise AssertionError("PlatformSelector must be bypassed for active HITL")
+
+    selector = ForbiddenPlatformSelector()
+    pipeline = AssistantPipeline(
+        config=SimpleNamespace(
+            context_filter=SimpleNamespace(
+                conversation_retrieval_after_last_qa_enabled=True,
+                conversation_retrieval_before_intent_enabled=True,
+            )
+        ),
+        last_qa_store=store,
+        query_rewriter=SimpleNamespace(rewrite=lambda query: query),
+        last_qa_resolver=_Resolver(_resolution(state=state, skip=True)),
+        retriever=_Retriever([]),
+        context_filter=_ContextFilter(None),
+        classifier=_Classifier(Intent.GENERAL_RESPONSE),
+        router=QuestionRouter(),
+        bundler=ResponseBundler(),
+        platform_selector=selector,
+        chat_output=ChatOutput(),
+    )
+
+    response = pipeline.handle(
+        ChatRequest(user_id="user-1", raw_query="Continue the deployment plan"),
+        _Repository([]),
+    )
+
+    assert selector.calls == 0
+    assert response.platform_payload["platform_selection"]["source"] == (
+        "bypassed_active_branch_question"
+    )
+    assert response.platform_payload["delivery"] == {
+        "channel": "none",
+        "status": "deferred_by_active_question",
+    }
+    assert response.last_qa_state.supporting_questions == [question]
+    assert "Supporting question: Which environment is required?" in (
+        response.final_chat_text
+    )
+
+
+def test_supporting_answer_resumes_deferred_platform_request() -> None:
+    question = GeneratedQuestion(
+        text="Which recipient email address should receive the update?",
+        source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+        purpose="resolve_required_context",
+        confidence=1.0,
+    )
+    state = LastQAState(
+        last_user_query="Send an email about release readiness.",
+        last_response=(
+            "I need one required detail.\nSupporting question: "
+            "Which recipient email address should receive the update?"
+        ),
+        response_type=ResponseType.NORMAL,
+        supporting_questions=[question],
+        linked_topic_id="topic-email",
+        linked_hop_id="hop-email",
+    )
+    resolution = LastQAResolution(
+        path=LastQAPath.LATEST_CONTEXT_INTERACTION,
+        rewritten_query="alex@example.com",
+        state=state,
+        did_merge_query=False,
+        skip_broad_retrieval=True,
+        confidence=1.0,
+        interaction_type=LastQAInteractionType.SUPPORTING_QUESTION_ANSWER,
+        question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+        linked_topic_id="topic-email",
+        linked_hop_id="hop-email",
+        matched_question=question.text,
+        is_authoritative_state=True,
+    )
+    pipeline = AssistantPipeline(
+        config=SimpleNamespace(
+            context_filter=SimpleNamespace(
+                conversation_retrieval_after_last_qa_enabled=True,
+                conversation_retrieval_before_intent_enabled=True,
+            )
+        ),
+        last_qa_store=_Store(state),
+        query_rewriter=SimpleNamespace(rewrite=lambda query: query),
+        last_qa_resolver=_Resolver(resolution),
+        retriever=_Retriever([]),
+        context_filter=_ContextFilter(None),
+        classifier=_Classifier(Intent.GENERAL_RESPONSE),
+        router=_Router(ResponseType.NORMAL),
+        bundler=ResponseBundler(),
+        platform_selector=PlatformSelector(llm=None),
+        chat_output=ChatOutput(),
+    )
+
+    response = pipeline.handle(
+        ChatRequest(user_id="user-1", raw_query="alex@example.com"),
+        _Repository([]),
+    )
+
+    assert response.platform_payload["platform_selection"]["channel"] == "gmail"
+    assert response.platform_payload["draft"]["recipients"] == [
+        "alex@example.com"
+    ]
+    assert response.platform_payload["delivery"]["status"] == "needs_input"
+    assert "notice" in response.platform_payload["delivery"]
+    assert "question" not in response.platform_payload["delivery"]
+
+
 def test_pipeline_assigns_replied_reminder_state_to_output_last_qa() -> None:
     reminder_state = build_reminder_state(
         {
@@ -583,6 +719,170 @@ def test_deterministic_last_qa_resolver_no_state_requires_broad_retrieval() -> N
     assert resolution.is_authoritative_state is False
 
 
+def test_llm_last_qa_skips_model_when_no_active_question_can_authorize_skip() -> None:
+    llm = _LLMStub(error=AssertionError("Last-QA LLM must not run"))
+    resolver = LLMLastQAResolver(llm=llm, config=LastQAConfig())
+
+    resolution = resolver.resolve(
+        ChatRequest(user_id="user-1", raw_query="Prepare a PDF agenda."),
+        "Prepare a PDF agenda.",
+        _last_qa_state(),
+    )
+
+    assert resolution.path is LastQAPath.BROAD_RETRIEVAL_REQUIRED
+    assert resolution.skip_broad_retrieval is False
+    assert llm.calls == []
+
+
+def test_llm_last_qa_binds_minimal_question_index_to_exact_state_question() -> None:
+    question = GeneratedQuestion(
+        text="Which deployment environment should Atlas use?",
+        source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+        purpose="optional_context",
+        confidence=1.0,
+        expected_response_type=ExpectedResponseType.SELECTION_ANSWER,
+    )
+    state = _last_qa_state()
+    state.supporting_questions = [question]
+    llm = _LLMStub(
+        payload={"matched_question_index": 0, "confidence": 1.0}
+    )
+    resolver = LLMLastQAResolver(llm=llm, config=LastQAConfig())
+
+    resolution = resolver.resolve(
+        ChatRequest(user_id="user-1", raw_query="Production"),
+        "Production",
+        state,
+    )
+
+    assert resolution.path is LastQAPath.LATEST_CONTEXT_INTERACTION
+    assert resolution.skip_broad_retrieval is True
+    assert resolution.interaction_type is LastQAInteractionType.SUPPORTING_QUESTION_ANSWER
+    assert resolution.question_source is QuestionSource.HUMAN_SUPPORTING_QUESTION
+    assert resolution.matched_question == question.text
+    assert set(llm.calls[0]["schema"]["properties"]) == {
+        "matched_question_index",
+        "confidence",
+    }
+    assert "active_supporting_questions" in llm.calls[0]["user_prompt"]
+    assert question.text in llm.calls[0]["user_prompt"]
+
+
+@pytest.mark.parametrize(
+    ("model_action", "expected_action"),
+    (
+        ("send", OutboundFollowUpAction.SEND),
+        ("revise", OutboundFollowUpAction.REVISE),
+        ("revise_and_send", OutboundFollowUpAction.REVISE_AND_SEND),
+    ),
+)
+def test_llm_last_qa_binds_semantic_action_to_active_outbound_envelope(
+    model_action: str,
+    expected_action: OutboundFollowUpAction,
+) -> None:
+    outbound = OutboundMessageState(
+        channel="gmail",
+        status="draft_ready",
+        recipients=("alice@example.com", "bob@example.com"),
+        subject="Schedule notice",
+        body="I will be away tomorrow.",
+        artifact_ids=("artifact-1",),
+        attachment_filenames=("details.pdf",),
+        source_topic_id="topic-mail",
+        source_hop_id="hop-mail",
+    )
+    state = LastQAState(
+        last_user_query="Prepare a notice.",
+        last_response="The draft is ready.",
+        response_type=ResponseType.NORMAL,
+        linked_topic_id="topic-mail",
+        linked_hop_id="hop-mail",
+        outbound_state=outbound,
+    )
+    llm = _LLMStub(
+        payload={"outbound_action": model_action, "confidence": 0.99}
+    )
+
+    resolution = LLMLastQAResolver(
+        llm=llm,
+        config=LastQAConfig(),
+    ).resolve(
+        ChatRequest(user_id="user-1", raw_query="Continue with that message."),
+        "Continue with that message.",
+        state,
+    )
+
+    assert resolution.path is LastQAPath.LATEST_CONTEXT_INTERACTION
+    assert resolution.skip_broad_retrieval is True
+    assert resolution.state is state
+    assert resolution.interaction_type is LastQAInteractionType.OUTBOUND_MESSAGE_ACTION
+    assert resolution.outbound_action is expected_action
+    assert resolution.linked_hop_id == "hop-mail"
+    assert set(llm.calls[0]["schema"]["properties"]) == {
+        "outbound_action",
+        "confidence",
+    }
+    assert "active_outbound_state" in llm.calls[0]["user_prompt"]
+    assert "details.pdf" in llm.calls[0]["user_prompt"]
+
+
+def test_llm_last_qa_outbound_none_continues_to_broad_retrieval_without_question() -> None:
+    state = LastQAState(
+        last_user_query="Prepare a notice.",
+        last_response="The draft is ready.",
+        response_type=ResponseType.NORMAL,
+        outbound_state=OutboundMessageState(
+            channel="gmail",
+            status="draft_ready",
+            recipients=("alice@example.com",),
+            subject="Schedule notice",
+            body="I will be away tomorrow.",
+        ),
+    )
+    llm = _LLMStub(payload={"outbound_action": "none", "confidence": 0.99})
+
+    resolution = LLMLastQAResolver(
+        llm=llm,
+        config=LastQAConfig(),
+    ).resolve(
+        ChatRequest(user_id="user-1", raw_query="Explain database indexes."),
+        "Explain database indexes.",
+        state,
+    )
+
+    assert resolution.path is LastQAPath.BROAD_RETRIEVAL_REQUIRED
+    assert resolution.skip_broad_retrieval is False
+    assert resolution.state is None
+    assert resolution.interaction_type is None
+
+
+def test_authoritative_outbound_action_skips_optional_supporting_question_llm() -> None:
+    llm = _LLMStub(error=AssertionError("optional HITL LLM must not run"))
+    context = PipelineContext(
+        request=ChatRequest(user_id="user-1", raw_query="Proceed with the draft."),
+        rewritten_query="Proceed with the draft.",
+        last_qa_state=None,
+        conversation_results=[],
+        intent=Intent.GENERAL_RESPONSE,
+        last_qa_trace={
+            "interaction_type": LastQAInteractionType.OUTBOUND_MESSAGE_ACTION.value
+        },
+    )
+
+    decision = LLMGeneralHITLStrategy(
+        llm=llm,
+        prompt_registry=DEFAULT_PROMPT_REGISTRY,
+        config=GeneralPurposeConfig(hitl_supporting_question_enabled=True),
+    ).evaluate(
+        context=context,
+        response_text="The outbound action is handled by the platform stage.",
+        approved_conversation_history=[],
+        merged_supporting_detail="",
+    )
+
+    assert decision.should_ask is False
+    assert decision.confidence == 1.0
+    assert llm.calls == []
 def test_deterministic_last_qa_resolver_unresolved_clarification_is_not_reused() -> None:
     question = GeneratedQuestion(
         text="Which environment?",
@@ -757,24 +1057,21 @@ def test_deterministic_reminder_reply_rejects_tampered_state_hash() -> None:
 
 
 @pytest.mark.parametrize(
-    ("intent_value", "operation_kind", "query", "expected"),
+    ("intent_value", "query", "expected"),
     (
-        ("general_response", "none", "Explain the Atlas policy.", Intent.GENERAL_RESPONSE),
+        ("general_response", "Explain the Atlas policy.", Intent.GENERAL_RESPONSE),
         (
             "knowledge_facts",
-            "durable_knowledge",
             "Remember that Atlas uses PostgreSQL.",
             Intent.KNOWLEDGE_FACTS,
         ),
         (
             "reminder",
-            "reminder_lifecycle",
             "Remind me tomorrow at 9 AM to submit expenses.",
             Intent.REMINDER,
         ),
         (
             "clarification",
-            "clarification_reply",
             "The concise-report preference.",
             Intent.CLARIFICATION,
         ),
@@ -782,14 +1079,12 @@ def test_deterministic_reminder_reply_rejects_tampered_state_hash() -> None:
 )
 def test_production_intent_classifier_operation_routes(
     intent_value: str,
-    operation_kind: str,
     query: str,
     expected: Intent,
 ) -> None:
     llm = _LLMStub(
         payload={
             "intent": intent_value,
-            "operation_kind": operation_kind,
             "confidence": 1.0,
         }
     )
@@ -804,17 +1099,24 @@ def test_production_intent_classifier_operation_routes(
 
     assert result is expected
     assert len(llm.calls) == 1
+    schema = llm.calls[0]["schema"]
+    assert set(schema["properties"]) == {"intent", "confidence"}
+    assert schema["properties"]["intent"]["enum"] == [
+        "general_response",
+        "knowledge_facts",
+        "reminder",
+        "clarification",
+    ]
 
 
 @pytest.mark.parametrize(
     ("payload", "error", "resolution"),
     (
         (None, RuntimeError("model unavailable"), None),
-        ({"intent": "reminder", "operation_kind": "reminder_lifecycle"}, None, None),
+        ({"intent": "reminder"}, None, None),
         (
             {
                 "intent": "reminder",
-                "operation_kind": "reminder_lifecycle",
                 "confidence": 0.69,
             },
             None,
@@ -823,7 +1125,6 @@ def test_production_intent_classifier_operation_routes(
         (
             {
                 "intent": "clarification",
-                "operation_kind": "clarification_reply",
                 "confidence": 1.0,
             },
             None,

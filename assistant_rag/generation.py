@@ -7,8 +7,9 @@ import logging
 from typing import Any, Protocol
 
 from .config import GeneralPurposeConfig, QuestionGenerationConfig
-from .contracts import ContentComposerResult, GeneratedQuestion, HumanSupportingDecision, PipelineContext, QuestionSource, ExpectedResponseType
+from .contracts import ContentComposerResult, GeneratedQuestion, HumanSupportingDecision, LastQAInteractionType, PipelineContext, QuestionSource, ExpectedResponseType
 from .llm import LLMClient, LLMTask, is_structured_fallback
+from .platform import is_explicit_email_message_request
 from .prompts import PromptContext, PromptRegistry
 
 logger = logging.getLogger(__name__)
@@ -134,6 +135,13 @@ class LLMHumanInTheLoopStrategy:
     config: QuestionGenerationConfig
 
     def evaluate(self, context: PipelineContext, response_text: str, confidence: float) -> tuple[list[GeneratedQuestion], dict[str, Any] | None]:
+        if is_explicit_email_message_request(context.rewritten_query):
+            return [], {
+                "triggered": False,
+                "confidence": 1.0,
+                "question_count": 0,
+                "reason": "explicit_delivery_request_is_actionable",
+            }
         if confidence >= self.config.question_generation_confidence_threshold:
             return [], None
             
@@ -155,6 +163,11 @@ class LLMHumanInTheLoopStrategy:
                         extra={
                             "response_text": response_text,
                             "confidence": confidence,
+                            "task_type": "required_general_context_decision",
+                            "decision_rule": (
+                                "Include one question only when a required user-provided fact "
+                                "is missing and the current request cannot otherwise be fulfilled."
+                            ),
                         },
                     )
                 ),
@@ -169,7 +182,7 @@ class LLMHumanInTheLoopStrategy:
                     GeneratedQuestion(
                         text=str(q["question_text"]),
                         source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
-                        purpose="optional_context",
+                        purpose="resolve_required_context",
                         confidence=float(q.get("confidence", 1.0)),
                         should_ask=True,
                         expected_response_type=ExpectedResponseType(q.get("expected_response_type", ExpectedResponseType.UNKNOWN.value)),
@@ -182,7 +195,7 @@ class LLMHumanInTheLoopStrategy:
             return [], None
             
         hitl_result = {
-            "triggered": True,
+            "triggered": bool(questions),
             "confidence": confidence,
             "question_count": len(questions),
         }
@@ -210,8 +223,37 @@ class LLMGeneralHITLStrategy:
                 expected_response_type=ExpectedResponseType.UNKNOWN,
                 reason_summary="Disabled by config", risk_flags=()
             )
+
+        if (
+            context.last_qa_trace.get("interaction_type")
+            == LastQAInteractionType.OUTBOUND_MESSAGE_ACTION.value
+        ):
+            return HumanSupportingDecision(
+                should_ask=False,
+                question="",
+                confidence=1.0,
+                question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+                expected_response_type=ExpectedResponseType.UNKNOWN,
+                reason_summary=(
+                    "An authoritative outbound action needs no additional context question."
+                ),
+                risk_flags=(),
+            )
+
+        if is_explicit_email_message_request(context.rewritten_query):
+            return HumanSupportingDecision(
+                should_ask=False,
+                question="",
+                confidence=1.0,
+                question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+                expected_response_type=ExpectedResponseType.UNKNOWN,
+                reason_summary=(
+                    "The explicit delivery request already supplies an actionable recipient."
+                ),
+                risk_flags=(),
+            )
             
-        # General HITL is contractually limited to one optional question, so an
+        # General HITL is contractually limited to one required-context question, so an
         # array wrapper adds output tokens and invalid-shape opportunities.
         schema = _question_item_schema()
 
@@ -228,10 +270,13 @@ class LLMGeneralHITLStrategy:
                             "draft_response": response_text,
                             "approved_conversation_history": approved_conversation_history,
                             "merged_supporting_detail": merged_supporting_detail,
-                            "task_type": "general_supporting_question_decision",
+                            "task_type": "required_general_context_decision",
                             "decision_rule": (
-                                "Ask only when one specific next-turn answer would materially improve "
-                                "the drafted response. Otherwise set should_ask=false."
+                                "Ask only when the current request cannot be fulfilled because one "
+                                "required user-provided fact is missing. Never ask for delivery "
+                                "credentials, information already present, preferences that merely "
+                                "improve an already complete response, or a next-step suggestion. "
+                                "Otherwise set should_ask=false."
                             ),
                         },
                     )
@@ -277,7 +322,7 @@ class LLMGeneralHITLStrategy:
                     confidence=confidence,
                     question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
                     expected_response_type=expected_response_type,
-                    reason_summary="One useful follow-up question was selected.",
+                    reason_summary="One required missing-context question was selected.",
                     risk_flags=(),
                 )
         except Exception as e:

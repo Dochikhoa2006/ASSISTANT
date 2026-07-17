@@ -12,6 +12,7 @@ from assistant_rag.contracts import (
     ChatRequest,
     Intent,
     LastQAState,
+    OutboundMessageState,
     PipelineContext,
     ResponseType,
 )
@@ -188,6 +189,17 @@ def test_last_qa_disk_and_chat_history_round_trip_reminder_state(tmp_path: Any) 
         linked_hop_id="reply-hop-1",
         reminder_state=replied,
         reminder_state_hash=reminder_state_hash(replied),
+        outbound_state=OutboundMessageState(
+            channel="gmail",
+            status="draft_ready",
+            recipients=("alice@example.com", "bob@example.com"),
+            subject="Monthly report",
+            body="The monthly report is attached.",
+            artifact_ids=("artifact-1",),
+            attachment_filenames=("monthly-report.pdf",),
+            source_topic_id="topic-1",
+            source_hop_id="reply-hop-1",
+        ),
     )
     store = DiskCacheLastQAStore(str(tmp_path / "last-qa.sqlite3"), ttl_seconds=60)
 
@@ -197,10 +209,74 @@ def test_last_qa_disk_and_chat_history_round_trip_reminder_state(tmp_path: Any) 
     assert restored is not None
     assert restored.reminder_state == replied
     assert restored.reminder_state_hash == reminder_state_hash(replied)
+    assert restored.outbound_state == state.outbound_state
     history = last_qa_chat_history(restored)
     assert history[0]["reminder_state"]["title"] == "Submit report"
     projected = supporting_question_context(history)
     assert projected[0]["reminder_state"]["reply_kind"] == "notification_purpose_reply"
+
+
+def test_generated_artifact_is_bound_once_to_its_user_owned_hop(
+    repository: Any,
+    tmp_path: Any,
+) -> None:
+    with repository.transaction() as cursor:
+        topic_id = repository.ensure_topic(
+            cursor,
+            user_id=USER_ID,
+            title="Artifact binding",
+        )
+        first_hop = repository.append_conversation_hop(
+            cursor,
+            topic_id=topic_id,
+            user_id=USER_ID,
+            intent=Intent.GENERAL_RESPONSE.value,
+            raw_user_query="Create the report.",
+            rewritten_user_query="Create the report.",
+            raw_response="Created.",
+            response_type=ResponseType.NORMAL.value,
+            entities={},
+        )
+        second_hop = repository.append_conversation_hop(
+            cursor,
+            topic_id=topic_id,
+            user_id=USER_ID,
+            intent=Intent.GENERAL_RESPONSE.value,
+            raw_user_query="Another turn.",
+            rewritten_user_query="Another turn.",
+            raw_response="Done.",
+            response_type=ResponseType.NORMAL.value,
+            entities={},
+        )
+    path = tmp_path / "medical-details.pdf"
+    path.write_bytes(b"%PDF-1.4 binding")
+    artifact = repository.create_generated_artifact(
+        user_id=USER_ID,
+        conversation_hop_id=None,
+        file_type="pdf",
+        filename=path.name,
+        storage_path=str(path),
+        storage_url=f"/artifacts/{path.name}",
+    )
+
+    bound = repository.bind_generated_artifacts(
+        user_id=USER_ID,
+        artifact_ids=[artifact["artifact_id"], artifact["artifact_id"]],
+        conversation_hop_id=first_hop.hop_id,
+    )
+    refused_rebind = repository.bind_generated_artifacts(
+        user_id=USER_ID,
+        artifact_ids=[artifact["artifact_id"]],
+        conversation_hop_id=second_hop.hop_id,
+    )
+
+    restored = repository.get_generated_artifact(
+        user_id=USER_ID,
+        artifact_id=artifact["artifact_id"],
+    )
+    assert bound == [artifact["artifact_id"]]
+    assert refused_rebind == []
+    assert restored["conversation_hop_id"] == first_hop.hop_id
 
 
 class _WritingBranch:

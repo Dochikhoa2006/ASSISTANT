@@ -16,6 +16,7 @@ from .contracts import (
     LastQAPath,
     LastQAResolution,
     LastQAState,
+    OutboundMessageState,
     RetrievalResult,
 )
 from .last_qa import InMemoryLastQAStore
@@ -48,6 +49,207 @@ def _branch_outbox_job_ids(branch_result: Any) -> list[str]:
             for job_id in [*values, fallback]
             if job_id
         )
+    )
+
+
+def _artifact_records(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        values = [payload]
+    elif isinstance(payload, (list, tuple)):
+        values = list(payload)
+    else:
+        values = []
+    return [dict(value) for value in values if isinstance(value, dict)]
+
+
+def _artifact_ids(payload: Any) -> list[str]:
+    return list(
+        dict.fromkeys(
+            str(item.get("artifact_id") or "")
+            for item in _artifact_records(payload)
+            if item.get("artifact_id")
+        )
+    )
+
+
+def _has_active_branch_question(response: BundledResponse) -> bool:
+    state = response.last_qa_state
+    return bool(
+        state.clarification_question
+        or state.reminder_supporting_question
+        or any(
+            question.should_ask and question.text.strip()
+            for question in state.supporting_questions
+        )
+    )
+
+
+def _platform_deferred_for_branch_question(
+    response: BundledResponse,
+) -> dict[str, Any]:
+    payload = dict(response.platform_payload)
+    payload.update(
+        {
+            "text": response.final_chat_text,
+            "platform_selection": {
+                "channel": "none",
+                "confidence": 1.0,
+                "source": "bypassed_active_branch_question",
+            },
+            "delivery": {
+                "channel": "none",
+                "status": "deferred_by_active_question",
+            },
+        }
+    )
+    return payload
+
+
+def _notice_only_platform_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Prevent platform integrations from becoming a second question owner."""
+
+    normalized = dict(payload)
+    delivery = normalized.get("delivery")
+    if not isinstance(delivery, dict):
+        return normalized
+    delivery = dict(delivery)
+    legacy_question = delivery.pop("question", None)
+    if legacy_question and not delivery.get("notice"):
+        delivery["notice"] = (
+            "Platform delivery could not continue with the currently available "
+            "chatbot delivery configuration."
+        )
+    normalized["delivery"] = delivery
+    return normalized
+
+
+def _platform_response_for_supporting_answer(
+    response: BundledResponse,
+    resolution: LastQAResolution,
+) -> BundledResponse:
+    """Carry an approved missing-context answer into platform action parsing.
+
+    The Last-QA resolver must first bind the current turn to exactly one active
+    question. Only then may the platform stage combine the two rewritten turns;
+    neither raw ingress text nor unrelated retrieved history is admitted.
+    """
+
+    state = resolution.state
+    if not (
+        resolution.interaction_type
+        is LastQAInteractionType.SUPPORTING_QUESTION_ANSWER
+        and resolution.is_authoritative_state
+        and state is not None
+    ):
+        return response
+    prior_query = state.last_user_query.strip()
+    current_answer = response.last_qa_state.last_user_query.strip()
+    if not prior_query or not current_answer:
+        return response
+    platform_action_query = (
+        f"{prior_query}\nResolved required context: {current_answer}"
+    )
+    return replace(
+        response,
+        last_qa_state=replace(
+            response.last_qa_state,
+            last_user_query=platform_action_query,
+        ),
+    )
+
+
+def _rehydrate_outbound_artifacts(
+    *,
+    repository: AssistantRepository,
+    user_id: str,
+    outbound_state: OutboundMessageState | None,
+    current_artifacts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    by_id = {
+        str(item.get("artifact_id") or ""): item
+        for item in current_artifacts
+        if item.get("artifact_id")
+    }
+    getter = getattr(repository, "get_generated_artifact", None)
+    if outbound_state is not None and callable(getter):
+        for artifact_id in outbound_state.artifact_ids:
+            if artifact_id in by_id:
+                continue
+            try:
+                row = getter(user_id=user_id, artifact_id=artifact_id)
+            except Exception:
+                continue
+            if isinstance(row, dict):
+                by_id[artifact_id] = dict(row)
+    return list(by_id.values())
+
+
+def _outbound_state_from_platform(
+    *,
+    platform_payload: dict[str, Any],
+    previous_state: OutboundMessageState | None,
+    source_topic_id: str | None,
+    source_hop_id: str | None,
+) -> OutboundMessageState | None:
+    delivery = platform_payload.get("delivery")
+    delivery = delivery if isinstance(delivery, dict) else {}
+    status = str(delivery.get("status") or "")
+    if status == "sent":
+        return None
+    if status == "not_requested" or delivery.get("channel") in (None, "none"):
+        return previous_state
+
+    draft = platform_payload.get("draft")
+    if not isinstance(draft, dict):
+        return previous_state
+    channel = str(delivery.get("channel") or draft.get("channel") or "").strip()
+    recipients_value = draft.get("recipients")
+    recipients = [
+        str(value).strip()
+        for value in (
+            recipients_value if isinstance(recipients_value, (list, tuple)) else []
+        )
+        if str(value).strip()
+    ]
+    if status == "partial_failure":
+        refused = delivery.get("refused_recipients")
+        refused_recipients = [
+            str(value).strip()
+            for value in (refused if isinstance(refused, (list, tuple)) else [])
+            if str(value).strip()
+        ]
+        if refused_recipients:
+            recipients = refused_recipients
+    subject = str(draft.get("subject") or "").strip()
+    body = str(draft.get("body") or "").strip()
+    if not channel or not recipients or not subject or not body:
+        return previous_state
+
+    attachments = _artifact_records(draft.get("attachments"))
+    artifact_ids = tuple(
+        dict.fromkeys(
+            str(item.get("artifact_id") or "")
+            for item in attachments
+            if item.get("artifact_id")
+        )
+    )
+    filenames_by_id = {
+        str(item.get("artifact_id") or ""): str(item.get("filename") or "")
+        for item in attachments
+        if item.get("artifact_id")
+    }
+    return OutboundMessageState(
+        channel=channel,
+        status=status,
+        recipients=tuple(recipients),
+        subject=subject,
+        body=body,
+        artifact_ids=artifact_ids,
+        attachment_filenames=tuple(
+            filenames_by_id.get(artifact_id, "") for artifact_id in artifact_ids
+        ),
+        source_topic_id=source_topic_id,
+        source_hop_id=source_hop_id,
     )
 
 @dataclass
@@ -320,12 +522,76 @@ class AssistantPipeline:
                         reminder_state_hash=reminder_state_hash(replied_state),
                     ),
                 )
-        with StageTimer("platform_selector"):
-            platform_payload = self.platform_selector.select(bundled, request)
+        current_artifacts = _artifact_records(
+            bundled.platform_payload.get("artifacts")
+        )
+        new_artifact_ids = _artifact_ids(current_artifacts)
+        binder = getattr(repository, "bind_generated_artifacts", None)
+        if new_artifact_ids and bundled.conversation_hop_id and callable(binder):
+            with StageTimer(
+                "artifact_hop_binding",
+                {"artifact_count": len(new_artifact_ids)},
+            ):
+                try:
+                    binder(
+                        user_id=request.user_id,
+                        artifact_ids=new_artifact_ids,
+                        conversation_hop_id=bundled.conversation_hop_id,
+                    )
+                except Exception:
+                    # Same-turn downloads/delivery still use the validated
+                    # in-memory artifact records. A binding failure must not
+                    # discard a successfully generated file or response.
+                    GLOBAL_METRICS.increment("artifact_hop_binding_failures_total")
+
+        active_outbound = (
+            resolution.state.outbound_state
+            if resolution.state is not None
+            and resolution.interaction_type
+            is LastQAInteractionType.OUTBOUND_MESSAGE_ACTION
+            else None
+        )
+        available_artifacts = _rehydrate_outbound_artifacts(
+            repository=repository,
+            user_id=request.user_id,
+            outbound_state=active_outbound,
+            current_artifacts=current_artifacts,
+        )
+        active_branch_question = _has_active_branch_question(bundled)
+        platform_response = _platform_response_for_supporting_answer(
+            bundled,
+            resolution,
+        )
+        with StageTimer(
+            "platform_selector",
+            {"bypassed_for_active_question": active_branch_question},
+        ):
+            contextual_selector = getattr(
+                self.platform_selector,
+                "select_with_outbound_context",
+                None,
+            )
+            if active_branch_question:
+                platform_payload = _platform_deferred_for_branch_question(bundled)
+            elif callable(contextual_selector):
+                platform_payload = contextual_selector(
+                    platform_response,
+                    request,
+                    outbound_state=active_outbound,
+                    outbound_action=resolution.outbound_action,
+                    available_artifacts=available_artifacts,
+                    new_artifact_ids=new_artifact_ids,
+                )
+            else:
+                platform_payload = self.platform_selector.select(platform_response, request)
+        platform_payload = _notice_only_platform_payload(platform_payload)
         with StageTimer("response_finalize"):
             delivery = platform_payload.get("delivery", {})
             if delivery.get("status") in {"needs_input", "pending_review", "failed", "partial_failure"}:
-                final_chat_text = str(delivery.get("question") or bundled.final_chat_text)
+                final_chat_text = str(
+                    delivery.get("notice")
+                    or bundled.final_chat_text
+                )
             elif delivery.get("status") == "sent":
                 final_chat_text = f"Sent via {delivery.get('provider', delivery.get('channel', 'platform')).title()} to {delivery.get('recipient', 'the recipient')}."
             elif delivery.get("status") == "draft_ready":
@@ -341,10 +607,25 @@ class AssistantPipeline:
                 )
             else:
                 final_chat_text = bundled.final_chat_text
+        previous_outbound_state = (
+            previous_last_qa_state.outbound_state
+            if previous_last_qa_state is not None
+            else None
+        )
+        outbound_state = _outbound_state_from_platform(
+            platform_payload=platform_payload,
+            previous_state=previous_outbound_state,
+            source_topic_id=bundled.conversation_topic_id,
+            source_hop_id=bundled.conversation_hop_id,
+        )
         bundled = replace(
             bundled,
             final_chat_text=final_chat_text,
-            last_qa_state=replace(bundled.last_qa_state, last_response=final_chat_text),
+            last_qa_state=replace(
+                bundled.last_qa_state,
+                last_response=final_chat_text,
+                outbound_state=outbound_state,
+            ),
             platform_payload=platform_payload,
         )
         # Record delivery metadata separately from the conversation answer. The
@@ -360,7 +641,7 @@ class AssistantPipeline:
                         status=str(delivery.get("status", "unknown")),
                         recipient=str(delivery.get("recipient") or bundled.platform_payload.get("draft", {}).get("recipient") or ""),
                         message=bundled.platform_payload.get("draft", {}),
-                        error_message=str(delivery.get("question") or "") if delivery.get("status") in {"failed", "partial_failure", "needs_input"} else None,
+                        error_message=str(delivery.get("notice") or "") if delivery.get("status") in {"failed", "partial_failure", "needs_input"} else None,
                     )
                 except Exception:
                     # Delivery history must not hide a completed send or response.

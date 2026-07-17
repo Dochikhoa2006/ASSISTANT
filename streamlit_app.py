@@ -838,6 +838,8 @@ def main() -> None:
         delivery = platform_payload.get("delivery", {})
         if delivery.get("channel") not in (None, "none"):
             st.caption(f"Delivery: {delivery.get('channel')} — {delivery.get('status')}")
+            if delivery.get("notice"):
+                st.info(str(delivery["notice"]))
             message = platform_payload.get("draft", {})
             if message:
                 with st.expander(

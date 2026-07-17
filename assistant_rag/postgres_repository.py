@@ -1175,6 +1175,57 @@ class PostgresRepository(AssistantRepository):
             raise ValueError("Artifact not found for user")
         return payload
 
+    def bind_generated_artifacts(
+        self,
+        *,
+        user_id: str,
+        artifact_ids: list[str],
+        conversation_hop_id: str,
+    ) -> list[str]:
+        unique_ids = list(dict.fromkeys(str(value) for value in artifact_ids if value))
+        if not unique_ids or not conversation_hop_id:
+            return []
+        with self.transaction() as cursor:
+            owner = cursor.execute(
+                select(conversation_hops.c.hop_id).where(
+                    and_(
+                        conversation_hops.c.user_id == user_id,
+                        conversation_hops.c.hop_id == conversation_hop_id,
+                    )
+                )
+            ).fetchone()
+            if not owner:
+                raise ValueError("Conversation hop not found for user")
+            cursor.execute(
+                update(generated_artifacts)
+                .where(
+                    and_(
+                        generated_artifacts.c.user_id == user_id,
+                        generated_artifacts.c.artifact_id.in_(unique_ids),
+                        generated_artifacts.c.status == ArtifactStatus.CREATED.value,
+                        or_(
+                            generated_artifacts.c.conversation_hop_id.is_(None),
+                            generated_artifacts.c.conversation_hop_id
+                            == conversation_hop_id,
+                        ),
+                    )
+                )
+                .values(conversation_hop_id=conversation_hop_id)
+            )
+            rows = cursor.execute(
+                select(generated_artifacts.c.artifact_id).where(
+                    and_(
+                        generated_artifacts.c.user_id == user_id,
+                        generated_artifacts.c.artifact_id.in_(unique_ids),
+                        generated_artifacts.c.conversation_hop_id
+                        == conversation_hop_id,
+                        generated_artifacts.c.status == ArtifactStatus.CREATED.value,
+                    )
+                )
+            ).fetchall()
+        bound = {str(row[0]) for row in rows}
+        return [artifact_id for artifact_id in unique_ids if artifact_id in bound]
+
     def delete_generated_artifact(self, *, user_id: str, artifact_id: str) -> dict[str, Any]:
         with self.transaction() as cursor:
             result = cursor.execute(

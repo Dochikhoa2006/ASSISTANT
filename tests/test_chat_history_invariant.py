@@ -170,6 +170,7 @@ def test_every_registry_prompt_preserves_complete_or_explicitly_empty_history() 
         if template_name in {
             "query_rewrite",
             "last_qa",
+            "outbound_follow_up",
             "clarification_merge",
             "knowledge_action_validation",
             "reminder_action_validation",
