@@ -187,13 +187,13 @@ def _assert_valid_artifact(path: Path, file_type: str) -> None:
         ),
     ),
 )
-def test_real_artifact_matrix_skips_unrequested_prose_and_materializes_one_valid_file(
+def test_real_artifact_matrix_runs_answer_then_materializes_one_valid_file(
     tmp_path: Path,
     query: str,
     expected_tool: str,
     file_type: str,
 ) -> None:
-    answer_text = "I cannot create the requested file."
+    answer_text = "I will provide the requested file with a concise handoff."
     llm = RecordingComposerLLM(
         answer_text=answer_text,
         file_plan="Title\nOwner,Forecast,Actual\nOperations,100,90",
@@ -202,10 +202,10 @@ def test_real_artifact_matrix_skips_unrequested_prose_and_materializes_one_valid
 
     result = composer.compose(_composer_input(query, repository), config)
 
-    assert [call["task"] for call in llm.calls] == [LLMTask.WRITING]
-    assert result.used_tool_names == (expected_tool,)
-    assert result.final_response_text.startswith("Created ")
-    assert answer_text not in result.final_response_text
+    assert [call["task"] for call in llm.calls] == [LLMTask.ANSWER, LLMTask.WRITING]
+    assert result.used_tool_names == ("answer_generation", expected_tool)
+    assert result.final_response_text.startswith(answer_text)
+    assert "\n\nCreated " in result.final_response_text
     assert len(result.artifacts) == 1
 
     artifact = result.artifacts[0]

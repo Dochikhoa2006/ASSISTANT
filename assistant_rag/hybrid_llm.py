@@ -8,8 +8,10 @@ from .llm import (
     LLMTask,
     OllamaLLMClient,
     is_structured_fallback,
+    llm_trace_stage_name_for_prompt,
     uses_onnx_runtime,
 )
+from .observability import StageTimer
 from .onnx_llm import ONNXLLMClient
 
 logger = logging.getLogger(__name__)
@@ -114,30 +116,35 @@ class HybridLLMClient:
         )
 
     def chat(self, *, task: LLMTask, system_prompt: str, user_prompt: str) -> str:
-        model_name = self.ollama_client.router.model_for_task(task)
-        if uses_onnx_runtime(model_name):
-            try:
-                return self.onnx_client.chat(
-                    task=task,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                )
-            except Exception:
-                fallback_model = self.ollama_client._fallback_model_for_task(task)
-                if not fallback_model or fallback_model == model_name or uses_onnx_runtime(fallback_model):
-                    raise
-                response = self.ollama_client._chat_raw(
-                    task=task,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    format_schema=None,
-                    model_override=fallback_model,
-                    fallback_for=model_name,
-                )
-                self.onnx_client.last_error_by_task.pop(task, None)
-                return response
-        return self.ollama_client.chat(
-            task=task,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt
-        )
+        # Record one logical generation stage around engine selection and any
+        # cross-engine recovery. Engine-local timers become nested operations,
+        # while an early ONNX model-resolution failure and its Ollama fallback
+        # remain attributed to the mandatory answer/Microsoft-writing stage.
+        with StageTimer(llm_trace_stage_name_for_prompt(task, user_prompt)):
+            model_name = self.ollama_client.router.model_for_task(task)
+            if uses_onnx_runtime(model_name):
+                try:
+                    return self.onnx_client.chat(
+                        task=task,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                    )
+                except Exception:
+                    fallback_model = self.ollama_client._fallback_model_for_task(task)
+                    if not fallback_model or fallback_model == model_name or uses_onnx_runtime(fallback_model):
+                        raise
+                    response = self.ollama_client._chat_raw(
+                        task=task,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        format_schema=None,
+                        model_override=fallback_model,
+                        fallback_for=model_name,
+                    )
+                    self.onnx_client.last_error_by_task.pop(task, None)
+                    return response
+            return self.ollama_client.chat(
+                task=task,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt
+            )

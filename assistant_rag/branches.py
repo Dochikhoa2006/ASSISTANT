@@ -61,7 +61,7 @@ from .prompts import DEFAULT_PROMPT_REGISTRY, PromptContext, PromptRegistry
 from .retrieval import HybridRetriever
 from .canonical_retrieval import retrieve_knowledge
 from .reminder_retrieval import retrieve_reminder_candidates, reminder_candidate_to_context
-from .context_filter import ContextFilter
+from .context_filter import ApprovedContext, ContextFilter
 from .action_detection import (
     ActionDetector,
 )
@@ -231,66 +231,130 @@ class GeneralResponseBranch:
     general_hitl_strategy: Any | None = None
     general_purpose_config: Any | None = None
 
-    def execute(self, context: PipelineContext, repository: AssistantRepository) -> BranchResult:
-        knowledge_results = retrieve_knowledge(
-            retriever=self.retriever,
-            repository=repository,
-            user_id=context.request.user_id,
-            query=context.rewritten_query,
+    def __post_init__(self) -> None:
+        composer_path_available = (
+            self.content_composer is not None
+            and self.general_purpose_config is not None
         )
-
-        reminder_raw = [
-            reminder_candidate_to_context(
-                user_id=context.request.user_id,
-                candidate=candidate,
+        if not composer_path_available and self.llm is None:
+            raise ValueError(
+                "GeneralResponseBranch requires either a configured content composer "
+                "or an answer LLM; general-purpose responses may not bypass answer "
+                "generation."
             )
-            for candidate in retrieve_reminder_candidates(
+
+    def execute(self, context: PipelineContext, repository: AssistantRepository) -> BranchResult:
+        general_warnings: list[str] = []
+        try:
+            knowledge_results = retrieve_knowledge(
+                retriever=self.retriever,
                 repository=repository,
                 user_id=context.request.user_id,
-                statuses=self.config.retrieval.general_response_reminder_statuses,
-                candidate_limit=self.config.retrieval.general_response_reminder_limit,
+                query=context.rewritten_query,
             )
-        ]
+        except Exception as exc:
+            knowledge_results = []
+            general_warnings.append(
+                f"general_knowledge_retrieval_unavailable:{type(exc).__name__}"
+            )
+        try:
+            reminder_raw = [
+                reminder_candidate_to_context(
+                    user_id=context.request.user_id,
+                    candidate=candidate,
+                )
+                for candidate in retrieve_reminder_candidates(
+                    repository=repository,
+                    user_id=context.request.user_id,
+                    statuses=self.config.retrieval.general_response_reminder_statuses,
+                    candidate_limit=self.config.retrieval.general_response_reminder_limit,
+                )
+            ]
+        except Exception as exc:
+            reminder_raw = []
+            general_warnings.append(
+                f"general_reminder_retrieval_unavailable:{type(exc).__name__}"
+            )
 
-        approved_context = self.context_filter.filter(
-            user_id=context.request.user_id,
-            knowledge_results=knowledge_results,
-            reminder_results=reminder_raw,
-            conversation_results=[],
-            query=context.rewritten_query,
-            intent=context.intent,
-        )
+        try:
+            approved_context = self.context_filter.filter(
+                user_id=context.request.user_id,
+                knowledge_results=knowledge_results,
+                reminder_results=reminder_raw,
+                conversation_results=[],
+                query=context.rewritten_query,
+                intent=context.intent,
+            )
+        except Exception as exc:
+            approved_context = ApprovedContext(
+                knowledge_evidence=[],
+                reminder_context=[],
+                approved_conversation_history=[],
+                rejected_knowledge_ids=[],
+                rejected_reminder_ids=[],
+                rejected_conversation_ids=[],
+            )
+            general_warnings.append(
+                f"general_context_filter_unavailable:{type(exc).__name__}"
+            )
         approved_context = replace(
             approved_context,
             approved_conversation_history=list(context.chat_history),
         )
-        merged_supporting_detail = self._merge_supporting_detail(approved_context)
+        try:
+            merged_supporting_detail = self._merge_supporting_detail(approved_context)
+        except Exception as exc:
+            merged_supporting_detail = (
+                '{"knowledge_evidence":[],"reminder_context":[]}'
+            )
+            general_warnings.append(
+                f"general_supporting_context_unavailable:{type(exc).__name__}"
+            )
 
         from .general_sub_branch import GeneralSubBranchValidator, GeneralPersistencePlanBuilder
-        
-        if self.general_purpose_config:
-            if self.sub_branch_detector:
-                decision = self.sub_branch_detector.detect(
+
+        decision = None
+        plan = None
+        if self.general_purpose_config is not None:
+            try:
+                if self.sub_branch_detector is not None:
+                    decision = self.sub_branch_detector.detect(
+                        context,
+                        self.general_purpose_config,
+                        merged_supporting_detail,
+                    )
+                else:
+                    decision = GeneralSubBranchDecision(
+                        sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
+                        confidence=1.0,
+                        persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
+                        reason_summary=(
+                            "Deterministic rule fired: NEW_CONVERSATION_TOPIC "
+                            "because no detector is configured."
+                        ),
+                    )
+                decision = GeneralSubBranchValidator().validate(
+                    decision,
                     context,
                     self.general_purpose_config,
-                    merged_supporting_detail,
                 )
-            else:
-                decision = GeneralSubBranchDecision(
-                    sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
-                    confidence=1.0,
-                    persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
-                    reason_summary=(
-                        "Deterministic rule fired: NEW_CONVERSATION_TOPIC "
-                        "because no detector is configured."
-                    ),
+                plan = GeneralPersistencePlanBuilder().build_plan(
+                    decision,
+                    context,
+                    self.general_purpose_config,
                 )
-            decision = GeneralSubBranchValidator().validate(decision, context, self.general_purpose_config)
-            plan = GeneralPersistencePlanBuilder().build_plan(decision, context, self.general_purpose_config)
-            answer_mode = self._general_sub_branch_to_answer_mode(decision.sub_branch)
+            except Exception as exc:
+                decision = None
+                plan = None
+                general_warnings.append(
+                    f"general_sub_branch_unavailable:{type(exc).__name__}"
+                )
+            answer_mode = (
+                self._general_sub_branch_to_answer_mode(decision.sub_branch)
+                if decision is not None
+                else self._detect_answer_mode(context, approved_context)
+            )
         else:
-            decision = None
-            plan = None
             answer_mode = self._detect_answer_mode(context, approved_context)
             
         resolved_sub_branch = decision.sub_branch if decision else GeneralSubBranch.NEW_CONVERSATION_TOPIC
@@ -326,7 +390,10 @@ class GeneralResponseBranch:
             expected_response_type=prompt_ctx.expected_response_type.value,
         ) + "\nRetrieved supporting detail:\n" + merged_supporting_detail
 
-        if self.content_composer and self.general_purpose_config:
+        if (
+            self.content_composer is not None
+            and self.general_purpose_config is not None
+        ):
             composer_input = ContentComposerInput(
                 user_id=context.request.user_id,
                 raw_user_query=context.rewritten_query,
@@ -350,15 +417,25 @@ class GeneralResponseBranch:
             response = composer_result.final_response_text
         else:
             composer_result = None
-            response = context.request.metadata.get("normal_response_text")
-            if not response:
-                response = self._generate_response(
-                    context,
-                    approved_context,
-                    prompt_ctx,
-                    sub_branch_supporting_prompt,
-                    merged_supporting_detail,
-                )
+            response = self._generate_response(
+                context,
+                approved_context,
+                prompt_ctx,
+                sub_branch_supporting_prompt,
+                merged_supporting_detail,
+            )
+        response_warnings = list(
+            dict.fromkeys(
+                [
+                    *general_warnings,
+                    *(
+                        composer_result.content_warnings
+                        if composer_result is not None
+                        else ()
+                    ),
+                ]
+            )
+        )
 
         completed_explicit_request_reason = ""
         if is_explicit_email_message_request(context.rewritten_query):
@@ -445,7 +522,7 @@ class GeneralResponseBranch:
             return BranchResult(
                 response_type=ResponseType.ERROR,
                 fallback_or_error_message="The database transaction failed and was rolled back.",
-                warnings=list(composer_result.content_warnings) if composer_result else [],
+                warnings=response_warnings,
                 # File creation completed before conversation persistence. Keep
                 # every successful artifact visible in the chatbot even when
                 # the hop transaction fails; platform delivery is blocked for
@@ -462,7 +539,7 @@ class GeneralResponseBranch:
             human_in_the_loop_result=hitl_result,
             linked_topic_id=hop.topic_id,
             linked_hop_id=hop.hop_id,
-            warnings=list(composer_result.content_warnings) if composer_result else [],
+            warnings=response_warnings,
             database_write_result={"conversation_hop_id": hop.hop_id},
             indexing_job_result={
                 "conversation_hop_job_id": hop.outbox_job_id,

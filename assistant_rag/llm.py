@@ -64,7 +64,12 @@ class LLMTask(str, Enum):
     ACTION_PLANNING = "action_planning"
 
 
-def llm_trace_stage_name(task: LLMTask, *, engine: str | None = None) -> str:
+def llm_trace_stage_name(
+    task: LLMTask,
+    *,
+    engine: str | None = None,
+    pipeline_stage: str | None = None,
+) -> str:
     """Return the stable trace label for an LLM task.
 
     Answer generation historically appeared as ``llm_answer`` (and
@@ -75,6 +80,11 @@ def llm_trace_stage_name(task: LLMTask, *, engine: str | None = None) -> str:
 
     if task is LLMTask.ANSWER:
         return "llm_answer_generation"
+    if (
+        task is LLMTask.WRITING
+        and str(pipeline_stage or "").strip() == "content_tool_answer_generation"
+    ):
+        return "llm_writing_microsoft_tool"
     suffix = f"_{engine}" if engine else ""
     return f"llm_{task.value}{suffix}"
 
@@ -205,7 +215,7 @@ class OllamaLLMClient:
         model_override: str | None = None,
         fallback_for: str | None = None,
     ) -> dict[str, Any]:
-        with StageTimer(llm_trace_stage_name(task)):
+        with StageTimer(llm_trace_stage_name_for_prompt(task, user_prompt)):
             last_error: Exception | None = None
             retry_count = getattr(self.settings, f"json_retry_count_{task.value}", self.settings.structured_retry_count)
             attempt_errors: list[str] = []
@@ -282,7 +292,7 @@ class OllamaLLMClient:
             return payload
 
     def chat(self, *, task: LLMTask, system_prompt: str, user_prompt: str) -> str:
-        with StageTimer(llm_trace_stage_name(task)):
+        with StageTimer(llm_trace_stage_name_for_prompt(task, user_prompt)):
             try:
                 response = self._chat_raw(
                     task=task,
@@ -369,10 +379,14 @@ class OllamaLLMClient:
         if attempt_index is not None and total_attempts is not None:
             mode_text = f", mode: {attempt_mode}" if attempt_mode else ""
             attempt_suffix = f", attempt: {attempt_index}/{total_attempts}{mode_text}"
+        log_task_name = llm_trace_stage_name_for_prompt(
+            task,
+            user_prompt,
+        ).removeprefix("llm_")
         if fallback_for:
-            print(f"LLM used: {model} (task: {task.value}, fallback_for: {fallback_for}{attempt_suffix})")
+            print(f"LLM used: {model} (task: {log_task_name}, fallback_for: {fallback_for}{attempt_suffix})")
         else:
-            print(f"LLM used: {model} (task: {task.value}{attempt_suffix})")
+            print(f"LLM used: {model} (task: {log_task_name}{attempt_suffix})")
         body: dict[str, Any] = {
             "model": model,
             "messages": [
@@ -880,6 +894,21 @@ def _prompt_context_payload(user_prompt: str) -> dict[str, Any]:
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def llm_trace_stage_name_for_prompt(
+    task: LLMTask,
+    user_prompt: str,
+    *,
+    engine: str | None = None,
+) -> str:
+    """Resolve a stable task label using only the declared prompt stage."""
+    pipeline_stage = _prompt_context_payload(user_prompt).get("stage")
+    return llm_trace_stage_name(
+        task,
+        engine=engine,
+        pipeline_stage=str(pipeline_stage or ""),
+    )
 
 
 def _first_enum(schema: dict[str, Any], key: str) -> str | None:

@@ -10,10 +10,16 @@ from typing import Any, Iterator
 import pytest
 
 import assistant_rag.branches as branches_module
+import assistant_rag.content_composer as content_composer_module
 from assistant_rag.branches import GeneralResponseBranch
 from assistant_rag.bundler import ResponseBundler
 from assistant_rag.config import GeneralPurposeConfig
-from assistant_rag.content_composer import ContentToolRegistry, DeterministicContentComposer
+from assistant_rag.content_composer import (
+    AnswerGenerationTool,
+    ContentToolRegistry,
+    DeterministicContentComposer,
+    GenerateExcelTool,
+)
 from assistant_rag.context_filter import ApprovedContext
 from assistant_rag.contracts import (
     ApprovedConversationContext,
@@ -39,6 +45,8 @@ from assistant_rag.contracts import (
     SubBranchPromptContext,
 )
 from assistant_rag.platform import PlatformSelector
+from assistant_rag.llm import LLMTask
+from assistant_rag.prompts import DEFAULT_PROMPT_REGISTRY
 
 
 _FILE_TOOLS = ("generate_pdf", "generate_excel", "generate_pptx")
@@ -142,14 +150,12 @@ def test_content_composer_sub_branch_and_file_outcome_cross_product(
     result = composer.compose(_composer_input(query, sub_branch), config)
 
     expected_tools = (
-        (expected_file_tool,)
+        ("answer_generation", expected_file_tool)
         if expected_file_tool is not None
         else ("answer_generation",)
     )
     assert result.used_tool_names == expected_tools
-    assert len(tools["answer_generation"].calls) == (
-        0 if expected_file_tool is not None else 1
-    )
+    assert len(tools["answer_generation"].calls) == 1
     assert sum(len(tools[name].calls) for name in _FILE_TOOLS) <= 1
     assert all(
         item.sub_branch is sub_branch
@@ -345,6 +351,244 @@ def _branch_case(
         ),
     )
     return context, decision, topic_id, hop_id, expected_ensure_calls
+
+
+def test_general_branch_rejects_composer_without_its_required_config() -> None:
+    with pytest.raises(ValueError, match="configured content composer or an answer LLM"):
+        GeneralResponseBranch(
+            retriever=object(),
+            config=SimpleNamespace(),  # type: ignore[arg-type]
+            context_filter=EmptyContextFilter(),  # type: ignore[arg-type]
+            content_composer=RecordingComposer(),
+            general_purpose_config=None,
+            llm=None,
+        )
+
+
+def test_compatibility_general_branch_cannot_reuse_prefilled_answer_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(branches_module, "retrieve_knowledge", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        branches_module,
+        "retrieve_reminder_candidates",
+        lambda **_kwargs: [],
+    )
+    context, _decision, *_ = _branch_case(GeneralSubBranch.NEW_CONVERSATION_TOPIC)
+    context = replace(
+        context,
+        request=replace(
+            context.request,
+            metadata={"normal_response_text": "stale prefilled answer"},
+        ),
+    )
+
+    class RecordingAnswerLLM:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def chat(self, **kwargs: Any) -> str:
+            self.calls.append(kwargs)
+            return "fresh answer from the mandatory model stage"
+
+    llm = RecordingAnswerLLM()
+    result = GeneralResponseBranch(
+        retriever=object(),
+        config=SimpleNamespace(
+            retrieval=SimpleNamespace(
+                general_response_reminder_statuses=("scheduled", "notified"),
+                general_response_reminder_limit=4,
+            )
+        ),
+        context_filter=EmptyContextFilter(),
+        llm=llm,  # type: ignore[arg-type]
+    ).execute(context, RecordingRepository())  # type: ignore[arg-type]
+
+    assert result.normal_response_text == "fresh answer from the mandatory model stage"
+    assert len(llm.calls) == 1
+    assert llm.calls[0]["task"] is LLMTask.ANSWER
+
+
+def test_pre_answer_context_failures_degrade_to_the_mandatory_answer_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_context(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("synthetic context failure")
+
+    monkeypatch.setattr(branches_module, "retrieve_knowledge", fail_context)
+    monkeypatch.setattr(
+        branches_module,
+        "retrieve_reminder_candidates",
+        fail_context,
+    )
+    context, _decision, *_ = _branch_case(GeneralSubBranch.NEW_CONVERSATION_TOPIC)
+
+    class ExplodingContextFilter:
+        def filter(self, **_kwargs: Any) -> ApprovedContext:
+            raise RuntimeError("synthetic filter failure")
+
+    class RecordingAnswerLLM:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def chat(self, **kwargs: Any) -> str:
+            self.calls.append(kwargs)
+            return "answer generated without optional context"
+
+    llm = RecordingAnswerLLM()
+    result = GeneralResponseBranch(
+        retriever=object(),
+        config=SimpleNamespace(
+            retrieval=SimpleNamespace(
+                general_response_reminder_statuses=("scheduled", "notified"),
+                general_response_reminder_limit=4,
+            )
+        ),
+        context_filter=ExplodingContextFilter(),  # type: ignore[arg-type]
+        llm=llm,  # type: ignore[arg-type]
+    ).execute(context, RecordingRepository())  # type: ignore[arg-type]
+
+    assert [call["task"] for call in llm.calls] == [LLMTask.ANSWER]
+    assert result.response_type is ResponseType.NORMAL
+    assert result.normal_response_text == "answer generated without optional context"
+    assert set(result.warnings) == {
+        "general_knowledge_retrieval_unavailable:RuntimeError",
+        "general_reminder_retrieval_unavailable:RuntimeError",
+        "general_context_filter_unavailable:RuntimeError",
+    }
+
+
+def test_sub_branch_failure_still_runs_real_answer_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(branches_module, "retrieve_knowledge", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        branches_module,
+        "retrieve_reminder_candidates",
+        lambda **_kwargs: [],
+    )
+    context, _decision, *_ = _branch_case(GeneralSubBranch.NEW_CONVERSATION_TOPIC)
+
+    class ExplodingDetector:
+        def detect(self, *_args: Any, **_kwargs: Any) -> GeneralSubBranchDecision:
+            raise RuntimeError("synthetic sub-branch failure")
+
+    class RecordingAnswerLLM:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def chat(self, **kwargs: Any) -> str:
+            self.calls.append(kwargs)
+            return "answer generated after sub-branch recovery"
+
+    llm = RecordingAnswerLLM()
+    general_config = GeneralPurposeConfig()
+    composer = DeterministicContentComposer(
+        registry=ContentToolRegistry(
+            tools=[
+                AnswerGenerationTool(
+                    llm=llm,
+                    prompt_registry=DEFAULT_PROMPT_REGISTRY,
+                )
+            ],
+            config=general_config,
+        )
+    )
+    result = GeneralResponseBranch(
+        retriever=object(),
+        config=SimpleNamespace(
+            retrieval=SimpleNamespace(
+                general_response_reminder_statuses=("scheduled", "notified"),
+                general_response_reminder_limit=4,
+            )
+        ),
+        context_filter=EmptyContextFilter(),
+        sub_branch_detector=ExplodingDetector(),
+        content_composer=composer,
+        general_purpose_config=general_config,
+    ).execute(context, RecordingRepository())  # type: ignore[arg-type]
+
+    assert [call["task"] for call in llm.calls] == [LLMTask.ANSWER]
+    assert result.response_type is ResponseType.NORMAL
+    assert result.normal_response_text == "answer generated after sub-branch recovery"
+    assert result.warnings == ["general_sub_branch_unavailable:RuntimeError"]
+
+
+def test_general_branch_runs_real_answer_then_optional_microsoft_writer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(branches_module, "retrieve_knowledge", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        branches_module,
+        "retrieve_reminder_candidates",
+        lambda **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        content_composer_module.ArtifactGenerator,
+        "generate",
+        lambda _self, **_kwargs: {
+            "artifact_id": "matrix-workbook",
+            "filename": "matrix-workbook.xlsx",
+            "storage_path": "/private/tmp/matrix-workbook.xlsx",
+            "file_type": "xlsx",
+            "status": "created",
+        },
+    )
+    context, decision, *_ = _branch_case(GeneralSubBranch.NEW_CONVERSATION_TOPIC)
+    query = "Create an Excel workbook with Task, Owner, and Status columns."
+    context = replace(
+        context,
+        request=replace(context.request, raw_query=query),
+        rewritten_query=query,
+    )
+
+    class OrderedLLM:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def chat(self, **kwargs: Any) -> str:
+            self.calls.append(kwargs)
+            if kwargs["task"] is LLMTask.ANSWER:
+                return "I will prepare the requested workbook."
+            return "Task,Owner,Status"
+
+    llm = OrderedLLM()
+    general_config = GeneralPurposeConfig()
+    composer = DeterministicContentComposer(
+        registry=ContentToolRegistry(
+            tools=[
+                AnswerGenerationTool(llm=llm, prompt_registry=DEFAULT_PROMPT_REGISTRY),
+                GenerateExcelTool(
+                    llm=llm,
+                    prompt_registry=DEFAULT_PROMPT_REGISTRY,
+                    config=general_config,
+                ),
+            ],
+            config=general_config,
+        )
+    )
+    repository = RecordingRepository()
+    result = GeneralResponseBranch(
+        retriever=object(),
+        config=SimpleNamespace(
+            retrieval=SimpleNamespace(
+                general_response_reminder_statuses=("scheduled", "notified"),
+                general_response_reminder_limit=4,
+            )
+        ),
+        context_filter=EmptyContextFilter(),
+        sub_branch_detector=FixedSubBranchDetector(decision),
+        content_composer=composer,
+        general_purpose_config=general_config,
+    ).execute(context, repository)  # type: ignore[arg-type]
+
+    assert [call["task"] for call in llm.calls] == [LLMTask.ANSWER, LLMTask.WRITING]
+    assert result.response_type is ResponseType.NORMAL
+    assert result.normal_response_text.startswith("I will prepare the requested workbook.")
+    assert repository.append_calls[0]["entities"]["used_tools"] == [
+        "answer_generation",
+        "generate_excel",
+    ]
 
 
 @pytest.mark.parametrize("sub_branch", tuple(GeneralSubBranch))

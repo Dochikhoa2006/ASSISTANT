@@ -10,6 +10,7 @@ from assistant_rag.llm import (
     structured_fallback_payload,
 )
 from assistant_rag.settings import OllamaSettings
+from assistant_rag.observability import start_trace
 
 
 def test_structured_normalization_is_lossless_and_schema_authorized() -> None:
@@ -158,3 +159,49 @@ def test_every_onnx_mutation_stage_has_cross_engine_recovery() -> None:
         assert "onnx" in primary.casefold()
         assert fallback
         assert "onnx" not in fallback.casefold()
+
+
+class _FailingChatOnnx:
+    def __init__(self) -> None:
+        self.last_error_by_task: dict[LLMTask, str] = {}
+
+    def chat(self, **kwargs: Any) -> str:
+        task = kwargs["task"]
+        self.last_error_by_task[task] = "synthetic ONNX model-resolution failure"
+        raise RuntimeError("synthetic ONNX model-resolution failure")
+
+
+class _FallbackChatOllama:
+    def __init__(self) -> None:
+        self.router = _Router()
+        self.settings = OllamaSettings()
+        self.last_error_by_task: dict[LLMTask, str] = {}
+        self.calls: list[dict[str, Any]] = []
+
+    def _fallback_model_for_task(self, _task: LLMTask) -> str:
+        return "qwen3.5:4b"
+
+    def _chat_raw(self, **kwargs: Any) -> str:
+        self.calls.append(kwargs)
+        return "recovered answer"
+
+
+def test_hybrid_chat_records_one_logical_answer_stage_across_onnx_recovery() -> None:
+    ollama = _FallbackChatOllama()
+    onnx = _FailingChatOnnx()
+    client = HybridLLMClient(ollama, onnx)  # type: ignore[arg-type]
+    trace = start_trace("hybrid-answer-recovery")
+
+    response = client.chat(
+        task=LLMTask.ANSWER,
+        system_prompt="system",
+        user_prompt='Runtime context:\n{"stage":"answer_generation"}',
+    )
+
+    assert response == "recovered answer"
+    assert len(ollama.calls) == 1
+    assert ollama.calls[0]["fallback_for"] == "microsoft/Phi-4-mini-instruct-onnx"
+    assert LLMTask.ANSWER not in onnx.last_error_by_task
+    assert [stage.stage for stage in trace.summary().stages] == [
+        "llm_answer_generation"
+    ]

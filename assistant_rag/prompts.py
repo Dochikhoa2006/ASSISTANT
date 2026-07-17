@@ -1702,6 +1702,7 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "Use structure and step-by-step detail for complex technical, architecture, or implementation questions.",
                 "For writing tasks, produce polished copy directly in the requested style.",
                 "For email-writing tasks, put every literal recipient in a To: line, then a concise Subject: line, then the authored message body; never invent or silently omit recipients.",
+                "This answer stage is mandatory for every general-purpose request, including file-only requests; when a Microsoft file tool is assigned, provide a concise companion response without duplicating file-internal content.",
                 "Always follow content_composition_scope when supplied: own the user-facing non-file prose, including any requested email, message, or cover note.",
                 "When a file tool is assigned, do not duplicate the attachment's internal document sections, workbook rows, or presentation slides; that tool owns only the file content.",
                 "Never append a clarification or supporting question; the dedicated HITL stage owns every conversational question.",

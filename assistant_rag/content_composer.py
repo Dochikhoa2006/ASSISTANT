@@ -6,7 +6,7 @@ import json
 from functools import lru_cache
 import re
 import unicodedata
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from .artifacts import ArtifactGenerator
@@ -44,6 +44,8 @@ class ContentCompositionScope:
     """Deterministic ownership boundary between prose and file generation."""
 
     answer_request_scope: str
+    # This remains explicit in trace/prompt metadata so runtime verification can
+    # prove the unconditional general-purpose answer-stage invariant.
     answer_generation_required: bool
     file_request_scope: str | None
     answer_generation_responsibility: str
@@ -291,16 +293,21 @@ def _derive_composition_scope(
         rewritten_query[answer_suffix_start:].strip(" \t\r\n,;.-"),
     )
     answer_scope = " ".join(part for part in answer_parts if part).strip()
-    answer_generation_required = bool(answer_scope)
-    if not answer_generation_required:
+    if not answer_scope:
+        # A file-only request still requires the general answer stage. Give it
+        # the canonical request as context while keeping file-internal content
+        # exclusively owned by the Microsoft tool that runs immediately after.
+        answer_scope = rewritten_query.strip()
         answer_responsibility = (
-            "No separate prose deliverable was requested. The authorized file tool "
-            "owns both file creation and its concise verified handoff."
+            "Produce a concise user-facing companion response for the requested "
+            "file. Do not reproduce the file's internal sections, rows, slides, or "
+            "other planned contents, and do not claim creation before the authorized "
+            "Microsoft file tool reports its result."
         )
 
     return ContentCompositionScope(
         answer_request_scope=answer_scope,
-        answer_generation_required=answer_generation_required,
+        answer_generation_required=True,
         file_request_scope=file_scope or rewritten_query.strip(),
         answer_generation_responsibility=answer_responsibility,
         file_tool_responsibility=(
@@ -441,7 +448,7 @@ class AnswerGenerationTool:
 
     def execute(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> ContentToolResult:
         try:
-            output = self.llm.chat(
+            output = str(self.llm.chat(
                 task=LLMTask.ANSWER,
                 system_prompt=self.prompt_registry.system("answer_generation"),
                 user_prompt=self.prompt_registry.user(
@@ -464,7 +471,9 @@ class AnswerGenerationTool:
                         },
                     )
                 ),
-            )
+            ) or "").strip()
+            if not output:
+                raise ValueError("answer_generation returned blank output")
             return ContentToolResult(
                 tool_name=self.name,
                 output_text=output,
@@ -781,9 +790,14 @@ class ContentToolRegistry:
     config: GeneralPurposeConfig
 
     def __post_init__(self) -> None:
+        names = [tool.name for tool in self.tools]
+        if len(names) != len(set(names)):
+            raise ValueError("ContentToolRegistry does not allow duplicate tool names.")
         self._tools: dict[str, ContentTool] = {tool.name: tool for tool in self.tools}
 
     def register(self, tool: ContentTool) -> None:
+        if tool.name == "answer_generation" and tool.name in self._tools:
+            raise ValueError("The mandatory answer_generation tool cannot be replaced.")
         self._tools[tool.name] = tool
 
     def get_tool(self, name: str) -> ContentTool | None:
@@ -795,55 +809,99 @@ class ContentToolRegistry:
 
 @dataclass
 class DeterministicContentComposer:
-    """Execute only the prose/file tools required by deterministic request scope."""
+    """Execute answer generation, then any deterministically authorized file tool."""
 
     registry: ContentToolRegistry
+    _answer_tool: ContentTool = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        answer_tool = self.registry.get_tool("answer_generation")
+        if answer_tool is None:
+            raise ValueError(
+                "DeterministicContentComposer requires answer_generation for every "
+                "general-purpose request."
+            )
+        # Pin the construction-time registration so later optional-tool updates
+        # cannot replace or remove the mandatory answer stage.
+        self._answer_tool = answer_tool
 
     def compose(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> ContentComposerResult:
-        canonical_metadata = dict(composer_input.metadata)
-        canonical_metadata[_CANONICAL_REWRITTEN_QUERY_KEY] = (
-            composer_input.rewritten_query
+        canonical_query = str(composer_input.rewritten_query or "").strip()
+        canonical_metadata = (
+            dict(composer_input.metadata)
+            if isinstance(composer_input.metadata, dict)
+            else {}
         )
+        canonical_metadata[_CANONICAL_REWRITTEN_QUERY_KEY] = canonical_query
         composer_input = replace(
             composer_input,
             # Compatibility field only: it must never retain the pre-rewrite input.
-            raw_user_query=composer_input.rewritten_query,
+            raw_user_query=canonical_query,
+            rewritten_query=canonical_query,
             metadata=canonical_metadata,
         )
-        canonical_query = _canonical_rewritten_query(composer_input)
-        decision = classify_file_creation_request(canonical_query, config)
-        desired_file_tool_name = decision.selected_tool_name
+        decision = FileCreationDecision(
+            selected_tool_name=None,
+            matched_verb_keywords=(),
+            matched_file_keywords=(),
+            matched_file_types=(),
+            reason_summary="routing_failed_answer_only",
+        )
+        composition_scope = ContentCompositionScope(
+            answer_request_scope=canonical_query,
+            answer_generation_required=True,
+            file_request_scope=None,
+            answer_generation_responsibility=(
+                "The optional file router was unavailable. Produce the complete "
+                "user-facing answer without claiming that a file or side effect "
+                "was created."
+            ),
+            file_tool_responsibility=None,
+        )
+        desired_file_tool_name: str | None = None
         file_tool: ContentTool | None = None
         file_route_status = "not_requested"
-        if desired_file_tool_name is not None:
-            if not config.content_composer_enabled:
-                file_route_status = "disabled"
-            elif desired_file_tool_name not in config.content_composer_allowed_tools:
-                file_route_status = "not_allowed"
-            else:
-                file_tool = self.registry.get_tool(desired_file_tool_name)
-                file_route_status = "ready" if file_tool is not None else "unavailable"
+        routing_warning: str | None = None
+        try:
+            decision = classify_file_creation_request(canonical_query, config)
+            desired_file_tool_name = decision.selected_tool_name
+            if desired_file_tool_name is not None:
+                if not config.content_composer_enabled:
+                    file_route_status = "disabled"
+                elif desired_file_tool_name not in config.content_composer_allowed_tools:
+                    file_route_status = "not_allowed"
+                else:
+                    file_tool = self.registry.get_tool(desired_file_tool_name)
+                    file_route_status = "ready" if file_tool is not None else "unavailable"
 
-        # If the optional file stage cannot actually run, answer_generation owns the
-        # complete request so no requested content is silently dropped.
-        scope_decision = (
-            decision
-            if file_tool is not None
-            else replace(decision, selected_tool_name=None)
-        )
-        composition_scope = _derive_composition_scope(
-            canonical_query,
-            scope_decision,
-            config,
-        )
-        if file_tool is not None and composition_scope.file_request_scope is None:
-            file_tool = None
-            file_route_status = "scope_projection_failed"
+            # If the optional file stage cannot actually run, answer_generation owns the
+            # complete request so no requested content is silently dropped.
+            scope_decision = (
+                decision
+                if file_tool is not None
+                else replace(decision, selected_tool_name=None)
+            )
             composition_scope = _derive_composition_scope(
                 canonical_query,
-                replace(decision, selected_tool_name=None),
+                scope_decision,
                 config,
             )
+            if file_tool is not None and composition_scope.file_request_scope is None:
+                file_tool = None
+                file_route_status = "scope_projection_failed"
+                composition_scope = _derive_composition_scope(
+                    canonical_query,
+                    replace(decision, selected_tool_name=None),
+                    config,
+                )
+        except Exception as exc:
+            # Deterministic file routing is optional. A malformed runtime policy
+            # must degrade locally to the mandatory answer stage instead of
+            # escaping to the branch/router fallback pipeline.
+            file_tool = None
+            desired_file_tool_name = None
+            file_route_status = "routing_failed"
+            routing_warning = f"content_routing_failed:{type(exc).__name__}"
         answer_metadata = dict(composer_input.metadata)
         # The canonical full query is private authorization state for routing
         # and file tools. The prose stage receives only its projected rewritten
@@ -862,38 +920,21 @@ class DeterministicContentComposer:
             metadata=answer_metadata,
         )
 
-        answer_tool = (
-            self.registry.get_tool("answer_generation")
-            if composition_scope.answer_generation_required
-            else None
-        )
-        if composition_scope.answer_generation_required and answer_tool is None:
-            trace = {
-                "classifier": "deterministic_keyword_pipeline",
-                "decision": decision.reason_summary,
-                "matched_verbs": decision.matched_verb_keywords,
-                "matched_file_keywords": decision.matched_file_keywords,
-                "matched_file_types": decision.matched_file_types,
-                "selected_file_tool": None,
-                "executed_tools": (),
-                "pipeline_status": "answer_tool_unavailable",
-            }
-            return ContentComposerResult(
-                final_response_text="System error: General answer tool not registered.",
-                tool_trace_summary=json.dumps(trace, sort_keys=True),
-                used_tool_names=(),
-                confidence=0.0,
-                fallback_used=True,
-                reason_summary="deterministic_tool_unavailable",
-                content_warnings=("answer_tool_unavailable",),
-            )
-
         used_tool_names: list[str] = []
         results: list[ContentToolResult] = []
-        if answer_tool is not None:
-            answer_result = answer_tool.execute(answer_input, config)
-            used_tool_names.append("answer_generation")
-            results.append(answer_result)
+        try:
+            answer_result = self._answer_tool.execute(answer_input, config)
+        except Exception as exc:
+            answer_result = ContentToolResult(
+                tool_name="answer_generation",
+                output_text="The answer model is temporarily unavailable.",
+                confidence=0.0,
+                fallback_used=True,
+                reason_summary=f"answer_generation_failed:{type(exc).__name__}",
+                warnings=("answer_model_unavailable",),
+            )
+        used_tool_names.append("answer_generation")
+        results.append(answer_result)
         selected_file_tool_name: str | None = None
         if file_tool is not None and desired_file_tool_name is not None:
             # The complete rewritten query is retained so each Microsoft tool can
@@ -910,7 +951,19 @@ class DeterministicContentComposer:
                 rewritten_query=composition_scope.file_request_scope or "",
                 metadata=file_metadata,
             )
-            file_result = file_tool.execute(file_input, config)
+            try:
+                file_result = file_tool.execute(file_input, config)
+            except Exception as exc:
+                file_result = ContentToolResult(
+                    tool_name=desired_file_tool_name,
+                    output_text="",
+                    confidence=0.0,
+                    fallback_used=True,
+                    reason_summary=(
+                        f"microsoft_file_tool_failed:{type(exc).__name__}"
+                    ),
+                    warnings=("microsoft_file_tool_unavailable",),
+                )
             results.append(file_result)
             used_tool_names.append(desired_file_tool_name)
             selected_file_tool_name = desired_file_tool_name
@@ -923,12 +976,18 @@ class DeterministicContentComposer:
             if result.artifact is not None
         )
         warnings = tuple(
-            dict.fromkeys(warning for result in results for warning in result.warnings)
+            dict.fromkeys(
+                [
+                    *(warning for result in results for warning in result.warnings),
+                    *([routing_warning] if routing_warning else []),
+                ]
+            )
         )
         route_fallback = file_route_status in {
             "not_allowed",
             "unavailable",
             "scope_projection_failed",
+            "routing_failed",
         }
         trace = {
             "classifier": "deterministic_keyword_pipeline",

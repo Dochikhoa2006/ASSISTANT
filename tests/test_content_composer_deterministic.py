@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import assistant_rag.content_composer as content_composer_module
 from assistant_rag.config import GeneralPurposeConfig
 from assistant_rag.content_keywords import (
     DOCUMENT_FILE_KEYWORDS,
@@ -28,7 +29,7 @@ from assistant_rag.contracts import (
     PersistenceMode,
     SubBranchPromptContext,
 )
-from assistant_rag.llm import LLMTask
+from assistant_rag.llm import LLMTask, llm_trace_stage_name_for_prompt
 from assistant_rag.prompts import DEFAULT_PROMPT_REGISTRY
 
 
@@ -179,15 +180,18 @@ def test_every_configured_file_keyword_with_an_explicit_verb_selects_exactly_one
         ("Export the data as an .xlsx file.", "generate_excel"),
     ),
 )
-def test_explicit_single_type_executes_only_the_required_file_tool(query: str, expected_tool: str) -> None:
+def test_explicit_single_type_executes_answer_then_only_the_required_file_tool(
+    query: str,
+    expected_tool: str,
+) -> None:
     result, tools = _compose(query)
 
-    assert result.used_tool_names == (expected_tool,)
+    assert result.used_tool_names == ("answer_generation", expected_tool)
     assert len(result.artifacts) == 1
     assert sum(tools[name].calls for name in ("generate_pdf", "generate_excel", "generate_pptx")) == 1
     assert tools[expected_tool].calls == 1
-    assert tools["answer_generation"].calls == 0
-    assert result.final_response_text == f"ran {expected_tool}"
+    assert tools["answer_generation"].calls == 1
+    assert result.final_response_text == f"ran answer_generation\n\nran {expected_tool}"
 
 
 @pytest.mark.parametrize(
@@ -216,7 +220,8 @@ def test_rewritten_query_is_the_sole_file_creation_authority() -> None:
         ),
     )
 
-    assert result.used_tool_names == ("generate_excel",)
+    assert result.used_tool_names == ("answer_generation", "generate_excel")
+    assert tools["answer_generation"].calls == 1
     assert tools["generate_excel"].calls == 1
     assert tools["generate_pdf"].calls == 0
     assert tools["generate_pptx"].calls == 0
@@ -356,18 +361,86 @@ def test_disabling_optional_composer_still_executes_answer_generation() -> None:
     assert '"file_route_status": "disabled"' in result.tool_trace_summary
 
 
-def test_pure_file_request_does_not_require_an_answer_tool() -> None:
+def test_composer_rejects_configuration_without_mandatory_answer_tool() -> None:
     config = GeneralPurposeConfig()
     excel = CountingTool("generate_excel")
-    composer = DeterministicContentComposer(
-        registry=ContentToolRegistry(tools=[excel], config=config)
+
+    with pytest.raises(ValueError, match="requires answer_generation"):
+        DeterministicContentComposer(
+            registry=ContentToolRegistry(tools=[excel], config=config)
+        )
+
+    assert excel.calls == 0
+
+
+def test_mandatory_answer_registration_cannot_be_replaced() -> None:
+    config = GeneralPurposeConfig()
+    original = CountingTool("answer_generation")
+    replacement = CountingTool("answer_generation")
+    registry = ContentToolRegistry(tools=[original], config=config)
+    composer = DeterministicContentComposer(registry=registry)
+
+    with pytest.raises(ValueError, match="cannot be replaced"):
+        registry.register(replacement)
+
+    result = composer.compose(_input("Explain the result."), config)
+    assert result.used_tool_names == ("answer_generation",)
+    assert original.calls == 1
+    assert replacement.calls == 0
+
+
+def test_file_routing_failure_degrades_locally_to_mandatory_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    composer, tools, config = _composer()
+
+    def fail_routing(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("synthetic router failure")
+
+    monkeypatch.setattr(
+        content_composer_module,
+        "classify_file_creation_request",
+        fail_routing,
     )
 
-    result = composer.compose(_input("Create an Excel expense tracker."), config)
+    result = composer.compose(_input("Create the requested workbook."), config)
 
-    assert result.used_tool_names == ("generate_excel",)
-    assert excel.calls == 1
-    assert result.content_warnings == ()
+    assert result.used_tool_names == ("answer_generation",)
+    assert tools["answer_generation"].calls == 1
+    assert all(tools[name].calls == 0 for name in ("generate_pdf", "generate_excel", "generate_pptx"))
+    assert "content_routing_failed:RuntimeError" in result.content_warnings
+    assert '"file_route_status": "routing_failed"' in result.tool_trace_summary
+
+
+def test_blank_answer_model_output_is_not_reported_as_success() -> None:
+    class BlankLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(self, **_kwargs: object) -> str:
+            self.calls += 1
+            return "   "
+
+    config = GeneralPurposeConfig()
+    llm = BlankLLM()
+    composer = DeterministicContentComposer(
+        registry=ContentToolRegistry(
+            tools=[
+                AnswerGenerationTool(
+                    llm=llm,
+                    prompt_registry=DEFAULT_PROMPT_REGISTRY,
+                )
+            ],
+            config=config,
+        )
+    )
+
+    result = composer.compose(_input("Explain the result."), config)
+
+    assert llm.calls == 1
+    assert result.used_tool_names == ("answer_generation",)
+    assert result.fallback_used
+    assert result.content_warnings == ("answer_model_unavailable",)
 
 
 def test_real_tool_prompts_keep_email_copy_out_of_excel_planner() -> None:
@@ -409,6 +482,67 @@ def test_real_tool_prompts_keep_email_copy_out_of_excel_planner() -> None:
     assert "file_tool_responsibility" in file_prompt
     assert "Write an email" not in file_prompt
     assert "finance" not in file_prompt
+
+
+def test_microsoft_writer_has_a_distinct_cross_engine_trace_label() -> None:
+    microsoft_prompt = (
+        'Runtime context:\n{"stage":"content_tool_answer_generation"}'
+    )
+    outbound_revision_prompt = 'Runtime context:\n{"stage":"outbound_revision"}'
+
+    assert llm_trace_stage_name_for_prompt(
+        LLMTask.WRITING,
+        microsoft_prompt,
+    ) == "llm_writing_microsoft_tool"
+    assert llm_trace_stage_name_for_prompt(
+        LLMTask.WRITING,
+        microsoft_prompt,
+        engine="onnx",
+    ) == "llm_writing_microsoft_tool"
+    assert llm_trace_stage_name_for_prompt(
+        LLMTask.WRITING,
+        outbound_revision_prompt,
+    ) == "llm_writing"
+
+
+def test_answer_model_failure_still_runs_authorized_microsoft_tool() -> None:
+    class AnswerFailingLLM:
+        def __init__(self) -> None:
+            self.calls: list[LLMTask] = []
+
+        def chat(self, **kwargs: object) -> str:
+            task = kwargs["task"]
+            assert isinstance(task, LLMTask)
+            self.calls.append(task)
+            if task is LLMTask.ANSWER:
+                raise RuntimeError("answer model unavailable")
+            return "Owner,Status\nOperations,Ready"
+
+    query = "Create an Excel tracker with owner and status columns."
+    config = GeneralPurposeConfig()
+    llm = AnswerFailingLLM()
+    composer = DeterministicContentComposer(
+        registry=ContentToolRegistry(
+            tools=[
+                AnswerGenerationTool(
+                    llm=llm,
+                    prompt_registry=DEFAULT_PROMPT_REGISTRY,
+                ),
+                GenerateExcelTool(
+                    llm=llm,
+                    prompt_registry=DEFAULT_PROMPT_REGISTRY,
+                ),
+            ],
+            config=config,
+        )
+    )
+
+    result = composer.compose(_input(query), config)
+
+    assert llm.calls == [LLMTask.ANSWER, LLMTask.WRITING]
+    assert result.used_tool_names == ("answer_generation", "generate_excel")
+    assert "answer_model_unavailable" in result.content_warnings
+    assert "Owner,Status" in result.final_response_text
 
 
 @pytest.mark.parametrize(

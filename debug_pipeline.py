@@ -81,6 +81,7 @@ from assistant_rag.llm import (
     _structured_attempt_prompt,
     is_structured_fallback,
     llm_trace_stage_name,
+    llm_trace_stage_name_for_prompt,
     structured_fallback_payload,
     uses_onnx_runtime,
     validate_json_schema,
@@ -561,6 +562,17 @@ class DeterministicRetriever:
 
 class ScenarioLLM:
     def chat(self, **kwargs: Any) -> str:
+        prompt = str(kwargs.get("user_prompt") or "")
+        prefix = "Runtime context:\n"
+        if prompt.startswith(prefix):
+            try:
+                payload = json.loads(prompt[len(prefix) :])
+            except Exception:
+                payload = {}
+            metadata = payload.get("metadata") or {}
+            scripted_response = metadata.get("normal_response_text")
+            if scripted_response:
+                return str(scripted_response)
         return "Start with Python basics, practice daily, then build small projects."
 
     def generate_json(self, **kwargs: Any) -> dict[str, Any]:
@@ -1273,6 +1285,7 @@ def build_scenario_state(settings: ProductionSettings) -> ScenarioState:
                 hitl_strategy=OptionalHITLStrategy(),
                 general_hitl_strategy=DeterministicGeneralHITLStrategy(),
                 general_purpose_config=gp_config,
+                llm=ScenarioLLM(),
                 sub_branch_detector=GeneralSubBranchDetector(
                     ScenarioLLM(), DEFAULT_PROMPT_REGISTRY
                 ),
@@ -2459,23 +2472,90 @@ def scenario_llm_answer_generation_trace(settings: ProductionSettings) -> Scenar
 
     recorder = start_trace(new_request_id())
     client = TraceableAnswerLLM(settings.ollama, OllamaModelRouter(settings.ollama))
-    client.chat(
-        task=LLMTask.ANSWER,
-        system_prompt="Generate a concise answer.",
-        user_prompt='Runtime context:\n{"stage":"answer_generation"}',
+    config = GeneralPurposeConfig()
+    composer = DeterministicContentComposer(
+        registry=ContentToolRegistry(
+            tools=[
+                AnswerGenerationTool(
+                    llm=client,
+                    prompt_registry=DEFAULT_PROMPT_REGISTRY,
+                ),
+                GenerateExcelTool(
+                    llm=client,
+                    prompt_registry=DEFAULT_PROMPT_REGISTRY,
+                    config=config,
+                ),
+            ],
+            config=config,
+        )
     )
+    from assistant_rag.contracts import (
+        ContentComposerInput,
+        GeneralSubBranch,
+        PersistenceMode,
+        SubBranchPromptContext,
+    )
+
+    query = "Create an Excel workbook with Task, Owner, and Status columns."
+    result = composer.compose(
+        ContentComposerInput(
+            user_id=DEBUG_USER,
+            raw_user_query=query,
+            rewritten_query=query,
+            sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
+            persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
+            approved_conversation_history=[],
+            human_supporting_questions=[],
+            reminder_supporting_questions=[],
+            extracted_expected_response_types=[],
+            approved_knowledge_evidence=[],
+            approved_reminder_context=[],
+            metadata={},
+            platform_context={},
+            sub_branch_prompt_context=SubBranchPromptContext(
+                sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
+                persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
+                chat_history_role="new conversation",
+                response_goal="answer directly",
+                database_update_mode="create",
+                allowed_database_updates=("conversation_hop_append",),
+                prohibited_database_updates=("knowledge_mutation",),
+            ),
+            sub_branch_supporting_prompt="Answer directly.",
+        ),
+        config,
+    )
+    if result.used_tool_names != ("answer_generation", "generate_excel"):
+        raise AssertionError(
+            "composer did not drive mandatory answer generation before Microsoft "
+            f"writing: {result.used_tool_names}"
+        )
     summary = recorder.summary()
     stage_names = [stage.stage for stage in summary.stages]
-    if stage_names != ["llm_answer_generation"]:
-        raise AssertionError(f"answer-generation trace label regressed: {stage_names}")
+    if stage_names != [
+        "llm_answer_generation",
+        "llm_writing_microsoft_tool",
+    ]:
+        raise AssertionError(f"general-purpose LLM trace labels regressed: {stage_names}")
     if llm_trace_stage_name(LLMTask.ANSWER, engine="onnx") != "llm_answer_generation":
         raise AssertionError("ONNX answer generation does not share the canonical trace label")
-    if not any("llm_answer_generation" in line for line in _debug_trace_lines(summary)):
-        raise AssertionError("debug trace formatter omitted llm_answer_generation")
+    if llm_trace_stage_name_for_prompt(
+        LLMTask.WRITING,
+        'Runtime context:\n{"stage":"content_tool_answer_generation"}',
+        engine="onnx",
+    ) != "llm_writing_microsoft_tool":
+        raise AssertionError("ONNX Microsoft writing does not share the canonical trace label")
+    debug_trace = "\n".join(_debug_trace_lines(summary))
+    for required_stage in (
+        "llm_answer_generation",
+        "llm_writing_microsoft_tool",
+    ):
+        if required_stage not in debug_trace:
+            raise AssertionError(f"debug trace formatter omitted {required_stage}")
     return ScenarioResult(
         "llm_answer_generation_trace",
         True,
-        "answer generation is logged with one stable cross-engine debug trace label",
+        "general-purpose answer and optional Microsoft writing use stable ordered trace labels",
     )
 
 
@@ -3677,12 +3757,18 @@ def scenario_content_composer_deterministic(settings: ProductionSettings) -> Sce
             ),
             config,
         )
-        if artifact_result.used_tool_names != ("generate_excel",) or len(artifact_result.artifacts) != 1:
-            raise AssertionError(f"file-only Excel request did not create exactly one artifact: {artifact_result!r}")
+        if artifact_result.used_tool_names != (
+            "answer_generation",
+            "generate_excel",
+        ) or len(artifact_result.artifacts) != 1:
+            raise AssertionError(
+                "file-only Excel request did not execute answer generation followed "
+                f"by exactly one artifact tool: {artifact_result!r}"
+            )
         artifact_path = Path(str(artifact_result.artifacts[0].get("storage_path") or ""))
         if not artifact_path.is_file() or not zipfile.is_zipfile(artifact_path):
             raise AssertionError("generated Excel artifact was not a downloadable workbook")
-    return ScenarioResult("content_composer_deterministic", True, "deterministic composer skips unrequested prose and creates one downloadable file for an explicit artifact request")
+    return ScenarioResult("content_composer_deterministic", True, "every general-purpose request runs answer generation before an optional downloadable Microsoft artifact")
 
 
 def scenario_general_broad_retrieval_approved(settings: ProductionSettings) -> ScenarioResult:
