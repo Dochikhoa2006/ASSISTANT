@@ -26,7 +26,7 @@ from .contracts import (
     ValidatedReminderAction,
 )
 from .database import AssistantRepository
-from .llm import LLMClient, LLMTask
+from .llm import LLMClient, LLMTask, is_structured_fallback
 from .prompts import (
     PromptContext,
     PromptRegistry,
@@ -315,6 +315,11 @@ class LLMReminderActionDetector:
                 ),
                 schema=REMINDER_ACTION_EXTRACTION_SCHEMA,
             )
+            if is_structured_fallback(payload):
+                return self._failed(
+                    "reminder_action_extraction_structured_fallback",
+                    ["action"],
+                )
         except Exception:
             return self._failed("reminder_action_extraction_failed", ["action"])
 
@@ -531,6 +536,7 @@ class LLMReminderActionDetector:
             confidence=0.0,
             missing_fields=missing_fields,
             risk_flags=[reason],
+            failure_kind="technical_failure",
         )
 
 
@@ -645,6 +651,12 @@ class ReminderActionValidationStrategy:
                     self.config.retrieval_validation.reminder_llm_validation_model
                 ),
             )
+            if is_structured_fallback(raw):
+                return self._rejection(
+                    operation,
+                    "Reminder validation model exhausted structured recovery.",
+                    "structured_output_fallback",
+                )
         except Exception:
             return self._rejection(
                 operation,
@@ -768,13 +780,13 @@ class ReminderActionValidationStrategy:
             "clarification_question",
             "candidate_assessments",
         }
-        expected_assessment_fields = {
+        required_assessment_fields = {
             "candidate_key",
-            "match_kind",
             "confidence",
             "evidence_field",
             "matched_text",
         }
+        legacy_assessment_fields = {"match_kind"}
         try:
             if not isinstance(raw, dict) or set(raw) != expected_root_fields:
                 raise ValueError("unexpected reminder validation fields")
@@ -798,17 +810,18 @@ class ReminderActionValidationStrategy:
             for item in raw_assessments:
                 if (
                     not isinstance(item, dict)
-                    or set(item) != expected_assessment_fields
+                    or not required_assessment_fields.issubset(item)
+                    or not set(item).issubset(
+                        required_assessment_fields | legacy_assessment_fields
+                    )
                 ):
                     raise ValueError("invalid reminder assessment fields")
                 candidate_key = _text(item["candidate_key"])
-                match_kind = item["match_kind"]
                 item_confidence = item["confidence"]
                 evidence_field = item["evidence_field"]
                 matched_text = item["matched_text"]
                 if (
                     not isinstance(item["candidate_key"], str)
-                    or match_kind not in {"NONE", "TARGET", "EQUIVALENT"}
                     or isinstance(item_confidence, bool)
                     or not isinstance(item_confidence, (int, float))
                     or not isinstance(evidence_field, str)
@@ -816,14 +829,24 @@ class ReminderActionValidationStrategy:
                     or candidate_key not in candidate_map
                 ):
                     raise ValueError("invalid reminder assessment values")
-                if operation == ReminderAction.ADD.value:
-                    if match_kind == "TARGET":
-                        raise ValueError("ADD assessments use EQUIVALENT")
-                elif match_kind == "EQUIVALENT":
-                    raise ValueError("target actions use TARGET")
 
                 candidate = candidate_map[candidate_key]
-                matches_target = match_kind != "NONE"
+                if bool(evidence_field) != bool(matched_text):
+                    raise ValueError("incomplete reminder match evidence")
+                matches_target = bool(matched_text)
+                match_kind = (
+                    "EQUIVALENT"
+                    if matches_target and operation == ReminderAction.ADD.value
+                    else "TARGET"
+                    if matches_target
+                    else "NONE"
+                )
+                # ``match_kind`` was formerly model-authored even though the
+                # fixed action plus grounded evidence determines it exactly.
+                # Accept it during rolling upgrades only when it agrees with
+                # the derived value.
+                if "match_kind" in item and item["match_kind"] != match_kind:
+                    raise ValueError("contradictory legacy reminder match kind")
                 if matches_target:
                     if (
                         evidence_field not in REMINDER_EDITABLE_FIELDS
@@ -1179,6 +1202,8 @@ class ReminderContentFinalizationStrategy:
                 ),
                 schema=REMINDER_CONTENT_FINALIZATION_SCHEMA,
             )
+            if is_structured_fallback(raw):
+                return None
             if not isinstance(raw, dict) or set(raw) != {"approved", "confidence"}:
                 return None
             approved = raw["approved"]

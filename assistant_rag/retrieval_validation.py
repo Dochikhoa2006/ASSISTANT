@@ -18,7 +18,7 @@ from .contracts import (
     ReminderValidationCandidate,
     RetrievalCandidateAssessment,
 )
-from .llm import LLMClient, LLMTask
+from .llm import LLMClient, LLMTask, is_structured_fallback
 from .prompts import (
     KNOWLEDGE_RETRIEVAL_VALIDATION_SCHEMA,
     PromptContext,
@@ -105,6 +105,8 @@ class KnowledgeRetrievalValidationStrategy:
                 schema=self._schema(),
                 model_override=self.config.knowledge_llm_validation_model,
             )
+            if is_structured_fallback(raw_response):
+                return self._build_internal_failure_result(operation)
             return self._parse_and_validate_result(
                 raw_response,
                 candidate_map,
@@ -121,24 +123,25 @@ class KnowledgeRetrievalValidationStrategy:
         *,
         requested_operation: str,
     ) -> dict[str, Any] | None:
-        expected_fields = {
+        required_fields = {
             "action",
             "text_content",
             "original_text",
             "replacement_text",
             "confidence",
-            "missing_fields",
-            "reason_summary",
         }
-        if not isinstance(response, dict) or set(response) != expected_fields:
+        legacy_fields = {"missing_fields", "reason_summary"}
+        if (
+            not isinstance(response, dict)
+            or not required_fields.issubset(response)
+            or not set(response).issubset(required_fields | legacy_fields)
+        ):
             return None
         action = response["action"]
         text_content = response["text_content"]
         original_text = response["original_text"]
         replacement_text = response["replacement_text"]
         confidence = response["confidence"]
-        missing_fields = response["missing_fields"]
-        reason_summary = response["reason_summary"]
         if (
             not isinstance(action, str)
             or action != requested_operation
@@ -149,20 +152,30 @@ class KnowledgeRetrievalValidationStrategy:
             or not isinstance(confidence, (int, float))
             or not isfinite(float(confidence))
             or not 0.0 <= float(confidence) <= 1.0
-            or not isinstance(missing_fields, list)
-            or not all(isinstance(field, str) for field in missing_fields)
-            or not isinstance(reason_summary, str)
         ):
             return None
-        return {
+        if "missing_fields" in response and (
+            not isinstance(response["missing_fields"], list)
+            or not all(
+                isinstance(item, str) for item in response["missing_fields"]
+            )
+        ):
+            return None
+        if "reason_summary" in response and not isinstance(
+            response["reason_summary"], str
+        ):
+            return None
+        canonical_response: dict[str, Any] = {
             "action": action,
             "text_content": text_content.strip(),
             "original_text": original_text.strip(),
             "replacement_text": replacement_text.strip(),
             "confidence": float(confidence),
-            "missing_fields": [field.strip() for field in missing_fields],
-            "reason_summary": reason_summary.strip(),
         }
+        for legacy_field in legacy_fields:
+            if legacy_field in response:
+                canonical_response[legacy_field] = response[legacy_field]
+        return canonical_response
 
     def _first_model_response_ready(
         self,
@@ -195,33 +208,37 @@ class KnowledgeRetrievalValidationStrategy:
         owns concurrency/database invariants, so this guard does not duplicate
         those later-stage responsibilities.
         """
-        expected_fields = {
-            "operation",
+        required_fields = {
             "decision",
             "selected_candidate_keys",
             "confidence",
             "clarification_question",
-            "reason_summary",
             "candidate_assessments",
         }
-        assessment_fields = {
+        required_assessment_fields = {
             "candidate_key",
-            "matches_target",
-            "action_compatible",
             "confidence",
-            "matched_fields",
-            "reason_summary",
             "matched_text",
         }
-        if not isinstance(raw_response, dict) or set(raw_response) != expected_fields:
+        legacy_root_fields = {"operation", "reason_summary"}
+        if (
+            not isinstance(raw_response, dict)
+            or not required_fields.issubset(raw_response)
+            or not set(raw_response).issubset(
+                required_fields | legacy_root_fields
+            )
+        ):
             return self._build_internal_failure_result(requested_operation)
         try:
-            raw_operation = raw_response["operation"]
+            # ``operation`` used to be a required model-generated mirror of
+            # model 1.  Model 2 cannot authoritatively change it, so derive it
+            # from the already guarded request.  If an older model still emits
+            # the mirror, reject only an actual contradiction.
+            raw_operation = raw_response.get("operation", requested_operation)
             raw_decision = raw_response["decision"]
             raw_selected = raw_response["selected_candidate_keys"]
             raw_confidence = raw_response["confidence"]
             raw_question = raw_response["clarification_question"]
-            raw_reason = raw_response["reason_summary"]
             raw_assessments = raw_response["candidate_assessments"]
             if (
                 not isinstance(raw_operation, str)
@@ -231,39 +248,62 @@ class KnowledgeRetrievalValidationStrategy:
                 or isinstance(raw_confidence, bool)
                 or not isinstance(raw_confidence, (int, float))
                 or not isinstance(raw_question, str)
-                or not isinstance(raw_reason, str)
                 or not isinstance(raw_assessments, list)
             ):
                 return self._build_internal_failure_result(requested_operation)
 
             assessments_list: list[RetrievalCandidateAssessment] = []
             for item in raw_assessments:
-                if not isinstance(item, dict) or set(item) != assessment_fields:
-                    return self._build_internal_failure_result(requested_operation)
-                item_confidence = item["confidence"]
+                legacy_assessment_fields = {
+                    "matches_target",
+                    "action_compatible",
+                    "matched_fields",
+                    "reason_summary",
+                }
                 if (
-                    not isinstance(item["candidate_key"], str)
-                    or not isinstance(item["matches_target"], bool)
-                    or not isinstance(item["action_compatible"], bool)
-                    or isinstance(item_confidence, bool)
-                    or not isinstance(item_confidence, (int, float))
-                    or not isinstance(item["matched_fields"], list)
-                    or not all(
-                        isinstance(value, str) for value in item["matched_fields"]
+                    not isinstance(item, dict)
+                    or not required_assessment_fields.issubset(item)
+                    or not set(item).issubset(
+                        required_assessment_fields | legacy_assessment_fields
                     )
-                    or not isinstance(item["reason_summary"], str)
-                    or not isinstance(item["matched_text"], str)
                 ):
                     return self._build_internal_failure_result(requested_operation)
+                item_confidence = item["confidence"]
+                matched_text = item["matched_text"]
+                if (
+                    not isinstance(item["candidate_key"], str)
+                    or isinstance(item_confidence, bool)
+                    or not isinstance(item_confidence, (int, float))
+                    or not isinstance(matched_text, str)
+                ):
+                    return self._build_internal_failure_result(requested_operation)
+                # The exact grounded excerpt already carries the match
+                # decision: empty means no match, non-empty means a match.
+                # Keep accepting the former boolean during rolling upgrades,
+                # but reject it if it contradicts the evidence-bearing field.
+                matches_target = bool(matched_text)
+                if "matches_target" in item:
+                    legacy_matches_target = item["matches_target"]
+                    if (
+                        not isinstance(legacy_matches_target, bool)
+                        or legacy_matches_target != matches_target
+                    ):
+                        return self._build_internal_failure_result(
+                            requested_operation
+                        )
                 assessments_list.append(
                     RetrievalCandidateAssessment(
                         candidate_key=item["candidate_key"],
-                        matches_target=item["matches_target"],
-                        action_compatible=item["action_compatible"],
+                        matches_target=matches_target,
+                        # Candidate ownership/status and operation semantics are
+                        # enforced before/after model 2.  Asking the model to
+                        # repeat an action-compatible boolean added a failure
+                        # surface without adding evidence.
+                        action_compatible=True,
                         confidence=float(item_confidence),
-                        matched_fields=tuple(item["matched_fields"]),
-                        reason_summary=item["reason_summary"].strip(),
-                        matched_text=item["matched_text"],
+                        matched_fields=("text",) if matches_target else (),
+                        reason_summary=("matched" if matches_target else "not_matched"),
+                        matched_text=matched_text,
                     )
                 )
             assessments = tuple(assessments_list)
@@ -278,8 +318,9 @@ class KnowledgeRetrievalValidationStrategy:
                 confidence=float(raw_confidence),
                 ambiguous=False,
                 reason_summary=(
-                    raw_reason.strip()
-                    or "Knowledge validation returned a safe decision."
+                    "Knowledge validation passed."
+                    if raw_decision == "PASS"
+                    else "Knowledge validation requires clarification."
                 ),
                 candidate_assessments=assessments,
                 should_execute=raw_decision == "PASS",
@@ -490,6 +531,8 @@ class ReminderRetrievalValidationStrategy:
                 user_prompt=user_prompt,
                 schema=self._schema(),
             )
+            if is_structured_fallback(raw_response):
+                return None
             return self._parse_and_validate_result(raw_response, candidate_map)
         except Exception as e:
             logger.error(f"Reminder LLM validation failed: {e}")

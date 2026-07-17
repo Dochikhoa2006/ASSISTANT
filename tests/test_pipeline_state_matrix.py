@@ -31,6 +31,7 @@ from assistant_rag.contracts import (
 )
 from assistant_rag.llm import OllamaIntentClassifier
 from assistant_rag.pipeline import AssistantPipeline
+from assistant_rag.reminder_reply import build_reminder_state, reminder_state_hash
 
 
 def _last_qa_state() -> LastQAState:
@@ -456,6 +457,77 @@ def test_pipeline_routes_each_intent_exactly_once(
     assert current_chat_history() == []
 
 
+def test_pipeline_assigns_replied_reminder_state_to_output_last_qa() -> None:
+    reminder_state = build_reminder_state(
+        {
+            "reminder_id": "reminder-1",
+            "notification_id": "notification-1",
+            "subject": "Project review",
+            "source_topic_id": "topic-reminder",
+            "source_hop_id": "hop-reminder",
+        }
+    )
+    state = LastQAState(
+        last_user_query="Create a project review reminder.",
+        last_response="The reminder was created.",
+        response_type=ResponseType.REMINDER_ACTION,
+        linked_topic_id="topic-reminder",
+        linked_hop_id="hop-reminder",
+        reminder_state=reminder_state,
+        reminder_state_hash=reminder_state_hash(reminder_state),
+    )
+    resolution = LastQAResolution(
+        path=LastQAPath.LATEST_CONTEXT_INTERACTION,
+        rewritten_query="Please prepare a PDF agenda.",
+        state=state,
+        did_merge_query=False,
+        skip_broad_retrieval=True,
+        interaction_type=LastQAInteractionType.REMINDER_NOTIFICATION_REPLY,
+        question_source=QuestionSource.NONE,
+        linked_topic_id="topic-reminder",
+        linked_hop_id="hop-reminder",
+        reminder_id="reminder-1",
+        notification_id="notification-1",
+        source_topic_id="topic-reminder",
+        source_hop_id="hop-reminder",
+        is_authoritative_state=True,
+    )
+    store = _Store(state)
+    pipeline = AssistantPipeline(
+        config=SimpleNamespace(
+            context_filter=SimpleNamespace(
+                conversation_retrieval_after_last_qa_enabled=True,
+                conversation_retrieval_before_intent_enabled=True,
+            )
+        ),
+        last_qa_store=store,
+        query_rewriter=SimpleNamespace(rewrite=lambda query: query),
+        last_qa_resolver=_Resolver(resolution),
+        retriever=_Retriever([]),
+        context_filter=_ContextFilter(None),
+        classifier=_Classifier(Intent.GENERAL_RESPONSE),
+        router=_Router(ResponseType.NORMAL),
+        bundler=ResponseBundler(),
+        platform_selector=_PlatformSelector(),
+        chat_output=ChatOutput(),
+    )
+
+    response = pipeline.handle(
+        ChatRequest(user_id="user-1", raw_query="Please prepare a PDF agenda."),
+        _Repository([]),
+    )
+
+    persisted = response.last_qa_state
+    assert persisted.reminder_state is not None
+    assert persisted.reminder_state["title"] == "Project review"
+    assert persisted.reminder_state["reply_received"] is True
+    assert persisted.reminder_state["reply_kind"] == "notification_purpose_reply"
+    assert persisted.reminder_state_hash == reminder_state_hash(
+        persisted.reminder_state
+    )
+    assert store.saved[-1][1] == persisted
+
+
 class _LLMStub:
     def __init__(
         self,
@@ -594,12 +666,23 @@ def test_deterministic_last_qa_resolver_unmatched_normal_state_is_rejected() -> 
 def test_deterministic_last_qa_resolver_reminder_reply_requires_exact_source_hop(
     source_matches: bool,
 ) -> None:
+    reminder_state = {
+        "reminder_id": "reminder-1",
+        "notification_id": "notification-1",
+        "source_topic_id": "topic-reminder",
+        "source_hop_id": "hop-reminder",
+        "notification_created": True,
+        "has_been_notified": True,
+    }
+    state_digest = reminder_state_hash(reminder_state)
     state = LastQAState(
         last_user_query="Medication reminder",
         last_response="It is time for your medication.",
         response_type=ResponseType.REMINDER_REPLY,
         linked_topic_id="topic-reminder",
         linked_hop_id="hop-reminder",
+        reminder_state=reminder_state,
+        reminder_state_hash=state_digest,
     )
     request = ChatRequest(
         user_id="user-1",
@@ -610,6 +693,8 @@ def test_deterministic_last_qa_resolver_reminder_reply_requires_exact_source_hop
             "notification_id": "notification-1",
             "source_topic_id": "topic-reminder",
             "source_hop_id": "hop-reminder" if source_matches else "wrong-hop",
+            "reminder_state": reminder_state,
+            "reminder_state_hash": state_digest,
         },
     )
 
@@ -629,6 +714,46 @@ def test_deterministic_last_qa_resolver_reminder_reply_requires_exact_source_hop
         assert resolution.state is None
         assert resolution.skip_broad_retrieval is False
         assert resolution.is_authoritative_state is False
+
+
+def test_deterministic_reminder_reply_rejects_tampered_state_hash() -> None:
+    reminder_state = {
+        "reminder_id": "reminder-1",
+        "notification_id": "notification-1",
+        "source_topic_id": "topic-reminder",
+        "source_hop_id": "hop-reminder",
+        "notification_created": True,
+        "has_been_notified": True,
+    }
+    state = LastQAState(
+        last_user_query="Medication reminder",
+        last_response="It is time for your medication.",
+        response_type=ResponseType.REMINDER_REPLY,
+        linked_topic_id="topic-reminder",
+        linked_hop_id="hop-reminder",
+        reminder_state={**reminder_state, "title": "tampered"},
+        reminder_state_hash=reminder_state_hash(reminder_state),
+    )
+    request = ChatRequest(
+        user_id="user-1",
+        raw_query="Done",
+        reminder_id="reminder-1",
+        notification_id="notification-1",
+        metadata={
+            "reminder_reply_context": True,
+            "reminder_id": "reminder-1",
+            "notification_id": "notification-1",
+            "source_topic_id": "topic-reminder",
+            "source_hop_id": "hop-reminder",
+            "reminder_state": reminder_state,
+            "reminder_state_hash": reminder_state_hash(reminder_state),
+        },
+    )
+
+    resolution = LastQAResolver().resolve(request, "Done", state)
+
+    assert resolution.path is LastQAPath.BROAD_RETRIEVAL_REQUIRED
+    assert resolution.is_authoritative_state is False
 
 
 @pytest.mark.parametrize(

@@ -15,7 +15,12 @@ from assistant_rag.contracts import (
     LastQAState,
     ResponseType,
 )
-from assistant_rag.platform import GmailSender, PlatformSelector
+from assistant_rag.llm import LLMTask, structured_fallback_payload
+from assistant_rag.platform import (
+    PLATFORM_CHANNEL_SELECTION_SCHEMA,
+    GmailSender,
+    PlatformSelector,
+)
 
 
 _RECIPIENTS = ["alice@example.com", "bob@example.com"]
@@ -35,6 +40,11 @@ class IncompletePlatformLLM:
             "body": "The generated artifact is ready.",
             "mode": self.mode,
         }
+
+
+class UnexpectedPlatformLLM:
+    def generate_json(self, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("deterministic platform routing must not need an LLM call")
 
 
 @dataclass
@@ -118,6 +128,49 @@ def test_microsoft_artifact_email_phrases_route_to_gmail_deterministically(
         "source": "deterministic_explicit_email_request",
     }
     assert result["draft"]["recipients"] == _RECIPIENTS
+
+
+def test_explicit_gmail_delivery_skips_redundant_message_extraction_llm() -> None:
+    query = "Email the update to alice@example.com and bob@example.com."
+
+    result = PlatformSelector(llm=UnexpectedPlatformLLM()).select(
+        _bundled(None, rewritten_query=query),
+        ChatRequest(user_id="user-1", raw_query=_RAW_QUERY_SENTINEL),
+    )
+
+    assert result["platform_selection"]["channel"] == "gmail"
+    assert result["draft"]["recipients"] == _RECIPIENTS
+    assert result["draft"]["subject"] == "Generated Microsoft artifact"
+    assert result["draft"]["body"] == (
+        "Subject: Generated Microsoft artifact\n\n"
+        "The generated artifact is ready."
+    )
+
+
+def test_ordinary_response_skips_platform_selection_llm() -> None:
+    result = PlatformSelector(llm=UnexpectedPlatformLLM()).select(
+        _bundled(None, rewritten_query="Explain the approved project update."),
+        ChatRequest(user_id="user-1", raw_query=_RAW_QUERY_SENTINEL),
+    )
+
+    assert result["platform_selection"] == {
+        "channel": "none",
+        "confidence": 1.0,
+        "source": "deterministic_no_platform_request",
+    }
+    assert result["delivery"] == {"channel": "none", "status": "not_requested"}
+
+
+def test_platform_channel_structured_fallback_is_fail_closed() -> None:
+    assert set(PLATFORM_CHANNEL_SELECTION_SCHEMA["properties"]) == {"channel"}
+    fallback = structured_fallback_payload(
+        task=LLMTask.ACTION_PLANNING,
+        schema=PLATFORM_CHANNEL_SELECTION_SCHEMA,
+        user_prompt="{}",
+        error=ValueError("invalid channel output"),
+    )
+
+    assert fallback == {"channel": "none"}
 
 
 def test_email_address_question_does_not_route_to_gmail() -> None:

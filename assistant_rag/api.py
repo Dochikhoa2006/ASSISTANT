@@ -535,7 +535,11 @@ def build_api_app(
                 raise ValueError("Reminder reply context not found for user")
             if not context.get("source_hop_id"):
                 raise ValueError("Reminder source conversation is unavailable")
-            reply_last_qa = build_reminder_reply_last_qa(context)
+            reply_last_qa = build_reminder_reply_last_qa(
+                context,
+                reminder_id=reminder_id,
+                notification_id=notification_id,
+            )
             idempotency_key = str(payload.get("idempotency_key") or "").strip() or None
             request_id = new_request_id(idempotency_key)
             start_trace(request_id)

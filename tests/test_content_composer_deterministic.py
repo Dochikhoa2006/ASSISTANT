@@ -179,15 +179,15 @@ def test_every_configured_file_keyword_with_an_explicit_verb_selects_exactly_one
         ("Export the data as an .xlsx file.", "generate_excel"),
     ),
 )
-def test_explicit_single_type_executes_answer_then_exactly_one_file_tool(query: str, expected_tool: str) -> None:
+def test_explicit_single_type_executes_only_the_required_file_tool(query: str, expected_tool: str) -> None:
     result, tools = _compose(query)
 
-    assert result.used_tool_names == ("answer_generation", expected_tool)
+    assert result.used_tool_names == (expected_tool,)
     assert len(result.artifacts) == 1
     assert sum(tools[name].calls for name in ("generate_pdf", "generate_excel", "generate_pptx")) == 1
     assert tools[expected_tool].calls == 1
-    assert tools["answer_generation"].calls == 1
-    assert result.final_response_text == f"ran answer_generation\n\nran {expected_tool}"
+    assert tools["answer_generation"].calls == 0
+    assert result.final_response_text == f"ran {expected_tool}"
 
 
 @pytest.mark.parametrize(
@@ -216,7 +216,7 @@ def test_rewritten_query_is_the_sole_file_creation_authority() -> None:
         ),
     )
 
-    assert result.used_tool_names == ("answer_generation", "generate_excel")
+    assert result.used_tool_names == ("generate_excel",)
     assert tools["generate_excel"].calls == 1
     assert tools["generate_pdf"].calls == 0
     assert tools["generate_pptx"].calls == 0
@@ -356,7 +356,7 @@ def test_disabling_optional_composer_still_executes_answer_generation() -> None:
     assert '"file_route_status": "disabled"' in result.tool_trace_summary
 
 
-def test_missing_answer_tool_prevents_file_execution() -> None:
+def test_pure_file_request_does_not_require_an_answer_tool() -> None:
     config = GeneralPurposeConfig()
     excel = CountingTool("generate_excel")
     composer = DeterministicContentComposer(
@@ -365,9 +365,9 @@ def test_missing_answer_tool_prevents_file_execution() -> None:
 
     result = composer.compose(_input("Create an Excel expense tracker."), config)
 
-    assert result.used_tool_names == ()
-    assert excel.calls == 0
-    assert result.content_warnings == ("answer_tool_unavailable",)
+    assert result.used_tool_names == ("generate_excel",)
+    assert excel.calls == 1
+    assert result.content_warnings == ()
 
 
 def test_real_tool_prompts_keep_email_copy_out_of_excel_planner() -> None:

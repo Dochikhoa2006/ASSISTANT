@@ -55,6 +55,7 @@ from .content_composer import (
     DeterministicContentComposer,
 )
 from .autoscan import ReminderAutoscan
+from .reminder_supporting import ReminderSupportingQuestionPlanner
 from .reminder_timing import ReminderTimingPlanner
 
 
@@ -188,6 +189,21 @@ def build_reminder_timing_planner(
     return ReminderTimingPlanner(llm=llm)
 
 
+def build_reminder_supporting_question_planner(
+    settings: ProductionSettings,
+    *,
+    llm: LLMClient | None = None,
+) -> ReminderSupportingQuestionPlanner:
+    """Build autoscan question planning with the shared routed LLM client."""
+    if llm is None:
+        model_router = OllamaModelRouter(settings.ollama)
+        ollama_llm = OllamaLLMClient(settings.ollama, model_router)
+        onnx_llm = ONNXLLMClient(model_router)
+        _warm_llm_models(ollama_llm, onnx_llm)
+        llm = HybridLLMClient(ollama_llm, onnx_llm)
+    return ReminderSupportingQuestionPlanner(llm=llm)
+
+
 def build_production_runtime(settings: ProductionSettings) -> ProductionRuntime:
     """Build and fully warm the exact runtime used for every user query."""
     pipeline = build_production_pipeline(settings)
@@ -201,6 +217,9 @@ def build_production_runtime(settings: ProductionSettings) -> ProductionRuntime:
         reminder_autoscan=ReminderAutoscan(
             repository,
             timing_planner=build_reminder_timing_planner(settings, llm=llm),
+            supporting_question_planner=(
+                build_reminder_supporting_question_planner(settings, llm=llm)
+            ),
         ),
     )
 

@@ -30,6 +30,21 @@ class AssistantRepository(ABC):
     def append_conversation_hop(self, cursor: sqlite3.Cursor, *, topic_id: str, user_id: str, intent: str, raw_user_query: str, rewritten_user_query: str, raw_response: str, response_type: str, supporting_questions: list[str | dict[str, Any]] | None=None, parent_hop_id: str | None=None, branch_id: str | None=None, entities: dict[str, Any] | None=None, state_summary: str='', hop_id: str | None=None) -> HopWrite:
         pass
 
+    def merge_conversation_hop_entities(
+        self,
+        cursor: Any,
+        *,
+        user_id: str,
+        hop_id: str,
+        entities: dict[str, Any],
+    ) -> None:
+        """Merge semantic state into an existing owned hop.
+
+        Production repositories implement this hook. The compatibility no-op
+        keeps lightweight injected repositories usable outside durable SQL.
+        """
+        del cursor, user_id, hop_id, entities
+
     @abstractmethod
     def scan_due_reminders(self, *, now_value: str, limit: int = 100) -> list[str]:
         pass
@@ -47,7 +62,19 @@ class AssistantRepository(ABC):
         pass
 
     @abstractmethod
-    def load_reminder_reply_context(self, *, user_id: str, reminder_id: str, notification_id: str) -> dict[str, str | None]:
+    def list_reminders_requiring_supporting_question(self, *, limit: int = 100) -> list[PendingReminderSupportingQuestion]:
+        pass
+
+    @abstractmethod
+    def complete_reminder_supporting_question_plan(self, *, reminder_id: str, user_id: str, expected_version: int, question: str | None, confidence: float, reason: str) -> bool:
+        pass
+
+    @abstractmethod
+    def fail_reminder_supporting_question_plan(self, *, reminder_id: str, user_id: str, expected_version: int, reason: str) -> bool:
+        pass
+
+    @abstractmethod
+    def load_reminder_reply_context(self, *, user_id: str, reminder_id: str, notification_id: str) -> dict[str, Any]:
         pass
 
     @abstractmethod

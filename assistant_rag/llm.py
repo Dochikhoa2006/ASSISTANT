@@ -81,6 +81,34 @@ class LLMClient(Protocol):
         ...
 
 
+class StructuredFallbackPayload(dict[str, Any]):
+    """Schema-compatible terminal recovery with out-of-band provenance.
+
+    The marker deliberately lives on the mapping object rather than inside it,
+    so a minimal model schema does not need diagnostic fields and strict
+    downstream key guards continue to see only the declared output contract.
+    """
+
+    __slots__ = ("task", "reason")
+
+    def __init__(
+        self,
+        payload: dict[str, Any],
+        *,
+        task: LLMTask,
+        reason: str,
+    ) -> None:
+        super().__init__(payload)
+        self.task = task
+        self.reason = reason
+
+
+def is_structured_fallback(payload: Any) -> bool:
+    """Return whether a structured result is terminal recovery, not model data."""
+
+    return isinstance(payload, StructuredFallbackPayload)
+
+
 @dataclass(frozen=True)
 class OllamaModelRouter:
     settings: OllamaSettings
@@ -177,12 +205,18 @@ class OllamaLLMClient:
                         attempt_mode=attempt_mode,
                     )
                     payload = parse_json_object(raw)
+                    payload, normalized = normalize_structured_output(
+                        payload,
+                        schema,
+                    )
                     validate_json_schema(payload, schema)
                     trace = current_trace()
                     if trace and trace._active_timers:
                         timer = trace._active_timers[-1]
                         timer.metadata["structured_attempts"] = attempt_index
                         timer.metadata["structured_configured_attempts"] = total_attempts
+                        if normalized:
+                            timer.metadata["structured_output_normalized"] = True
                         if attempt_errors:
                             timer.metadata["structured_previous_failures"] = len(attempt_errors)
                             timer.metadata["structured_last_retry_error"] = attempt_errors[-1]
@@ -463,12 +497,91 @@ def validate_json_schema(payload: dict[str, Any], schema: dict[str, Any]) -> Non
     _validate_json_value(payload, schema, path="$")
 
 
+def normalize_structured_output(
+    payload: dict[str, Any],
+    schema: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Apply only lossless, schema-authorized repairs before validation.
+
+    This removes keys only when ``additionalProperties`` explicitly forbids
+    them, canonicalizes an enum string only when casing identifies exactly one
+    declared value, and converts integral JSON numbers to integers. Missing or
+    semantically contradictory values remain failures and consume the normal
+    bounded recovery path.
+    """
+
+    normalized = _normalize_structured_value(payload, schema)
+    if not isinstance(normalized, dict):
+        return payload, False
+    return normalized, not _same_json_shape_and_value(normalized, payload)
+
+
+def _same_json_shape_and_value(left: Any, right: Any) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _same_json_shape_and_value(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _same_json_shape_and_value(a, b) for a, b in zip(left, right)
+        )
+    return left == right
+
+
+def _normalize_structured_value(value: Any, rules: dict[str, Any]) -> Any:
+    enum_values = rules.get("enum")
+    if isinstance(value, str) and isinstance(enum_values, list):
+        matches = [
+            candidate
+            for candidate in enum_values
+            if isinstance(candidate, str)
+            and candidate.casefold() == value.casefold()
+        ]
+        if len(matches) == 1:
+            value = matches[0]
+
+    expected_type = rules.get("type")
+    if (
+        expected_type == "integer"
+        and isinstance(value, float)
+        and not isinstance(value, bool)
+        and value.is_integer()
+    ):
+        value = int(value)
+
+    if isinstance(value, dict) and expected_type == "object":
+        properties = rules.get("properties") or {}
+        allowed_keys = set(properties)
+        keys = (
+            [key for key in value if key in allowed_keys]
+            if rules.get("additionalProperties") is False
+            else list(value)
+        )
+        return {
+            key: _normalize_structured_value(value[key], properties[key])
+            if key in properties
+            else value[key]
+            for key in keys
+        }
+
+    if isinstance(value, list) and isinstance(rules.get("items"), dict):
+        return [
+            _normalize_structured_value(item, rules["items"])
+            for item in value
+        ]
+    return value
+
+
 def _validate_json_value(value: Any, rules: dict[str, Any], *, path: str) -> None:
     expected_type = rules.get("type")
     if expected_type == "string" and not isinstance(value, str):
         raise ValueError(f"Structured output field must be string: {path}")
     if expected_type == "number" and (isinstance(value, bool) or not isinstance(value, (int, float))):
         raise ValueError(f"Structured output field must be number: {path}")
+    if expected_type == "integer" and (isinstance(value, bool) or not isinstance(value, int)):
+        raise ValueError(f"Structured output field must be integer: {path}")
     if expected_type == "boolean" and not isinstance(value, bool):
         raise ValueError(f"Structured output field must be boolean: {path}")
     if expected_type == "array" and not isinstance(value, list):
@@ -510,21 +623,19 @@ def structured_fallback_payload(
         payload.update({"rewritten_query": query})
     elif task == LLMTask.LAST_QA:
         payload.update({
-            "interaction_detected": False,
-            "interaction_type": "",
+            "interaction_type": "ambiguous",
             "question_source": "none",
             "matched_question": "",
             "confidence": 0.0,
-            "llm_suggested_skip_broad_retrieval": False,
         })
     elif task == LLMTask.INTENT:
-        payload.update({
-            "intent": Intent.GENERAL_RESPONSE.value,
-            "confidence": 1.0,
-            "multi_intent": False,
-            "requires_clarification": False,
-            "reason_summary": reason,
-        })
+        if "operation_kind" in (schema.get("properties") or {}):
+            payload.update({"operation_kind": "none", "confidence": 1.0})
+        else:
+            payload.update({
+                "intent": Intent.GENERAL_RESPONSE.value,
+                "confidence": 1.0,
+            })
     elif task == LLMTask.REMINDER_ACTION_EXTRACTION:
         payload.update({
             "action": "add",
@@ -562,11 +673,14 @@ def structured_fallback_payload(
         payload.update({"results": []})
     elif task == LLMTask.GENERATE_CLARIFICATION:
         payload.update({
-            "question_text": DEFAULT_PROMPT_REGISTRY.message("fallback_message"),
+            # Technical recovery must never impersonate a semantic decision to
+            # ask the user something. Consumers use the out-of-band fallback
+            # marker and this empty fail-closed shape to pause cleanly.
+            "question_text": "",
             "question_source": "clarification_question",
             "purpose": "resolve_missing_info",
-            "confidence": 1.0,
-            "should_ask": True,
+            "confidence": 0.0,
+            "should_ask": False,
             "expected_response_type": "unknown",
             "reason_summary": reason,
         })
@@ -600,9 +714,7 @@ def structured_fallback_payload(
             "decision": "FAIL",
             "selected_candidate_keys": [],
             "confidence": 0.0,
-            "clarification_question": DEFAULT_PROMPT_REGISTRY.message(
-                "knowledge_missing_action"
-            ),
+            "clarification_question": "",
             "reason_summary": reason,
             "candidate_assessments": [],
         })
@@ -611,10 +723,7 @@ def structured_fallback_payload(
             "validation_result": "FAIL",
             "selected_candidate_keys": [],
             "confidence": 0.0,
-            "clarification_question": (
-                "Could you clarify which reminder you want to change and "
-                "the exact result you want?"
-            ),
+            "clarification_question": "",
             "candidate_assessments": [],
         })
     elif task == LLMTask.RETRIEVAL_VALIDATION:
@@ -643,6 +752,17 @@ def structured_fallback_payload(
         })
     elif task == LLMTask.ACTION_PLANNING:
         payload.update({"confidence": 0.0, "reason_summary": reason})
+        properties = schema.get("properties") or {}
+        channel_values = (properties.get("channel") or {}).get("enum") or []
+        if "none" in channel_values:
+            payload["channel"] = "none"
+        mode_values = (properties.get("mode") or {}).get("enum") or []
+        if "draft" in mode_values:
+            payload["mode"] = "draft"
+        if "should_ask" in properties:
+            payload["should_ask"] = False
+        if "needs_clarification" in properties:
+            payload["needs_clarification"] = True
     elif task in {
         LLMTask.CONTENT_COMPOSER_REACT,
         LLMTask.ANSWER,
@@ -658,7 +778,20 @@ def structured_fallback_payload(
     if "presentation_title" in payload:
         payload.update({"presentation_title": "Untitled", "slides": [], "confidence": 0.0, "reason_summary": reason})
 
-    return payload
+    # Fallbacks obey the same bounded output surface as the real model. This
+    # prevents obsolete diagnostic keys from re-expanding a deliberately
+    # minimal schema or tripping a downstream response guard.
+    allowed_fields = set((schema.get("properties") or {}).keys())
+    filtered_payload = {
+        key: value
+        for key, value in payload.items()
+        if key in allowed_fields
+    }
+    return StructuredFallbackPayload(
+        filtered_payload,
+        task=task,
+        reason=reason,
+    )
 
 
 def _log_structured_fallback(
@@ -859,15 +992,6 @@ class OllamaIntentClassifier:
         schema = {
             "type": "object",
             "properties": {
-                "intent": {
-                    "type": "string",
-                    "enum": [
-                        "clarification",
-                        "general_response",
-                        "knowledge_facts",
-                        "reminder",
-                    ],
-                },
                 "operation_kind": {
                     "type": "string",
                     "enum": [
@@ -880,7 +1004,6 @@ class OllamaIntentClassifier:
                 "confidence": {"type": "number"},
             },
             "required": [
-                "intent",
                 "operation_kind",
                 "confidence",
             ],
@@ -904,6 +1027,8 @@ class OllamaIntentClassifier:
                 ),
                 schema=schema,
             )
+            if is_structured_fallback(payload):
+                return Intent.GENERAL_RESPONSE
             validate_json_schema(payload, schema)
         except Exception:
             return Intent.GENERAL_RESPONSE

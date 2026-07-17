@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 
-from .llm import LLMClient, LLMTask
+from .llm import LLMClient, LLMTask, is_structured_fallback
 from .chat_history import CHAT_HISTORY_PROMPT_RULE, inject_chat_history
 
 
@@ -54,12 +54,12 @@ class ReminderTimingPlanner:
 
         schema = {
             "type": "object",
-            "required": ["lead_minutes", "confidence", "needs_clarification", "reason"],
+            "additionalProperties": False,
+            "required": ["lead_minutes", "confidence", "needs_clarification"],
             "properties": {
                 "lead_minutes": {"type": "integer", "minimum": 0, "maximum": self.max_lead_minutes},
                 "confidence": {"type": "number"},
                 "needs_clarification": {"type": "boolean"},
-                "reason": {"type": "string"},
             },
         }
         try:
@@ -91,15 +91,26 @@ class ReminderTimingPlanner:
                 ),
                 schema=schema,
             )
+            if is_structured_fallback(payload):
+                return ReminderTimingDecision(
+                    None,
+                    0.0,
+                    payload.reason,
+                    True,
+                )
             confidence = max(0.0, min(1.0, float(payload.get("confidence", 0.0))))
             lead_minutes = int(payload.get("lead_minutes", -1))
             needs_clarification = bool(payload.get("needs_clarification", False))
-            reason = str(payload.get("reason") or "").strip()
         except Exception as exc:
             return ReminderTimingDecision(None, 0.0, f"Timing planner unavailable: {type(exc).__name__}.", True)
 
         if needs_clarification or confidence < self.min_confidence:
-            return ReminderTimingDecision(None, confidence, reason or "Timing confidence is too low.", True)
+            return ReminderTimingDecision(
+                None,
+                confidence,
+                "Timing needs clarification or confidence is too low.",
+                True,
+            )
         if lead_minutes < 0 or lead_minutes > self.max_lead_minutes:
             return ReminderTimingDecision(None, confidence, "The timing lead was outside the allowed range.", True)
 
@@ -109,5 +120,5 @@ class ReminderTimingPlanner:
         return ReminderTimingDecision(
             notification_time=event_time - timedelta(minutes=lead_minutes),
             confidence=confidence,
-            reason=reason or f"Notify {lead_minutes} minutes before the event.",
+            reason=f"Notify {lead_minutes} minutes before the event.",
         )

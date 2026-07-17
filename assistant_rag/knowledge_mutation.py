@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import json
 from math import isfinite
 from typing import Any
@@ -22,7 +22,7 @@ from .contracts import (
     ValidatedKnowledgeAction,
 )
 from .database import AssistantRepository
-from .llm import LLMClient, LLMTask
+from .llm import LLMClient, LLMTask, is_structured_fallback
 from .prompts import (
     KNOWLEDGE_ACTION_EXTRACTION_SCHEMA,
     KNOWLEDGE_CONTENT_FINALIZATION_SCHEMA,
@@ -57,28 +57,29 @@ def _knowledge_prompt_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class _KnowledgeActionExtraction:
-    """One schema-complete first-stage knowledge extraction."""
+    """One minimal first-stage knowledge extraction."""
 
     action: str
     text_content: str
     original_text: str
     replacement_text: str
     confidence: float
-    missing_fields: tuple[str, ...]
-    reason_summary: str
 
     @classmethod
     def from_payload(cls, payload: Any) -> _KnowledgeActionExtraction | None:
-        expected_fields = {
+        required_fields = {
             "action",
             "text_content",
             "original_text",
             "replacement_text",
             "confidence",
-            "missing_fields",
-            "reason_summary",
         }
-        if not isinstance(payload, dict) or set(payload) != expected_fields:
+        legacy_fields = {"missing_fields", "reason_summary"}
+        if (
+            not isinstance(payload, dict)
+            or not required_fields.issubset(payload)
+            or not set(payload).issubset(required_fields | legacy_fields)
+        ):
             return None
         if not all(
             isinstance(payload[field], str)
@@ -87,7 +88,6 @@ class _KnowledgeActionExtraction:
                 "text_content",
                 "original_text",
                 "replacement_text",
-                "reason_summary",
             )
         ):
             return None
@@ -97,9 +97,13 @@ class _KnowledgeActionExtraction:
             (int, float),
         ):
             return None
-        raw_missing_fields = payload["missing_fields"]
-        if not isinstance(raw_missing_fields, list) or not all(
-            isinstance(value, str) for value in raw_missing_fields
+        if "missing_fields" in payload and (
+            not isinstance(payload["missing_fields"], list)
+            or not all(isinstance(item, str) for item in payload["missing_fields"])
+        ):
+            return None
+        if "reason_summary" in payload and not isinstance(
+            payload["reason_summary"], str
         ):
             return None
         return cls(
@@ -108,8 +112,6 @@ class _KnowledgeActionExtraction:
             original_text=payload["original_text"].strip(),
             replacement_text=payload["replacement_text"].strip(),
             confidence=float(raw_confidence),
-            missing_fields=tuple(raw_missing_fields),
-            reason_summary=payload["reason_summary"].strip(),
         )
 
 
@@ -209,6 +211,12 @@ class LLMKnowledgeActionDetector:
                 ),
                 schema=KNOWLEDGE_ACTION_EXTRACTION_SCHEMA,
             )
+            if is_structured_fallback(payload):
+                return self._failed(
+                    intent,
+                    "knowledge_action_extraction_structured_fallback",
+                    ["action"],
+                )
         except Exception:
             return self._failed(
                 intent,
@@ -228,7 +236,6 @@ class LLMKnowledgeActionDetector:
         original_text = extraction.original_text
         replacement_text = extraction.replacement_text
         confidence = extraction.confidence
-        missing_fields = list(extraction.missing_fields)
 
         if intent is not Intent.KNOWLEDGE_FACTS:
             return self._failed(
@@ -331,6 +338,7 @@ class LLMKnowledgeActionDetector:
                 intent,
                 "knowledge_content_not_grounded_in_request_context",
                 ungrounded_fields,
+                failure_kind="semantic_gap",
             )
 
         if trusted_confirmation_action and not self._matches_confirmation_action(
@@ -350,20 +358,25 @@ class LLMKnowledgeActionDetector:
         if trusted_topic_title:
             action_payload["topic_title"] = str(trusted_topic_title)
 
+        first_model_response: dict[str, Any] = {
+            "action": action_name,
+            "text_content": text_content,
+            "original_text": original_text,
+            "replacement_text": replacement_text,
+            "confidence": confidence,
+        }
+        # Accept the two harmless diagnostic fields emitted by the previous
+        # contract during rolling upgrades. New schemas never request them.
+        for legacy_field in ("missing_fields", "reason_summary"):
+            if legacy_field in payload:
+                first_model_response[legacy_field] = payload[legacy_field]
+
         return ActionDetectionResult(
             intent=intent,
             confidence=confidence,
             metadata={
                 "knowledge_actions": [action_payload],
-                "knowledge_action_extraction_response": {
-                    "action": action_name,
-                    "text_content": text_content,
-                    "original_text": original_text,
-                    "replacement_text": replacement_text,
-                    "confidence": confidence,
-                    "missing_fields": list(extraction.missing_fields),
-                    "reason_summary": extraction.reason_summary,
-                },
+                "knowledge_action_extraction_response": first_model_response,
                 "action_authorization": {
                     "intent": intent.value,
                     "action": action_name,
@@ -371,10 +384,7 @@ class LLMKnowledgeActionDetector:
                     "source": "knowledge_action_extraction_llm",
                 },
             },
-            missing_fields=self._normalize_missing_fields(
-                action_name,
-                missing_fields,
-            ),
+            missing_fields=[],
         )
 
     @staticmethod
@@ -446,35 +456,6 @@ class LLMKnowledgeActionDetector:
         )
 
     @staticmethod
-    def _normalize_missing_fields(
-        action_name: str,
-        fields: list[str],
-    ) -> list[str]:
-        normalized: list[str] = []
-        for field in fields:
-            key = field.casefold()
-            if action_name == "add" and key in {
-                "text_content",
-                "knowledge_content",
-                "content",
-            }:
-                key = "text"
-            elif action_name == "delete" and key in {
-                "text_content",
-                "original_text",
-                "knowledge_content",
-                "content",
-            }:
-                key = "target_description"
-            elif action_name == "modify" and key in {
-                "original_text",
-                "text_content",
-            }:
-                key = "target_description"
-            normalized.append(key)
-        return list(dict.fromkeys(normalized))
-
-    @staticmethod
     def _grounding_text(value: str) -> str:
         return " ".join(
             unicodedata.normalize("NFKC", value).casefold().split()
@@ -492,12 +473,15 @@ class LLMKnowledgeActionDetector:
         intent: Intent,
         reason: str,
         missing_fields: list[str],
+        *,
+        failure_kind: str = "technical_failure",
     ) -> ActionDetectionResult:
         return ActionDetectionResult(
             intent=intent,
             confidence=0.0,
             missing_fields=missing_fields,
             risk_flags=[reason],
+            failure_kind=failure_kind,
         )
 
 
@@ -605,6 +589,10 @@ class KnowledgeContentFinalizationStrategy:
                         chat_history=context.chat_history,
                         extra={
                             "first_model_response": authoritative_first_response,
+                            # Retain the two compact consistency mirrors used
+                            # by this established knowledge-only prompt. They
+                            # are deterministic runtime inputs, not additional
+                            # model output invariants.
                             "operation": authoritative_first_response["action"],
                             "extracted_action_content": {
                                 "text_content": authoritative_first_response[
@@ -621,24 +609,15 @@ class KnowledgeContentFinalizationStrategy:
                                 {
                                     "candidate_key": selected_candidate.candidate_key,
                                     "text": selected_candidate.text,
-                                    "source_title": selected_candidate.source_title,
-                                    "selected": True,
                                     "matched_text": matched_text,
                                 }
                             ],
                             "validation_result": {
-                                "operation": validation_result.operation,
                                 "decision": "PASS",
-                                "selected_candidate_keys": list(
-                                    validation_result.selected_candidate_keys
+                                "selected_candidate_key": (
+                                    selected_candidate.candidate_key
                                 ),
                                 "confidence": validation_result.confidence,
-                                "clarification_question": "",
-                                "reason_summary": validation_result.reason_summary,
-                                "candidate_assessments": [
-                                    asdict(item)
-                                    for item in validation_result.candidate_assessments
-                                ],
                             },
                             "supporting_question_context": supporting_question_context(
                                 context.chat_history
@@ -648,9 +627,10 @@ class KnowledgeContentFinalizationStrategy:
                 ),
                 schema=KNOWLEDGE_CONTENT_FINALIZATION_SCHEMA,
             )
+            if is_structured_fallback(payload):
+                return None
             final_content = str(payload["final_content"]).strip()
             confidence = float(payload["confidence"])
-            reason_summary = str(payload["reason_summary"])
         except Exception:
             return None
 
@@ -673,7 +653,7 @@ class KnowledgeContentFinalizationStrategy:
         return KnowledgeFinalizationResult(
             final_content=final_content,
             confidence=confidence,
-            reason_summary=reason_summary,
+            reason_summary="Model 3 produced the exact validated replacement.",
         )
 
     @staticmethod

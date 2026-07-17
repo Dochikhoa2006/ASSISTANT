@@ -79,6 +79,7 @@ from assistant_rag.llm import (
     OllamaLLMClient,
     OllamaModelRouter,
     _structured_attempt_prompt,
+    is_structured_fallback,
     structured_fallback_payload,
     uses_onnx_runtime,
     validate_json_schema,
@@ -567,7 +568,9 @@ class ScenarioLLM:
         prefix = "Runtime context:\n"
         payload = json.loads(prompt[len(prefix) :]) if prompt.startswith(prefix) else {}
         if task is LLMTask.KNOWLEDGE_ACTION_EXTRACTION:
-            raw_query = str(payload.get("raw_query") or "").strip()
+            raw_query = str(
+                payload.get("rewritten_query") or payload.get("raw_query") or ""
+            ).strip()
             extra = payload.get("extra") or {}
             confirmed = list(
                 extra.get("trusted_confirmation_action_context") or []
@@ -728,16 +731,18 @@ class ScenarioLLM:
                 assessments.append(
                     {
                         "candidate_key": key,
-                        "matches_target": matches,
-                        "action_compatible": matches,
                         "confidence": 0.99 if matches else 0.95,
-                        "matched_fields": ["text"] if matches else [],
-                        "reason_summary": "Deterministic full-text debug assessment.",
                         "matched_text": matched_text,
                     }
                 )
-            if operation == "add":
-                duplicate = any(item["matches_target"] for item in assessments)
+            if operation == "modify" and not replacement:
+                decision = "FAIL"
+                clarification_question = (
+                    "What should replace that stored fact?"
+                )
+                selected = []
+            elif operation == "add":
+                duplicate = any(item["matched_text"] for item in assessments)
                 decision = "FAIL" if duplicate else "PASS"
                 clarification_question = (
                     "That fact is already stored. What different fact should I add?"
@@ -795,10 +800,7 @@ class ScenarioLLM:
             extracted = extra.get("extracted_action_content") or {}
             candidates = list(extra.get("validated_candidate_context") or [])
             validation = extra.get("validation_result") or {}
-            selected = next(
-                (item for item in candidates if item.get("selected")),
-                {},
-            )
+            selected = candidates[0] if len(candidates) == 1 else {}
             final_content = str(selected.get("text") or "")
             matched_text = str(selected.get("matched_text") or "")
             replacement = str(extracted.get("replacement_text") or "")
@@ -811,7 +813,9 @@ class ScenarioLLM:
             }
 
         if task is LLMTask.REMINDER_ACTION_EXTRACTION:
-            raw_query = str(payload.get("raw_query") or "")
+            raw_query = str(
+                payload.get("rewritten_query") or payload.get("raw_query") or ""
+            )
             extra = payload.get("extra") or {}
             confirmed = list(
                 extra.get("trusted_confirmation_action_context") or []
@@ -820,11 +824,11 @@ class ScenarioLLM:
             if not source:
                 folded = raw_query.casefold()
                 if re.match(r"^\s*(?:turn|switch)\s+off\b", folded):
-                    action_name = "toggle"
-                    toggle_direction = "turn_off"
+                    action_name = "turn_off"
+                    toggle_direction = ""
                 elif re.match(r"^\s*(?:turn|switch)\s+on\b", folded):
-                    action_name = "toggle"
-                    toggle_direction = "turn_on"
+                    action_name = "turn_on"
+                    toggle_direction = ""
                 elif re.match(r"^\s*(?:delete|remove|cancel)\b", folded):
                     action_name = "delete"
                     toggle_direction = ""
@@ -900,6 +904,7 @@ class ScenarioLLM:
                     if time_match:
                         source["new_reminder_time"] = time_match.group(0)
                         source["original_time_text"] = time_match.group(0)
+                        source["user_timezone"] = "UTC"
                 else:
                     target = re.sub(
                         r"(?i)^\s*(?:delete|remove|cancel|turn\s+on|turn\s+off|switch\s+on|switch\s+off)\s+(?:the\s+)?",
@@ -910,12 +915,11 @@ class ScenarioLLM:
                         r"(?i)\s+reminder\s*$", "", target
                     ).strip(" .")
             stored_action = str(source.get("action") or "add")
-            if stored_action in {"turn_on", "turn_off"}:
-                action = "toggle"
-                toggle_direction = stored_action
-            else:
-                action = stored_action
-                toggle_direction = str(source.get("toggle_direction") or "")
+            action = (
+                str(source.get("toggle_direction") or "")
+                if stored_action == "toggle"
+                else stored_action
+            )
             record = {field: "" for field in REMINDER_EDITABLE_FIELDS}
             retrieval_text = str(
                 source.get("retrieval_text")
@@ -1026,33 +1030,43 @@ class ScenarioLLM:
                     missing_fields.append("notification_time")
             elif action == "modify" and not changed_fields:
                 missing_fields.append("changed_fields")
+            model_fields = tuple(
+                field
+                for field in REMINDER_EDITABLE_FIELDS
+                if field not in {"supporting_question", "supporting_response"}
+            )
+            supplied_fields = (
+                [field for field in model_fields if record[field]]
+                if action == "add"
+                else [
+                    field
+                    for field in changed_fields
+                    if field in model_fields
+                ]
+                if action == "modify"
+                else []
+            )
             return {
                 "action": action,
-                "toggle_direction": toggle_direction,
                 "retrieval_text": retrieval_text,
-                "changed_fields": changed_fields,
-                **record,
-                "time_semantics": time_semantics,
+                "field_values": [
+                    {"field": field, "value": record[field]}
+                    for field in supplied_fields
+                ],
                 "confidence": 0.99 if not missing_fields else 0.0,
-                "missing_fields": missing_fields,
-                "reason_summary": "Scenario LLM selected one reminder action.",
             }
 
         if task is LLMTask.REMINDER_ACTION_VALIDATION:
-            extra = payload.get("extra") or {}
-            operation = str(extra.get("operation") or "")
-            extracted = extra.get("extracted_action") or {}
-            target = str(extracted.get("retrieval_text") or "").strip()
-            candidates = list(extra.get("candidate_reminders") or [])
-            allowed_statuses = set(
-                (extra.get("validation_policy") or {}).get("allowed_statuses") or []
-            )
-            no_op_statuses = set(
-                (extra.get("validation_policy") or {}).get("no_op_statuses") or []
-            )
+            first_response = payload.get("first_model_response") or {}
+            operation = str(first_response.get("action") or "")
+            target = str(first_response.get("retrieval_text") or "").strip()
+            field_values = {
+                str(item.get("field") or ""): str(item.get("value") or "")
+                for item in first_response.get("field_values") or []
+                if isinstance(item, dict)
+            }
+            candidates = list(payload.get("reminder_retrieval") or [])
             assessments: list[dict[str, Any]] = []
-            compatible_matches: list[str] = []
-            no_op_matches: list[str] = []
             semantic_matches: list[str] = []
             for candidate in candidates:
                 candidate_key = str(candidate.get("candidate_key") or "")
@@ -1076,123 +1090,70 @@ class ScenarioLLM:
                         matched_text = value
                         break
                 matches = bool(matched_field)
-                compatible = str(candidate.get("status") or "") in allowed_statuses
                 if matches:
                     semantic_matches.append(candidate_key)
-                if matches and compatible:
-                    compatible_matches.append(candidate_key)
-                if matches and str(candidate.get("status") or "") in no_op_statuses:
-                    no_op_matches.append(candidate_key)
                 assessments.append(
                     {
                         "candidate_key": candidate_key,
-                        "matches_target": matches,
-                        "action_compatible": compatible,
                         "confidence": 0.99 if matches else 0.95,
-                        "matched_fields": [matched_field] if matches else [],
+                        "evidence_field": matched_field if matches else "",
                         "matched_text": matched_text,
-                        "reason_summary": "Deterministic complete SQL reminder assessment.",
                     }
                 )
 
-            asserted_fields = (
-                REMINDER_EDITABLE_FIELDS
+            has_time = bool(
+                field_values.get("notification_time")
+                or field_values.get("event_time")
+            )
+            extraction_complete = (
+                bool(target and field_values.get("subject") and has_time)
                 if operation == "add"
-                else tuple(str(item) for item in extracted.get("changed_fields") or [])
+                else bool(target and field_values)
+                if operation == "modify"
+                else bool(target and not field_values)
             )
-            asserted_text = " ".join(str(extracted.get(field) or "") for field in asserted_fields)
-            factuality_concern = bool(
-                re.search(r"\b1\s*\+\s*1\s*=\s*3\b", asserted_text)
-            )
-            selected: list[str] = []
-            ambiguous = False
-            requires_hitl = False
-            hitl_reason = ""
-            if factuality_concern:
-                result = "CLARIFY_MISSING_FIELDS"
-                should_execute = False
-                requires_hitl = True
-                hitl_reason = "factuality_concern"
-            elif operation == "add":
-                result = "SKIP_ALREADY_EXISTS" if compatible_matches else "EXECUTE"
-                should_execute = not compatible_matches
-            elif len(semantic_matches) > 1:
-                result = "CLARIFY_AMBIGUOUS_TARGET"
-                should_execute = False
-                ambiguous = True
-                requires_hitl = True
-                hitl_reason = "ambiguous_target"
-            elif len(compatible_matches) == 1:
-                candidate = next(
-                    item
-                    for item in candidates
-                    if str(item.get("candidate_key") or "") == compatible_matches[0]
+            if not extraction_complete:
+                decision = "FAIL"
+                selected = []
+                clarification_question = (
+                    "When should I remind you?"
+                    if operation == "add" and not has_time
+                    else "Which exact reminder and change should I use?"
                 )
-                changed_fields = {
-                    str(item) for item in extracted.get("changed_fields") or []
-                }
-                compared_fields = set(changed_fields)
-                if changed_fields & {"notification_time", "event_time"}:
-                    compared_fields.discard("original_time_text")
-                same_modify = operation == "modify" and compared_fields and all(
-                    str(extracted.get(field) or "").strip()
-                    == str(candidate.get(field) or "").strip()
-                    for field in compared_fields
-                )
-                if same_modify:
-                    result = "SKIP_ALREADY_EXISTS"
-                    selected = compatible_matches
-                    should_execute = False
-                else:
-                    result = "EXECUTE"
-                    selected = compatible_matches
-                    should_execute = True
-            elif len(no_op_matches) == 1:
-                result = "SKIP_ALREADY_EXISTS"
-                selected = no_op_matches
-                should_execute = False
+            elif operation == "add" and not semantic_matches:
+                decision = "PASS"
+                selected: list[str] = []
+                clarification_question = ""
+            elif operation != "add" and len(semantic_matches) == 1:
+                decision = "PASS"
+                selected = [semantic_matches[0]]
+                clarification_question = ""
             else:
-                result = "SKIP_NOT_FOUND"
-                should_execute = False
+                decision = "FAIL"
+                selected = []
+                clarification_question = (
+                    "That reminder already exists. What should be different?"
+                    if operation == "add"
+                    else "Which exact reminder should I change?"
+                )
             return {
-                "operation": operation,
-                "validation_result": result,
+                "validation_result": decision,
                 "selected_candidate_keys": selected,
                 "confidence": 0.99,
-                "ambiguous": ambiguous,
-                "should_execute": should_execute,
-                "requires_hitl": requires_hitl,
-                "factuality_concern": factuality_concern,
-                "hitl_reason": hitl_reason,
-                "reason_summary": "Deterministic debug reminder validation.",
+                "clarification_question": clarification_question,
                 "candidate_assessments": assessments,
             }
 
         if task is LLMTask.REMINDER_CONTENT_FINALIZATION:
-            extra = payload.get("extra") or {}
-            operation = str(extra.get("operation") or "")
-            extracted = extra.get("extracted_action_manifest") or {}
-            selected = extra.get("selected_candidate_manifest") or {}
-            changed_fields = {
-                str(field) for field in extracted.get("changed_fields") or []
-            }
-            field_bindings = []
-            for field in REMINDER_EDITABLE_FIELDS:
-                source = (
-                    "extracted_action"
-                    if operation == "add"
-                    or (operation == "modify" and field in changed_fields)
-                    else "selected_candidate"
-                )
-                field_bindings.append({"field": field, "source": source})
+            first_response = (payload.get("extra") or {}).get(
+                "first_model_response"
+            ) or payload.get("first_model_response") or {}
             return {
-                "operation": operation,
-                "selected_candidate_key": str(
-                    (selected or {}).get("candidate_key") or ""
+                "approved": bool(
+                    first_response.get("action") == "modify"
+                    and first_response.get("field_values")
                 ),
-                "field_bindings": field_bindings,
                 "confidence": 0.99,
-                "reason_summary": "Deterministic debug reminder finalization.",
             }
 
         raise AssertionError("deterministic content composer must not request a ReAct decision")
@@ -1338,9 +1299,7 @@ def build_scenario_state(settings: ProductionSettings) -> ScenarioState:
                     min_confidence=debug_settings.prompt_policy.action_min_confidence,
                     default_timezone=config.default_timezone,
                 ),
-                clarification_strategy=clarification_strategy,
                 prompt_registry=DEFAULT_PROMPT_REGISTRY,
-                validated_action_builder=validated_builder,
                 retriever=retriever,
                 context_filter=context_filter,
                 llm=reminder_llm,
@@ -1731,7 +1690,53 @@ def scenario_user_entrypoint_runtime_parity(settings: ProductionSettings) -> Sce
     )
 
 
+def scenario_streamlit_terminal_failure_containment(
+    _settings: ProductionSettings,
+) -> ScenarioResult:
+    """An escaped backend failure must not crash chat or ask forever."""
+
+    import streamlit_app
+
+    request = ChatRequest(
+        user_id="streamlit-debug-failure",
+        raw_query="Handle this request.",
+        idempotency_key="streamlit-debug-failure-key",
+    )
+    original_execute = streamlit_app._execute_user_request
+    try:
+        for error in (
+            RequestLifecycleConflict("already in progress"),
+            RuntimeError("backend unavailable"),
+        ):
+            def fail(**_kwargs: Any) -> Any:
+                raise error
+
+            streamlit_app._execute_user_request = fail
+            execution, failure = streamlit_app._execute_user_request_safely(
+                pipeline=object(),
+                repository=object(),
+                request=request,
+            )
+            if execution is not None or failure is None:
+                raise AssertionError("Streamlit did not contain a terminal request failure")
+            if failure.get("response_type") != ResponseType.ERROR.value:
+                raise AssertionError(f"Streamlit failure was not typed as error: {failure!r}")
+            if "?" in str(failure.get("content") or ""):
+                raise AssertionError(f"Streamlit failure created a clarification loop: {failure!r}")
+    finally:
+        streamlit_app._execute_user_request = original_execute
+
+    return ScenarioResult(
+        "streamlit_terminal_failure_containment",
+        True,
+        "Streamlit preserves chat on lifecycle/backend failures without asking another clarification",
+    )
+
+
 def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSettings) -> ScenarioResult:
+    delivery_query = (
+        "Send this by Gmail to alice@example.com and bob@example.com."
+    )
     class ScriptedPlatformLLM:
         def __init__(self, mode: str) -> None:
             self.mode = mode
@@ -1795,20 +1800,36 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
         final_chat_text="The migration is ready.",
         response_type=ResponseType.NORMAL,
         last_qa_state=LastQAState(
-            last_user_query="",
+            last_user_query=delivery_query,
             last_response="",
             response_type=ResponseType.NORMAL,
         ),
     )
+
+    def response_for_query(
+        response: BundledResponse,
+        query: str,
+    ) -> BundledResponse:
+        return replace(
+            response,
+            last_qa_state=replace(
+                response.last_qa_state,
+                last_user_query=query,
+            ),
+        )
     original_smtp_ssl = smtplib.SMTP_SSL
     try:
         smtplib.SMTP_SSL = FakeSMTP  # type: ignore[assignment]
-        send_selector = PlatformSelector(llm=ScriptedPlatformLLM("send"), senders={"gmail": GmailSender()})
+        direct_delivery_llm = ScriptedPlatformLLM("send")
+        send_selector = PlatformSelector(
+            llm=direct_delivery_llm,
+            senders={"gmail": GmailSender()},
+        )
         sent = send_selector.select(
             bundled,
             ChatRequest(
                 user_id="platform-test",
-                raw_query="Send this by Gmail to alice@example.com and bob@example.com.",
+                raw_query=delivery_query,
                 platform_context={
                     "gmail_username": "sender@example.com",
                     "gmail_app_password": "app-password-for-test",
@@ -1816,13 +1837,14 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
             ),
         )
         state = build_scenario_state(settings)
+        pipeline_delivery_llm = ScriptedPlatformLLM("send")
         state.pipeline.platform_selector = PlatformSelector(
-            llm=ScriptedPlatformLLM("send"),
+            llm=pipeline_delivery_llm,
             senders={"gmail": GmailSender()},
         )
         pipeline_response = run_request(
             state,
-            "Send this by Gmail to alice@example.com and bob@example.com.",
+            delivery_query,
             metadata={
                 "intent": Intent.GENERAL_RESPONSE.value,
                 "normal_response_text": "The migration is ready.",
@@ -1837,6 +1859,10 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
 
     if sent["delivery"]["status"] != "sent" or sent["delivery"]["recipients"] != ["alice@example.com", "bob@example.com"]:
         raise AssertionError(f"multi-recipient Gmail send failed: {sent!r}")
+    if direct_delivery_llm.calls or pipeline_delivery_llm.calls:
+        raise AssertionError(
+            "explicit Gmail delivery invoked a redundant platform LLM call"
+        )
     if len(FakeSMTP.instances) != 2:
         raise AssertionError("selector and full pipeline did not each create exactly one SMTP delivery")
     smtp_client = FakeSMTP.instances[0]
@@ -1864,6 +1890,7 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
     # A literal-recipient email-writing request must enter Gmail preparation
     # even if no platform model is available or it would have selected none.
     # This is still draft-only: a write request cannot authorize SMTP sending.
+    exact_request = "Write an email to inform a day-off to vaiojjr@gmail.com and koffdo75@gmail.com."
     day_off_response = BundledResponse(
         final_chat_text=(
             "To inform the recipients about your day off, use this email:\n\n"
@@ -1874,12 +1901,11 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
         ),
         response_type=ResponseType.NORMAL,
         last_qa_state=LastQAState(
-            last_user_query="",
+            last_user_query=exact_request,
             last_response="",
             response_type=ResponseType.NORMAL,
         ),
     )
-    exact_request = "Write an email to inform a day-off to vaiojjr@gmail.com and koffdo75@gmail.com."
     deterministic_draft = PlatformSelector(llm=None).select(
         day_off_response,
         ChatRequest(user_id="platform-test", raw_query=exact_request),
@@ -1919,11 +1945,18 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
     )
     if local_draft_with_credentials["delivery"]["status"] != "draft_ready":
         raise AssertionError("writing an email with saved credentials unexpectedly attempted Gmail IMAP")
+    ordinary_query = "Is vaiojjr@gmail.com an email address I should use?"
     ordinary_address_question = PlatformSelector(llm=None).select(
-        day_off_response,
+        replace(
+            day_off_response,
+            last_qa_state=replace(
+                day_off_response.last_qa_state,
+                last_user_query=ordinary_query,
+            ),
+        ),
         ChatRequest(
             user_id="platform-test",
-            raw_query="Is vaiojjr@gmail.com an email address I should use?",
+            raw_query=ordinary_query,
         ),
     )
     if ordinary_address_question["delivery"]["channel"] != "none":
@@ -1949,14 +1982,18 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
     # Even a bad extractor response cannot turn an explicit do-not-send request
     # into an SMTP side effect; raw user intent remains authoritative.
     original_imap_ssl = imaplib.IMAP4_SSL
+    draft_query = (
+        "Save a Gmail draft update to alice@example.com and bob@example.com; "
+        "do not send."
+    )
     try:
         imaplib.IMAP4_SSL = FakeIMAP  # type: ignore[assignment]
         draft_selector = PlatformSelector(llm=ScriptedPlatformLLM("send"), senders={"gmail": GmailSender()})
         drafted = draft_selector.select(
-            bundled,
+            response_for_query(bundled, draft_query),
             ChatRequest(
                 user_id="platform-test",
-                raw_query="Save a Gmail draft update to alice@example.com and bob@example.com; do not send.",
+                raw_query=draft_query,
                 platform_context={
                     "gmail_username": "sender@example.com",
                     "gmail_app_password": "app-password-for-test",
@@ -2013,10 +2050,10 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
         failed_draft = PlatformSelector(
             llm=ScriptedPlatformLLM("send"), senders={"gmail": GmailSender()}
         ).select(
-            bundled,
+            response_for_query(bundled, draft_query),
             ChatRequest(
                 user_id="platform-test",
-                raw_query="Save a Gmail draft update to alice@example.com and bob@example.com; do not send.",
+                raw_query=draft_query,
                 platform_context={
                     "gmail_username": "sender@example.com",
                     "gmail_app_password": "app-password-for-test",
@@ -2044,15 +2081,16 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
             }],
         },
     )
+    attachment_query = "Send the generated file to alice@example.com."
     try:
         smtplib.SMTP_SSL = FakeSMTP  # type: ignore[assignment]
         attached_delivery = PlatformSelector(
             llm=ScriptedPlatformLLM("send"), senders={"gmail": GmailSender()}
         ).select(
-            attachment_bundled,
+            response_for_query(attachment_bundled, attachment_query),
             ChatRequest(
                 user_id="platform-test",
-                raw_query="Send the generated file to alice@example.com.",
+                raw_query=attachment_query,
                 platform_context={
                     "gmail_username": "sender@example.com",
                     "gmail_app_password": "app-password-for-test",
@@ -2127,7 +2165,7 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
                 llm=IncompleteRecipientPlatformLLM("draft"),
                 senders={"gmail": GmailSender()},
             ).select(
-                workbook_bundled,
+                response_for_query(workbook_bundled, workbook_send_query),
                 ChatRequest(
                     user_id="platform-test",
                     raw_query=workbook_send_query,
@@ -2163,7 +2201,7 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
                 llm=IncompleteRecipientPlatformLLM("send"),
                 senders={"gmail": GmailSender()},
             ).select(
-                workbook_bundled,
+                response_for_query(workbook_bundled, workbook_draft_query),
                 ChatRequest(
                     user_id="platform-test",
                     raw_query=workbook_draft_query,
@@ -2288,24 +2326,16 @@ def scenario_structured_clarification_fallback_policy(settings: ProductionSettin
         "type": "object",
         "properties": {
             "question_text": {"type": "string"},
-            "question_source": {"type": "string"},
-            "purpose": {"type": "string"},
             "confidence": {"type": "number"},
-            "should_ask": {"type": "boolean"},
             "expected_response_type": {
                 "type": "string",
                 "enum": [e.value for e in ExpectedResponseType],
             },
-            "reason_summary": {"type": "string"},
         },
         "required": [
             "question_text",
-            "question_source",
-            "purpose",
             "confidence",
-            "should_ask",
             "expected_response_type",
-            "reason_summary",
         ],
     }
     payload = structured_fallback_payload(
@@ -2315,17 +2345,35 @@ def scenario_structured_clarification_fallback_policy(settings: ProductionSettin
         error=ValueError("synthetic malformed JSON"),
     )
     validate_json_schema(payload, schema)
-    if payload["question_text"] != DEFAULT_PROMPT_REGISTRY.message("fallback_message"):
-        raise AssertionError("clarification fallback text must come from PromptRegistry")
+    if not is_structured_fallback(payload):
+        raise AssertionError("structured fallback must retain out-of-band provenance")
+    if payload["question_text"] or payload["confidence"] != 0.0:
+        raise AssertionError("technical fallback must not impersonate a clarification decision")
+    for task in (
+        LLMTask.KNOWLEDGE_ACTION_VALIDATION,
+        LLMTask.KNOWLEDGE_CONTENT_FINALIZATION,
+        LLMTask.REMINDER_ACTION_VALIDATION,
+        LLMTask.REMINDER_CONTENT_FINALIZATION,
+        LLMTask.RETRIEVAL_VALIDATION,
+    ):
+        fallback_model = getattr(
+            default_settings.ollama,
+            f"model_{task.value}_fallback",
+            None,
+        )
+        if not fallback_model or uses_onnx_runtime(fallback_model):
+            raise AssertionError(
+                f"{task.value} needs a non-ONNX structured recovery model"
+            )
     return ScenarioResult(
         "structured_clarification_fallback_policy",
         True,
-        "clarification structured fallback is schema-valid, registry-backed, and budgeted",
+        "terminal structured fallback is marked, non-questioning, and cross-engine recoverable",
     )
 
 
 def scenario_mutation_clarification_fast_path(settings: ProductionSettings) -> ScenarioResult:
-    """Predictable mutation gaps must not spend latency on planning or question LLMs."""
+    """Mutation gaps must not spend latency on removed or unnecessary stages."""
     state = build_scenario_state(settings)
 
     class LowConfidenceDetector:
@@ -2336,7 +2384,12 @@ def scenario_mutation_clarification_fast_path(settings: ProductionSettings) -> S
             return type(
                 "Detection",
                 (),
-                {"requires_clarification": True, "missing_fields": self.missing_fields, "metadata": {}},
+                {
+                    "requires_clarification": True,
+                    "missing_fields": self.missing_fields,
+                    "metadata": {},
+                    "failure_kind": "semantic_gap",
+                },
             )()
 
     class MustNotRun:
@@ -2366,7 +2419,6 @@ def scenario_mutation_clarification_fast_path(settings: ProductionSettings) -> S
     reminder_branch = ReminderBranch(
         config=state.pipeline.config,
         action_detector=LowConfidenceDetector(["reminder_time"]),
-        clarification_strategy=MustNotRun(),
         prompt_registry=DEFAULT_PROMPT_REGISTRY,
         llm=MustNotRun(),
     )
@@ -2382,9 +2434,19 @@ def scenario_mutation_clarification_fast_path(settings: ProductionSettings) -> S
     )
     if knowledge_result.clarification_question is None or knowledge_result.clarification_question.text != DEFAULT_PROMPT_REGISTRY.message("knowledge_missing_action"):
         raise AssertionError(f"knowledge fast clarification was not deterministic: {knowledge_result}")
-    if reminder_result.clarification_question is None or reminder_result.clarification_question.text != DEFAULT_PROMPT_REGISTRY.message("reminder_missing_time"):
-        raise AssertionError(f"reminder fast clarification did not request time: {reminder_result}")
-    return ScenarioResult("mutation_clarification_fast_path", True, "predictable mutation gaps skip unused action planning and LLM question generation")
+    if (
+        reminder_result.response_type is not ResponseType.SAFE_NOOP
+        or reminder_result.clarification_question is not None
+    ):
+        raise AssertionError(
+            "reminder model-1 rejection must use the non-generative safe path: "
+            f"{reminder_result}"
+        )
+    return ScenarioResult(
+        "mutation_clarification_fast_path",
+        True,
+        "mutation gaps skip unused planning and the removed reminder clarification generator",
+    )
 
 
 def scenario_last_qa_mandatory_before_classification(settings: ProductionSettings) -> ScenarioResult:
@@ -2457,12 +2519,10 @@ def scenario_llm_first_action_extraction(settings: ProductionSettings) -> Scenar
         llm=ScenarioLLM(),
         prompts=DEFAULT_PROMPT_REGISTRY,
     )
+    query = "Remember that the weekly release note includes operational risks."
     result = detector.detect(
-        ChatRequest(
-            user_id=DEBUG_USER,
-            raw_query="Remember that the weekly release note includes operational risks.",
-        ),
-        "A rewritten query that says delete must not affect routing.",
+        ChatRequest(user_id=DEBUG_USER, raw_query=query),
+        query,
         Intent.KNOWLEDGE_FACTS,
     )
     actions = result.metadata.get("knowledge_actions") or []
@@ -2684,21 +2744,13 @@ def scenario_clarification_schema_echo_recovery(settings: ProductionSettings) ->
         "type": "object",
         "properties": {
             "question_text": {"type": "string"},
-            "question_source": {"type": "string"},
-            "purpose": {"type": "string"},
             "confidence": {"type": "number"},
-            "should_ask": {"type": "boolean"},
             "expected_response_type": {"type": "string", "enum": [e.value for e in ExpectedResponseType]},
-            "reason_summary": {"type": "string"},
         },
         "required": [
             "question_text",
-            "question_source",
-            "purpose",
             "confidence",
-            "should_ask",
             "expected_response_type",
-            "reason_summary",
         ],
     }
     system_prompt = DEFAULT_PROMPT_REGISTRY.system("question_generation")
@@ -2720,7 +2772,7 @@ def scenario_clarification_schema_echo_recovery(settings: ProductionSettings) ->
     router = OllamaModelRouter(onnx_settings)
     onnx_client = ONNXLLMClient(router)
     prompts: list[str] = []
-    valid_payload_text = '{"question_text":"Which preference should I update?","question_source":"clarification_question","purpose":"resolve_missing_info","confidence":0.95,"should_ask":true,"expected_response_type":"free_text_answer","reason_summary":"missing target"}'
+    valid_payload_text = '{"question_text":"Which preference should I update?","confidence":0.95,"expected_response_type":"free_text_answer"}'
     responses = [
         '{"type":"object","properties":{}}',
         valid_payload_text,
@@ -3055,9 +3107,15 @@ def scenario_intent_branch_ownership_policy(settings: ProductionSettings) -> Sce
             Intent.CLARIFICATION.value: "clarification_reply",
             Intent.GENERAL_RESPONSE.value: "none",
         }
+        intent_value = str(
+            payload.get("intent") or Intent.GENERAL_RESPONSE.value
+        )
         payload = {
-            **payload,
-            "operation_kind": payload.get("operation_kind") or kind_for_intent[payload["intent"]],
+            "operation_kind": (
+                payload.get("operation_kind")
+                or kind_for_intent[intent_value]
+            ),
+            "confidence": payload.get("confidence", 0.0),
         }
         llm = ScriptedIntentLLM(payload)
         intent = OllamaIntentClassifier(llm).classify(
@@ -3153,7 +3211,7 @@ def scenario_intent_branch_ownership_policy(settings: ProductionSettings) -> Sce
 
     prompt = DEFAULT_PROMPT_REGISTRY.system("intent_classifier")
     required_prompt_rules = (
-        "Choose operation_kind before intent; intent must agree with it.",
+        "Choose one operation_kind. Runtime code maps",
         "durable_knowledge is mutation-only",
         "reminder_lifecycle is mutation-only",
         "Every request to search, find, list, show, inspect, look up, retrieve, recall, read, or answer",
@@ -3444,12 +3502,12 @@ def scenario_content_composer_deterministic(settings: ProductionSettings) -> Sce
             ),
             config,
         )
-        if artifact_result.used_tool_names != ("answer_generation", "generate_excel") or len(artifact_result.artifacts) != 1:
-            raise AssertionError(f"answer-first explicit Excel request did not create exactly one artifact: {artifact_result!r}")
+        if artifact_result.used_tool_names != ("generate_excel",) or len(artifact_result.artifacts) != 1:
+            raise AssertionError(f"file-only Excel request did not create exactly one artifact: {artifact_result!r}")
         artifact_path = Path(str(artifact_result.artifacts[0].get("storage_path") or ""))
         if not artifact_path.is_file() or not zipfile.is_zipfile(artifact_path):
             raise AssertionError("generated Excel artifact was not a downloadable workbook")
-    return ScenarioResult("content_composer_deterministic", True, "deterministic composer always answers and creates one downloadable file for an explicit artifact request")
+    return ScenarioResult("content_composer_deterministic", True, "deterministic composer skips unrequested prose and creates one downloadable file for an explicit artifact request")
 
 
 def scenario_general_broad_retrieval_approved(settings: ProductionSettings) -> ScenarioResult:
@@ -3946,24 +4004,16 @@ def scenario_knowledge_three_llm_pipeline(settings: ProductionSettings) -> Scena
                     "original_text": original,
                     "replacement_text": replacement,
                     "confidence": 0.99,
-                    "missing_fields": [],
-                    "reason_summary": "One grounded action.",
                 },
                 {
-                    "operation": "modify",
                     "decision": "PASS",
                     "selected_candidate_keys": [chunk_id],
                     "confidence": 0.99,
                     "clarification_question": "",
-                    "reason_summary": "One SQL candidate contains the target.",
                     "candidate_assessments": [
                         {
                             "candidate_key": chunk_id,
-                            "matches_target": True,
-                            "action_compatible": True,
                             "confidence": 0.99,
-                            "matched_fields": ["text"],
-                            "reason_summary": "Exact detail found in full text.",
                             "matched_text": original,
                         }
                     ],
@@ -3971,7 +4021,6 @@ def scenario_knowledge_three_llm_pipeline(settings: ProductionSettings) -> Scena
                 {
                     "final_content": final_content,
                     "confidence": 0.99,
-                    "reason_summary": "Only the validated detail changed.",
                 },
             ]
 
@@ -4048,7 +4097,11 @@ def scenario_knowledge_three_llm_pipeline(settings: ProductionSettings) -> Scena
     ]
     canonical_history = prompt_payloads[0]["chat_history"]
     for payload in (prompt_payloads[0], prompt_payloads[2]):
-        if payload["raw_query"] != query or payload["chat_history"] != canonical_history:
+        if (
+            payload.get("rewritten_query") != query
+            or payload["chat_history"] != canonical_history
+            or "raw_query" in payload
+        ):
             raise AssertionError("knowledge extraction/finalization lost query/history")
     if set(prompt_payloads[1]) != {
         "first_model_response",
@@ -4195,13 +4248,17 @@ def scenario_reminder_delete(settings: ProductionSettings) -> ScenarioResult:
             ],
         },
     )
-    assert_response(response, ResponseType.REMINDER_ACTION, "confirm")
-    if not response.actions_pending_confirmation:
-        raise AssertionError("reminder delete should require confirmation before mutating")
+    assert_response(response, ResponseType.REMINDER_ACTION, "dismissed")
+    if response.actions_pending_confirmation:
+        raise AssertionError("validated reminder delete reintroduced a confirmation stage")
     row = state.repository.list_reminders(user_id=state.user_id)[0]
-    if row["status"] != "scheduled":
-        raise AssertionError("delete mutated before confirmation")
-    return ScenarioResult("reminder_delete", True, "delete requires confirmation before dismissing the reminder")
+    if row["status"] != "dismissed":
+        raise AssertionError("validated delete did not dismiss the reminder")
+    return ScenarioResult(
+        "reminder_delete",
+        True,
+        "validated delete dismissed the reminder without a removed confirmation stage",
+    )
 
 
 def scenario_reminder_missing_time(settings: ProductionSettings) -> ScenarioResult:
@@ -4217,7 +4274,11 @@ def scenario_reminder_missing_time(settings: ProductionSettings) -> ScenarioResu
         },
     )
     assert_response(response, ResponseType.CLARIFICATION, "When")
-    return ScenarioResult("reminder_missing_time", True, "missing reminder time asks clarification")
+    return ScenarioResult(
+        "reminder_missing_time",
+        True,
+        "model 2 returned the immediate missing-time clarification",
+    )
 
 
 def scenario_autoscan_notification_reply(settings: ProductionSettings) -> ScenarioResult:
@@ -4260,6 +4321,7 @@ SCENARIOS: tuple[ScenarioFn, ...] = (
     scenario_general_hitl_supporting_question_printed,
     scenario_general_hitl_disabled_does_not_fallback,
     scenario_user_entrypoint_runtime_parity,
+    scenario_streamlit_terminal_failure_containment,
     scenario_platform_gmail_multi_recipient_delivery,
     scenario_general_new_conversation_skips_sub_branch_llm,
     scenario_answer_adaptive_token_budget,

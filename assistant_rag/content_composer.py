@@ -44,6 +44,7 @@ class ContentCompositionScope:
     """Deterministic ownership boundary between prose and file generation."""
 
     answer_request_scope: str
+    answer_generation_required: bool
     file_request_scope: str | None
     answer_generation_responsibility: str
     file_tool_responsibility: str | None
@@ -222,6 +223,7 @@ def _derive_composition_scope(
     if decision.selected_tool_name is None:
         return ContentCompositionScope(
             answer_request_scope=rewritten_query.strip(),
+            answer_generation_required=True,
             file_request_scope=None,
             answer_generation_responsibility=(
                 "No Microsoft file tool is assigned. Produce the complete user-facing "
@@ -246,6 +248,7 @@ def _derive_composition_scope(
         # configured keyword policy changes between classification and projection.
         return ContentCompositionScope(
             answer_request_scope=rewritten_query.strip(),
+            answer_generation_required=True,
             file_request_scope=None,
             answer_generation_responsibility=answer_responsibility,
             file_tool_responsibility=None,
@@ -288,19 +291,16 @@ def _derive_composition_scope(
         rewritten_query[answer_suffix_start:].strip(" \t\r\n,;.-"),
     )
     answer_scope = " ".join(part for part in answer_parts if part).strip()
-    if not answer_scope:
-        file_label = {
-            _DOCUMENT_TOOL_NAME: "document",
-            _EXCEL_TOOL_NAME: "Excel workbook",
-            _POWERPOINT_TOOL_NAME: "PowerPoint presentation",
-        }.get(decision.selected_tool_name, "file")
-        answer_scope = (
-            f"Provide only a concise user-facing handoff for the separately generated "
-            f"{file_label}; do not generate any content that belongs inside it."
+    answer_generation_required = bool(answer_scope)
+    if not answer_generation_required:
+        answer_responsibility = (
+            "No separate prose deliverable was requested. The authorized file tool "
+            "owns both file creation and its concise verified handoff."
         )
 
     return ContentCompositionScope(
         answer_request_scope=answer_scope,
+        answer_generation_required=answer_generation_required,
         file_request_scope=file_scope or rewritten_query.strip(),
         answer_generation_responsibility=answer_responsibility,
         file_tool_responsibility=(
@@ -795,7 +795,7 @@ class ContentToolRegistry:
 
 @dataclass
 class DeterministicContentComposer:
-    """Always execute answer generation, then at most one authorized file tool."""
+    """Execute only the prose/file tools required by deterministic request scope."""
 
     registry: ContentToolRegistry
 
@@ -851,6 +851,7 @@ class DeterministicContentComposer:
         answer_metadata.pop(_CANONICAL_REWRITTEN_QUERY_KEY, None)
         answer_metadata["content_composition_scope"] = {
             "answer_request_scope": composition_scope.answer_request_scope,
+            "answer_generation_required": composition_scope.answer_generation_required,
             "answer_generation_responsibility": composition_scope.answer_generation_responsibility,
             "assigned_file_tool": desired_file_tool_name if file_tool is not None else None,
         }
@@ -861,8 +862,12 @@ class DeterministicContentComposer:
             metadata=answer_metadata,
         )
 
-        answer_tool = self.registry.get_tool("answer_generation")
-        if answer_tool is None:
+        answer_tool = (
+            self.registry.get_tool("answer_generation")
+            if composition_scope.answer_generation_required
+            else None
+        )
+        if composition_scope.answer_generation_required and answer_tool is None:
             trace = {
                 "classifier": "deterministic_keyword_pipeline",
                 "decision": decision.reason_summary,
@@ -883,11 +888,12 @@ class DeterministicContentComposer:
                 content_warnings=("answer_tool_unavailable",),
             )
 
-        # Stage one is unconditional.  Configuration may disable file creation, but
-        # it cannot disable the user-facing answer-generation responsibility.
-        answer_result = answer_tool.execute(answer_input, config)
-        used_tool_names = ["answer_generation"]
-        results = [answer_result]
+        used_tool_names: list[str] = []
+        results: list[ContentToolResult] = []
+        if answer_tool is not None:
+            answer_result = answer_tool.execute(answer_input, config)
+            used_tool_names.append("answer_generation")
+            results.append(answer_result)
         selected_file_tool_name: str | None = None
         if file_tool is not None and desired_file_tool_name is not None:
             # The complete rewritten query is retained so each Microsoft tool can
@@ -913,7 +919,7 @@ class DeterministicContentComposer:
         output_parts = [result.output_text.strip() for result in results if result.output_text.strip()]
         artifacts = tuple(
             result.artifact
-            for result in results[1:]
+            for result in results
             if result.artifact is not None
         )
         warnings = tuple(
@@ -934,6 +940,7 @@ class DeterministicContentComposer:
             "file_route_status": file_route_status,
             "executed_tools": used_tool_names,
             "answer_request_scope": composition_scope.answer_request_scope,
+            "answer_generation_required": composition_scope.answer_generation_required,
             "file_request_scope": composition_scope.file_request_scope,
         }
         return ContentComposerResult(

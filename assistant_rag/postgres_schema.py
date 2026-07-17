@@ -5,6 +5,7 @@ from sqlalchemy import (
     String,
     Text,
     Integer,
+    Float,
     DateTime,
     ForeignKey,
     CheckConstraint,
@@ -169,6 +170,10 @@ reminders = Table(
     Column("timing_plan_status", String, nullable=False, default="pending"),
     Column("timing_planned_at", String, nullable=True),
     Column("timing_plan_reason", Text, nullable=True),
+    Column("supporting_question_plan_status", String, nullable=False, default="pending"),
+    Column("supporting_question_planned_at", String, nullable=True),
+    Column("supporting_question_plan_reason", Text, nullable=True),
+    Column("supporting_question_confidence", Float, nullable=True),
     Column("raw_reminder", Text, nullable=False),
     Column("reminder_summary", Text, nullable=False),
     Column("subject", String, nullable=False),
@@ -189,6 +194,21 @@ reminders = Table(
         "status IN ('scheduled', 'notified', 'cancelled', 'dismissed', 'completed')",
         name="ck_reminders_status",
     ),
+    CheckConstraint(
+        "supporting_question_plan_status IN ('pending', 'planned', 'needs_review')",
+        name="ck_reminders_supporting_question_plan_status",
+    ),
+    CheckConstraint(
+        "supporting_question_confidence IS NULL OR "
+        "(supporting_question_confidence >= 0.0 AND supporting_question_confidence <= 1.0)",
+        name="ck_reminders_supporting_question_confidence",
+    ),
+)
+Index(
+    "idx_reminders_supporting_question_plan",
+    reminders.c.status,
+    reminders.c.supporting_question_plan_status,
+    reminders.c.reminder_time,
 )
 
 reminder_notifications = Table(
@@ -212,6 +232,12 @@ reminder_notifications = Table(
     CheckConstraint(
         "delivery_status IN ('pending', 'sent', 'failed', 'retrying')",
         name="ck_reminder_notifications_delivery_status",
+    ),
+    UniqueConstraint(
+        "reminder_id",
+        "user_id",
+        "fire_time",
+        name="uq_reminder_notifications_fire",
     ),
 )
 

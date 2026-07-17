@@ -18,6 +18,7 @@ from .llm import (
     OllamaModelRouter,
     _structured_attempt_plan,
     _structured_attempt_prompt,
+    normalize_structured_output,
     parse_json_object,
     structured_fallback_payload,
     _log_structured_fallback,
@@ -300,6 +301,7 @@ class ONNXLLMClient:
                 )
                 response = self._generate(task, system_prompt, attempt_prompt, decision)
                 payload = parse_json_object(response)
+                payload, normalized = normalize_structured_output(payload, schema)
                 validate_json_schema(payload, schema)
                 trace = current_trace()
                 if trace and trace._active_timers:
@@ -307,6 +309,8 @@ class ONNXLLMClient:
                     timer.metadata["structured_attempts"] = attempt_index
                     timer.metadata["structured_configured_attempts"] = total_attempts
                     timer.metadata["attempt_mode"] = attempt_mode
+                    if normalized:
+                        timer.metadata["structured_output_normalized"] = True
                 self.last_error_by_task.pop(task, None)
                 return payload
             except Exception as exc:

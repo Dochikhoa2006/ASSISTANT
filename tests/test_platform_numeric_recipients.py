@@ -6,7 +6,10 @@ from typing import Any
 import pytest
 
 from assistant_rag.contracts import BundledResponse, ChatRequest, LastQAState, ResponseType
-from assistant_rag.platform import PlatformSelector
+from assistant_rag.platform import (
+    PLATFORM_RECIPIENT_EXTRACTION_SCHEMA,
+    PlatformSelector,
+)
 
 
 _RAW_QUERY_SENTINEL = "RAW_SENTINEL audit-only ingress text."
@@ -16,8 +19,10 @@ class ScriptedPlatformLLM:
     def __init__(self, channel: str, extraction: dict[str, Any]) -> None:
         self.channel = channel
         self.extraction = extraction
+        self.calls: list[dict[str, Any]] = []
 
     def generate_json(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
         if "platform selector" in kwargs["system_prompt"]:
             return {"channel": self.channel, "confidence": 1.0}
         return dict(self.extraction)
@@ -72,16 +77,12 @@ def test_numeric_recipient_ids_are_routed_for_non_email_channels(
     platform_context: dict[str, str],
 ) -> None:
     sender = RecordingSender()
+    llm = ScriptedPlatformLLM(
+        channel,
+        {"recipients": [str(recipient)]},
+    )
     selector = PlatformSelector(
-        llm=ScriptedPlatformLLM(
-            channel,
-            {
-                "recipient": recipient,
-                "subject": "",
-                "body": "The requested update is ready.",
-                "mode": "send",
-            },
-        ),
+        llm=llm,
         senders={channel: sender},
     )
 
@@ -106,7 +107,12 @@ def test_numeric_recipient_ids_are_routed_for_non_email_channels(
     sent_payload, sent_context = sender.calls[0]
     assert sent_payload["recipient"] == expected_recipient
     assert sent_payload["recipients"] == [expected_recipient]
+    assert sent_payload["body"] == "The requested update is ready."
+    assert sent_payload["mode"] == "send"
     assert sent_context == platform_context
+    assert len(llm.calls) == 2
+    assert llm.calls[1]["schema"] == PLATFORM_RECIPIENT_EXTRACTION_SCHEMA
+    assert set(llm.calls[1]["schema"]["properties"]) == {"recipients"}
 
 
 def test_gmail_recipient_validation_remains_email_only() -> None:

@@ -142,12 +142,14 @@ def test_content_composer_sub_branch_and_file_outcome_cross_product(
     result = composer.compose(_composer_input(query, sub_branch), config)
 
     expected_tools = (
-        ("answer_generation", expected_file_tool)
+        (expected_file_tool,)
         if expected_file_tool is not None
         else ("answer_generation",)
     )
     assert result.used_tool_names == expected_tools
-    assert len(tools["answer_generation"].calls) == 1
+    assert len(tools["answer_generation"].calls) == (
+        0 if expected_file_tool is not None else 1
+    )
     assert sum(len(tools[name].calls) for name in _FILE_TOOLS) <= 1
     assert all(
         item.sub_branch is sub_branch

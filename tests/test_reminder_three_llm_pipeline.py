@@ -299,7 +299,6 @@ def test_all_reminder_llm_contracts_are_minimal_and_have_no_clarification_compon
     ]
     assert set(assessment_properties) == {
         "candidate_key",
-        "match_kind",
         "confidence",
         "evidence_field",
         "matched_text",
@@ -482,13 +481,6 @@ def _validation(
         "candidate_assessments": [
             {
                 "candidate_key": item["candidate_key"],
-                "match_kind": (
-                    "EQUIVALENT"
-                    if operation == "add" and item["matches_target"]
-                    else "TARGET"
-                    if item["matches_target"]
-                    else "NONE"
-                ),
                 "confidence": item["confidence"],
                 "evidence_field": (
                     item["matched_fields"][0]

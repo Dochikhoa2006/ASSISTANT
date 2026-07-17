@@ -100,6 +100,16 @@ class DiskCacheLastQAStore:
                 if payload.get("expected_response_type")
                 else None
             ),
+            reminder_state=(
+                payload.get("reminder_state")
+                if isinstance(payload.get("reminder_state"), dict)
+                else None
+            ),
+            reminder_state_hash=(
+                str(payload["reminder_state_hash"])
+                if payload.get("reminder_state_hash")
+                else None
+            ),
         )
 
     def save(self, user_id: str, state: LastQAState) -> None:
@@ -115,6 +125,8 @@ class DiskCacheLastQAStore:
             "linked_topic_id": state.linked_topic_id,
             "linked_hop_id": state.linked_hop_id,
             "expected_response_type": state.expected_response_type.value if state.expected_response_type else None,
+            "reminder_state": state.reminder_state,
+            "reminder_state_hash": state.reminder_state_hash,
         }
         self.connection.execute(
             """

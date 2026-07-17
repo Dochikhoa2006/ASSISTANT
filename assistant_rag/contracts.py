@@ -246,6 +246,11 @@ class LastQAState:
     linked_topic_id: Optional[str] = None
     linked_hop_id: Optional[str] = None
     expected_response_type: ExpectedResponseType | None = None
+    # Canonical SQL-derived context for an exact reminder-notification reply.
+    # It is kept separate from the free-form response so the next turn can
+    # identify both supporting-question and purpose-driven replies precisely.
+    reminder_state: dict[str, Any] | None = None
+    reminder_state_hash: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -641,6 +646,22 @@ class PendingReminderTiming:
     version: int
 
 
+@dataclass(frozen=True)
+class PendingReminderSupportingQuestion:
+    """A reminder awaiting one durable autoscan question-plan decision."""
+
+    reminder_id: str
+    user_id: str
+    subject: str
+    reminder_summary: str
+    raw_reminder: str
+    notification_time: datetime | None
+    event_time: datetime | None
+    user_timezone: str
+    recurrence_rule: str | None
+    version: int
+
+
 @dataclass
 class BranchResult:
     response_type: ResponseType
@@ -742,6 +763,10 @@ class PipelineContext:
     chat_history_source: Literal["conversation_retrieval", "last_qa"] = "last_qa"
     last_qa_trace: dict[str, Any] = field(default_factory=dict)
     approved_conversation_context: ApprovedConversationContext | None = None
+    # Retained solely for non-semantic lifecycle guards such as suppressing an
+    # identical consecutive clarification. It must never become prompt,
+    # retrieval, routing, or mutation authority after Last-QA rejects it.
+    previous_last_qa_state: LastQAState | None = None
 
 
 @dataclass(frozen=True)

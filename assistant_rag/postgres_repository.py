@@ -36,6 +36,16 @@ def now_iso() -> str:
 def new_id() -> str:
     return uuid.uuid4().hex
 
+
+def _optional_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
 class PostgresRepository(AssistantRepository):
     def __init__(self, engine: Engine):
         self.engine = engine
@@ -201,6 +211,44 @@ class PostgresRepository(AssistantRepository):
             outbox_job_id=outbox_job_id
         )
 
+    def merge_conversation_hop_entities(
+        self,
+        cursor: Connection,
+        *,
+        user_id: str,
+        hop_id: str,
+        entities: dict[str, Any],
+    ) -> None:
+        row = cursor.execute(
+            select(conversation_hops.c.entities_json).where(
+                and_(
+                    conversation_hops.c.hop_id == hop_id,
+                    conversation_hops.c.user_id == user_id,
+                )
+            )
+        ).fetchone()
+        if not row:
+            raise ValueError("Conversation hop not found for user")
+        try:
+            current = json.loads(str(row[0] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            current = {}
+        if not isinstance(current, dict):
+            current = {}
+        current.update(entities)
+        result = cursor.execute(
+            update(conversation_hops)
+            .where(
+                and_(
+                    conversation_hops.c.hop_id == hop_id,
+                    conversation_hops.c.user_id == user_id,
+                )
+            )
+            .values(entities_json=json.dumps(current))
+        )
+        if result.rowcount != 1:
+            raise ValueError("Conversation hop entities could not be updated")
+
     def _resolve_root_hop(
         self, cursor: Connection, previous_hop_id: str | None, parent_hop_id: str | None
     ) -> str | None:
@@ -239,6 +287,7 @@ class PostgresRepository(AssistantRepository):
                     reminders.c.recurrence_rule,
                     reminders.c.recurrence_timezone,
                     reminders.c.next_fire_time,
+                    reminders.c.version,
                 )
                 # Deliberately global across users. The notification row still
                 # carries the owning user_id and remains access-controlled.
@@ -249,6 +298,7 @@ class PostgresRepository(AssistantRepository):
                 ))
                 .order_by(due_expr)
                 .limit(limit)
+                .with_for_update(skip_locked=True)
             ).fetchall()
             for row in rows:
                 fire_time = row.next_fire_time or row.reminder_time
@@ -259,12 +309,28 @@ class PostgresRepository(AssistantRepository):
                     fire_time=fire_time,
                 )
                 if row.recurrence_rule:
+                    completed_occurrences = int(
+                        cursor.execute(
+                            select(func.count()).select_from(
+                                reminder_notifications
+                            ).where(
+                                and_(
+                                    reminder_notifications.c.reminder_id
+                                    == row.reminder_id,
+                                    reminder_notifications.c.user_id
+                                    == row.user_id,
+                                )
+                            )
+                        ).scalar_one()
+                    )
                     next_fire_time = calculate_next_fire_time(
                         previous_fire_time=fire_time,
                         recurrence_rule=row.recurrence_rule,
                         recurrence_timezone=row.recurrence_timezone or "UTC",
+                        completed_occurrences=completed_occurrences,
                     )
                     values = {
+                        "status": "scheduled",
                         "last_fire_time": fire_time,
                         "next_fire_time": next_fire_time,
                         "updated_at": now_iso(),
@@ -272,33 +338,40 @@ class PostgresRepository(AssistantRepository):
                     }
                     if next_fire_time is None:
                         values["status"] = "completed"
-                    cursor.execute(
+                    transition = cursor.execute(
                         update(reminders)
                         .where(
                             and_(
                                 reminders.c.reminder_id == row.reminder_id,
                                 reminders.c.user_id == row.user_id,
                                 reminders.c.status == "scheduled",
+                                reminders.c.version == row.version,
                             )
                         )
                         .values(**values)
                     )
                 else:
-                    cursor.execute(
+                    transition = cursor.execute(
                         update(reminders)
                         .where(
                             and_(
                                 reminders.c.reminder_id == row.reminder_id,
                                 reminders.c.user_id == row.user_id,
                                 reminders.c.status == "scheduled",
+                                reminders.c.version == row.version,
                             )
                         )
                         .values(
                             status="notified",
                             last_fire_time=fire_time,
+                            next_fire_time=None,
                             updated_at=now_iso(),
                             version=reminders.c.version + 1,
                         )
+                    )
+                if transition.rowcount != 1:
+                    raise ReminderConflictError(
+                        "Autoscan reminder transition lost its scheduled version."
                     )
                 notified.append(str(row.reminder_id))
         GLOBAL_METRICS.increment("reminder_scans_total")
@@ -388,15 +461,151 @@ class PostgresRepository(AssistantRepository):
             )
             return result.rowcount == 1
 
-    def load_reminder_reply_context(self, *, user_id: str, reminder_id: str, notification_id: str) -> dict[str, str | None]:
+    def list_reminders_requiring_supporting_question(
+        self, *, limit: int = 100
+    ) -> list[PendingReminderSupportingQuestion]:
+        stmt = (
+            select(
+                reminders.c.reminder_id,
+                reminders.c.user_id,
+                reminders.c.subject,
+                reminders.c.reminder_summary,
+                reminders.c.raw_reminder,
+                reminders.c.reminder_time,
+                reminders.c.event_time,
+                reminders.c.user_timezone,
+                reminders.c.recurrence_rule,
+                reminders.c.version,
+            )
+            .where(
+                and_(
+                    reminders.c.status == "scheduled",
+                    reminders.c.supporting_question_plan_status == "pending",
+                )
+            )
+            .order_by(
+                func.coalesce(reminders.c.event_time, reminders.c.reminder_time),
+                reminders.c.reminder_id,
+            )
+            .limit(limit)
+        )
+        with self.engine.connect() as conn:
+            rows = conn.execute(stmt).fetchall()
+        return [
+            PendingReminderSupportingQuestion(
+                reminder_id=str(row.reminder_id),
+                user_id=str(row.user_id),
+                subject=str(row.subject or ""),
+                reminder_summary=str(row.reminder_summary or ""),
+                raw_reminder=str(row.raw_reminder or ""),
+                notification_time=_optional_datetime(row.reminder_time),
+                event_time=_optional_datetime(row.event_time),
+                user_timezone=str(row.user_timezone or "UTC"),
+                recurrence_rule=(
+                    str(row.recurrence_rule)
+                    if row.recurrence_rule is not None
+                    else None
+                ),
+                version=int(row.version),
+            )
+            for row in rows
+        ]
+
+    def complete_reminder_supporting_question_plan(
+        self,
+        *,
+        reminder_id: str,
+        user_id: str,
+        expected_version: int,
+        question: str | None,
+        confidence: float,
+        reason: str,
+    ) -> bool:
+        timestamp = now_iso()
+        with self.transaction() as cursor:
+            result = cursor.execute(
+                update(reminders)
+                .where(
+                    and_(
+                        reminders.c.reminder_id == reminder_id,
+                        reminders.c.user_id == user_id,
+                        reminders.c.version == expected_version,
+                        reminders.c.status == "scheduled",
+                        reminders.c.supporting_question_plan_status == "pending",
+                    )
+                )
+                .values(
+                    supporting_question=question,
+                    supporting_question_plan_status="planned",
+                    supporting_question_planned_at=timestamp,
+                    supporting_question_plan_reason=reason,
+                    supporting_question_confidence=confidence,
+                    updated_at=timestamp,
+                    version=reminders.c.version + 1,
+                )
+            )
+            return result.rowcount == 1
+
+    def fail_reminder_supporting_question_plan(
+        self,
+        *,
+        reminder_id: str,
+        user_id: str,
+        expected_version: int,
+        reason: str,
+    ) -> bool:
+        timestamp = now_iso()
+        with self.transaction() as cursor:
+            result = cursor.execute(
+                update(reminders)
+                .where(
+                    and_(
+                        reminders.c.reminder_id == reminder_id,
+                        reminders.c.user_id == user_id,
+                        reminders.c.version == expected_version,
+                        reminders.c.status == "scheduled",
+                        reminders.c.supporting_question_plan_status == "pending",
+                    )
+                )
+                .values(
+                    supporting_question_plan_status="needs_review",
+                    supporting_question_planned_at=timestamp,
+                    supporting_question_plan_reason=reason,
+                    supporting_question_confidence=None,
+                    updated_at=timestamp,
+                    version=reminders.c.version + 1,
+                )
+            )
+            return result.rowcount == 1
+
+    def load_reminder_reply_context(self, *, user_id: str, reminder_id: str, notification_id: str) -> dict[str, Any]:
         stmt = select(
+            reminders.c.reminder_id,
+            reminder_notifications.c.notification_id,
             reminders.c.subject,
             reminders.c.reminder_summary,
+            reminders.c.raw_reminder,
+            reminders.c.status.label("reminder_status"),
+            reminders.c.reminder_time,
+            reminders.c.event_time,
+            reminders.c.user_timezone,
+            reminders.c.original_time_text,
+            reminders.c.recurrence_rule,
+            reminders.c.recurrence_timezone,
+            reminders.c.next_fire_time,
+            reminders.c.last_fire_time,
+            reminders.c.parent_recurring_reminder_id,
+            reminders.c.timing_plan_status,
+            reminders.c.supporting_question_plan_status,
+            reminders.c.supporting_question_confidence,
             reminders.c.supporting_question,
             reminders.c.supporting_response,
             reminder_notifications.c.source_topic_id,
             reminder_notifications.c.source_hop_id,
-            reminder_notifications.c.ui_status,
+            reminder_notifications.c.ui_status.label("notification_ui_status"),
+            reminder_notifications.c.delivery_status.label("notification_delivery_status"),
+            reminder_notifications.c.fire_time.label("notification_fire_time"),
+            reminder_notifications.c.created_at.label("notification_created_at"),
             conversation_hops.c.topic_id,
             conversation_hops.c.rewritten_user_query.label("source_rewritten_user_query"),
             conversation_hops.c.raw_response.label("source_raw_response"),
@@ -425,20 +634,7 @@ class PostgresRepository(AssistantRepository):
             if not row:
                 raise ValueError("Reminder not found or does not belong to user")
             
-            return {
-                "subject": row[0],
-                "reminder_summary": row[1],
-                "supporting_question": row[2],
-                "supporting_response": row[3],
-                "source_topic_id": row[4],
-                "source_hop_id": row[5],
-                "ui_status": row[6],
-                "topic_id": row[7],
-                "source_rewritten_user_query": row[8],
-                "source_raw_response": row[9],
-                "supporting_questions_json": row[10],
-                "source_response_type": row[11],
-            }
+            return dict(row._mapping)
 
 
     def add_knowledge_chunk(
@@ -1039,6 +1235,10 @@ class PostgresRepository(AssistantRepository):
         source_topic_id = canonical_topic_id
         reminder_id = new_id()
         timestamp = now_iso()
+        has_existing_support = bool(
+            str(supporting_question or "").strip()
+            or str(supporting_response or "").strip()
+        )
         cursor.execute(
             insert(reminders).values(
                 reminder_id=reminder_id,
@@ -1047,6 +1247,20 @@ class PostgresRepository(AssistantRepository):
                 source_hop_id=source_hop_id,
                 reminder_time=reminder_time,
                 event_time=event_time,
+                supporting_question_plan_status=(
+                    "planned" if has_existing_support else "pending"
+                ),
+                supporting_question_planned_at=(
+                    timestamp if has_existing_support else None
+                ),
+                supporting_question_plan_reason=(
+                    "Existing reminder supporting context was preserved."
+                    if has_existing_support
+                    else None
+                ),
+                supporting_question_confidence=(
+                    1.0 if has_existing_support else None
+                ),
                 raw_reminder=raw_reminder,
                 reminder_summary=reminder_summary,
                 subject=subject,
@@ -2161,6 +2375,14 @@ class PostgresRepository(AssistantRepository):
                 topic_id = self.ensure_topic(
                     cursor, user_id=user_id, title=f"Reminder: {ctx['subject']}"
                 )
+            from .reminder_reply import build_reminder_state, reminder_reply_hop_entities
+
+            reply_hop_id = new_id()
+            reminder_state = build_reminder_state(
+                ctx,
+                reminder_id=reminder_id,
+                notification_id=notification_id,
+            )
             return self.append_conversation_hop(
                 cursor,
                 topic_id=topic_id,
@@ -2170,7 +2392,12 @@ class PostgresRepository(AssistantRepository):
                 rewritten_user_query=reply_text,
                 raw_response=response_text,
                 response_type=ResponseType.REMINDER_REPLY.value,
-                parent_hop_id=ctx["source_hop_id"]
+                parent_hop_id=ctx["source_hop_id"],
+                entities=reminder_reply_hop_entities(
+                    reminder_state,
+                    reply_hop_id=reply_hop_id,
+                ),
+                hop_id=reply_hop_id,
             )
 
     def claim_outbox_jobs(self, *, max_attempts: int, batch_size: int, retry_cutoff: str) -> list[dict[str, Any]]:

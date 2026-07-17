@@ -169,8 +169,6 @@ def _extraction(
         "original_text": original_text,
         "replacement_text": replacement_text,
         "confidence": 0.99,
-        "missing_fields": [],
-        "reason_summary": "One grounded knowledge action was extracted.",
     }
 
 
@@ -185,12 +183,10 @@ def _validation(
     reason: str = "Knowledge action was validated.",
 ) -> dict[str, Any]:
     return {
-        "operation": operation,
         "decision": decision,
         "selected_candidate_keys": selected,
         "confidence": confidence,
         "clarification_question": clarification_question,
-        "reason_summary": reason,
         "candidate_assessments": assessments,
     }
 
@@ -204,12 +200,8 @@ def _assessment(
 ) -> dict[str, Any]:
     return {
         "candidate_key": chunk_id,
-        "matches_target": matches,
-        "action_compatible": compatible,
         "confidence": 0.99,
-        "matched_fields": ["text"] if matches else [],
-        "reason_summary": "Candidate was assessed against the full SQL text.",
-        "matched_text": matched_text,
+        "matched_text": matched_text if matches else "",
     }
 
 
@@ -270,6 +262,14 @@ def test_add_runs_extraction_and_pass_validation_only_then_commits() -> None:
     ]
     assert "validation_result" not in validation_schema["properties"]
     assert "clarification_question" in validation_schema["required"]
+    assessment_schema = validation_schema["properties"]["candidate_assessments"][
+        "items"
+    ]
+    assert set(assessment_schema["properties"]) == {
+        "candidate_key",
+        "confidence",
+        "matched_text",
+    }
 
     rows = repository.connection.execute(
         "SELECT raw_text FROM knowledge_chunks WHERE user_id = ? AND is_deleted = 0",
@@ -369,7 +369,8 @@ def test_failed_knowledge_extractor_never_falls_back_to_metadata_action() -> Non
     with canonical_chat_history_scope([]):
         result = _branch(llm, retriever).execute(context, _repository())
 
-    assert result.response_type is ResponseType.CLARIFICATION
+    assert result.response_type is ResponseType.ERROR
+    assert result.clarification_question is None
     assert result.actions_pending_confirmation == []
     assert len(llm.calls) == 1
     assert llm.calls[0]["task"] is LLMTask.KNOWLEDGE_ACTION_EXTRACTION

@@ -37,6 +37,7 @@ from .contracts import (
     KnowledgeSourceStatus,
     ArtifactStatus,
     PendingReminderTiming,
+    PendingReminderSupportingQuestion,
 )
 from .errors import (
     RepositoryConflictError,
@@ -71,6 +72,16 @@ def content_hash(user_id: str, text: str) -> str:
     digest.update(b"\0")
     digest.update(text.encode("utf-8"))
     return digest.hexdigest()
+
+
+def _optional_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 class SQLiteRepository(AssistantRepository):
@@ -210,6 +221,10 @@ class SQLiteRepository(AssistantRepository):
                 timing_plan_status TEXT NOT NULL DEFAULT 'pending' CHECK (timing_plan_status IN ('pending', 'planned', 'needs_review')),
                 timing_planned_at TEXT NULL,
                 timing_plan_reason TEXT NULL,
+                supporting_question_plan_status TEXT NOT NULL DEFAULT 'pending' CHECK (supporting_question_plan_status IN ('pending', 'planned', 'needs_review')),
+                supporting_question_planned_at TEXT NULL,
+                supporting_question_plan_reason TEXT NULL,
+                supporting_question_confidence REAL NULL CHECK (supporting_question_confidence IS NULL OR (supporting_question_confidence >= 0.0 AND supporting_question_confidence <= 1.0)),
                 status TEXT NOT NULL CHECK (status IN ('scheduled', 'notified', 'cancelled', 'dismissed', 'completed')),
                 raw_reminder TEXT NOT NULL,
                 reminder_summary TEXT NOT NULL,
@@ -335,6 +350,7 @@ class SQLiteRepository(AssistantRepository):
         self._ensure_release3_sqlite_columns()
         self._ensure_release4_sqlite_columns()
         self._ensure_release5_reminder_source_bindings()
+        self._ensure_release6_reminder_supporting_question_plan()
         self._ensure_unique_knowledge_topic_titles()
         self.connection.commit()
 
@@ -504,6 +520,58 @@ class SQLiteRepository(AssistantRepository):
             BEGIN
                 SELECT RAISE(ABORT, 'Reminder notification source binding is immutable');
             END;
+            """
+        )
+
+    def _ensure_release6_reminder_supporting_question_plan(self) -> None:
+        """Add an independent, durable autoscan state for reminder questions."""
+        rows = self.connection.execute("PRAGMA table_info(reminders)").fetchall()
+        reminder_columns = {str(row["name"]) for row in rows}
+        if "supporting_question_plan_status" not in reminder_columns:
+            self.connection.execute(
+                "ALTER TABLE reminders ADD COLUMN supporting_question_plan_status "
+                "TEXT NOT NULL DEFAULT 'pending' CHECK "
+                "(supporting_question_plan_status IN ('pending', 'planned', 'needs_review'))"
+            )
+        if "supporting_question_planned_at" not in reminder_columns:
+            self.connection.execute(
+                "ALTER TABLE reminders ADD COLUMN supporting_question_planned_at TEXT NULL"
+            )
+        if "supporting_question_plan_reason" not in reminder_columns:
+            self.connection.execute(
+                "ALTER TABLE reminders ADD COLUMN supporting_question_plan_reason TEXT NULL"
+            )
+        if "supporting_question_confidence" not in reminder_columns:
+            self.connection.execute(
+                "ALTER TABLE reminders ADD COLUMN supporting_question_confidence "
+                "REAL NULL CHECK (supporting_question_confidence IS NULL OR "
+                "(supporting_question_confidence >= 0.0 AND supporting_question_confidence <= 1.0))"
+            )
+        self.connection.execute(
+            """
+            UPDATE reminders
+            SET supporting_question_plan_status = 'planned',
+                supporting_question_planned_at = COALESCE(
+                    supporting_question_planned_at, updated_at, created_at
+                ),
+                supporting_question_plan_reason = COALESCE(
+                    supporting_question_plan_reason,
+                    'Existing reminder supporting context was preserved.'
+                ),
+                supporting_question_confidence = COALESCE(
+                    supporting_question_confidence, 1.0
+                )
+            WHERE supporting_question_plan_status = 'pending'
+              AND (
+                  TRIM(COALESCE(supporting_question, '')) <> ''
+                  OR TRIM(COALESCE(supporting_response, '')) <> ''
+              )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_reminders_supporting_question_plan
+            ON reminders(status, supporting_question_plan_status, reminder_time)
             """
         )
 
@@ -695,13 +763,45 @@ class SQLiteRepository(AssistantRepository):
         )
         return HopWrite(topic_id=topic_id, hop_id=hop_id, previous_hop_id=previous_hop_id, outbox_job_id=outbox_job_id)
 
+    def merge_conversation_hop_entities(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        user_id: str,
+        hop_id: str,
+        entities: dict[str, Any],
+    ) -> None:
+        row = cursor.execute(
+            "SELECT entities_json FROM conversation_hops WHERE hop_id = ? AND user_id = ?",
+            (hop_id, user_id),
+        ).fetchone()
+        if not row:
+            raise ValueError("Conversation hop not found for user")
+        try:
+            current = json.loads(str(row["entities_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            current = {}
+        if not isinstance(current, dict):
+            current = {}
+        current.update(entities)
+        cursor.execute(
+            """
+            UPDATE conversation_hops
+            SET entities_json = ?, updated_at = ?, version = version + 1
+            WHERE hop_id = ? AND user_id = ?
+            """,
+            (json.dumps(current), now_iso(), hop_id, user_id),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("Conversation hop entities could not be updated")
+
     def scan_due_reminders(self, *, now_value: str, limit: int = 100) -> list[str]:
         notified: list[str] = []
         with self.transaction() as cursor:
             rows = cursor.execute(
                 """
                 SELECT reminder_id, user_id, reminder_time, recurrence_rule,
-                       recurrence_timezone, next_fire_time
+                       recurrence_timezone, next_fire_time, version
                 FROM reminders
                 -- Deliberately no user_id predicate: one worker must create
                 -- durable notifications for every due user, including offline
@@ -723,10 +823,21 @@ class SQLiteRepository(AssistantRepository):
                     fire_time=fire_time,
                 )
                 if row["recurrence_rule"]:
+                    completed_occurrences = int(
+                        cursor.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM reminder_notifications
+                            WHERE reminder_id = ? AND user_id = ?
+                            """,
+                            (row["reminder_id"], row["user_id"]),
+                        ).fetchone()[0]
+                    )
                     next_fire_time = calculate_next_fire_time(
                         previous_fire_time=fire_time,
                         recurrence_rule=row["recurrence_rule"],
                         recurrence_timezone=row["recurrence_timezone"] or "UTC",
+                        completed_occurrences=completed_occurrences,
                     )
                     if next_fire_time:
                         cursor.execute(
@@ -734,11 +845,20 @@ class SQLiteRepository(AssistantRepository):
                             UPDATE reminders
                             SET last_fire_time = ?,
                                 next_fire_time = ?,
+                                status = 'scheduled',
                                 updated_at = ?,
                                 version = version + 1
-                            WHERE reminder_id = ? AND user_id = ? AND status = 'scheduled'
+                            WHERE reminder_id = ? AND user_id = ?
+                              AND status = 'scheduled' AND version = ?
                             """,
-                            (fire_time, next_fire_time, now_iso(), row["reminder_id"], row["user_id"]),
+                            (
+                                fire_time,
+                                next_fire_time,
+                                now_iso(),
+                                row["reminder_id"],
+                                row["user_id"],
+                                row["version"],
+                            ),
                         )
                     else:
                         cursor.execute(
@@ -749,9 +869,16 @@ class SQLiteRepository(AssistantRepository):
                                 next_fire_time = NULL,
                                 updated_at = ?,
                                 version = version + 1
-                            WHERE reminder_id = ? AND user_id = ? AND status = 'scheduled'
+                            WHERE reminder_id = ? AND user_id = ?
+                              AND status = 'scheduled' AND version = ?
                             """,
-                            (fire_time, now_iso(), row["reminder_id"], row["user_id"]),
+                            (
+                                fire_time,
+                                now_iso(),
+                                row["reminder_id"],
+                                row["user_id"],
+                                row["version"],
+                            ),
                         )
                 else:
                     cursor.execute(
@@ -759,11 +886,23 @@ class SQLiteRepository(AssistantRepository):
                         UPDATE reminders
                         SET status = 'notified',
                             last_fire_time = ?,
+                            next_fire_time = NULL,
                             updated_at = ?,
                             version = version + 1
-                        WHERE reminder_id = ? AND user_id = ? AND status = 'scheduled'
+                        WHERE reminder_id = ? AND user_id = ?
+                          AND status = 'scheduled' AND version = ?
                         """,
-                        (fire_time, now_iso(), row["reminder_id"], row["user_id"]),
+                        (
+                            fire_time,
+                            now_iso(),
+                            row["reminder_id"],
+                            row["user_id"],
+                            row["version"],
+                        ),
+                    )
+                if cursor.rowcount != 1:
+                    raise ReminderConflictError(
+                        "Autoscan reminder transition lost its scheduled version."
                     )
                 notified.append(str(row["reminder_id"]))
         GLOBAL_METRICS.increment("reminder_scans_total")
@@ -840,17 +979,145 @@ class SQLiteRepository(AssistantRepository):
             )
             return cursor.rowcount == 1
 
-    def load_reminder_reply_context(self, *, user_id: str, reminder_id: str, notification_id: str) -> dict[str, str | None]:
+    def list_reminders_requiring_supporting_question(
+        self, *, limit: int = 100
+    ) -> list[PendingReminderSupportingQuestion]:
+        """Return globally pending question plans without exposing chat history."""
+        rows = self.connection.execute(
+            """
+            SELECT reminder_id, user_id, subject, reminder_summary, raw_reminder,
+                   reminder_time, event_time, user_timezone, recurrence_rule, version
+            FROM reminders
+            WHERE status = 'scheduled'
+              AND supporting_question_plan_status = 'pending'
+            ORDER BY COALESCE(event_time, reminder_time), reminder_id
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [
+            PendingReminderSupportingQuestion(
+                reminder_id=str(row["reminder_id"]),
+                user_id=str(row["user_id"]),
+                subject=str(row["subject"] or ""),
+                reminder_summary=str(row["reminder_summary"] or ""),
+                raw_reminder=str(row["raw_reminder"] or ""),
+                notification_time=_optional_datetime(row["reminder_time"]),
+                event_time=_optional_datetime(row["event_time"]),
+                user_timezone=str(row["user_timezone"] or "UTC"),
+                recurrence_rule=(
+                    str(row["recurrence_rule"])
+                    if row["recurrence_rule"] is not None
+                    else None
+                ),
+                version=int(row["version"]),
+            )
+            for row in rows
+        ]
+
+    def complete_reminder_supporting_question_plan(
+        self,
+        *,
+        reminder_id: str,
+        user_id: str,
+        expected_version: int,
+        question: str | None,
+        confidence: float,
+        reason: str,
+    ) -> bool:
+        timestamp = now_iso()
+        with self.transaction() as cursor:
+            cursor.execute(
+                """
+                UPDATE reminders
+                SET supporting_question = ?,
+                    supporting_question_plan_status = 'planned',
+                    supporting_question_planned_at = ?,
+                    supporting_question_plan_reason = ?,
+                    supporting_question_confidence = ?,
+                    updated_at = ?,
+                    version = version + 1
+                WHERE reminder_id = ? AND user_id = ? AND version = ?
+                  AND status = 'scheduled'
+                  AND supporting_question_plan_status = 'pending'
+                """,
+                (
+                    question,
+                    timestamp,
+                    reason,
+                    confidence,
+                    timestamp,
+                    reminder_id,
+                    user_id,
+                    expected_version,
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def fail_reminder_supporting_question_plan(
+        self,
+        *,
+        reminder_id: str,
+        user_id: str,
+        expected_version: int,
+        reason: str,
+    ) -> bool:
+        timestamp = now_iso()
+        with self.transaction() as cursor:
+            cursor.execute(
+                """
+                UPDATE reminders
+                SET supporting_question_plan_status = 'needs_review',
+                    supporting_question_planned_at = ?,
+                    supporting_question_plan_reason = ?,
+                    supporting_question_confidence = NULL,
+                    updated_at = ?,
+                    version = version + 1
+                WHERE reminder_id = ? AND user_id = ? AND version = ?
+                  AND status = 'scheduled'
+                  AND supporting_question_plan_status = 'pending'
+                """,
+                (
+                    timestamp,
+                    reason,
+                    timestamp,
+                    reminder_id,
+                    user_id,
+                    expected_version,
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def load_reminder_reply_context(self, *, user_id: str, reminder_id: str, notification_id: str) -> dict[str, Any]:
         res = self.connection.execute(
             """
             SELECT
+                r.reminder_id,
+                n.notification_id,
                 r.subject,
                 r.reminder_summary,
+                r.raw_reminder,
+                r.status AS reminder_status,
+                r.reminder_time,
+                r.event_time,
+                r.user_timezone,
+                r.original_time_text,
+                r.recurrence_rule,
+                r.recurrence_timezone,
+                r.next_fire_time,
+                r.last_fire_time,
+                r.parent_recurring_reminder_id,
+                r.timing_plan_status,
+                r.supporting_question_plan_status,
+                r.supporting_question_confidence,
                 r.supporting_question,
                 r.supporting_response,
                 n.source_topic_id,
                 n.source_hop_id,
-                n.ui_status,
+                n.ui_status AS notification_ui_status,
+                n.delivery_status AS notification_delivery_status,
+                n.fire_time AS notification_fire_time,
+                n.created_at AS notification_created_at,
                 h.topic_id,
                 h.rewritten_user_query AS source_rewritten_user_query,
                 h.raw_response AS source_raw_response,
@@ -1721,17 +1988,32 @@ class SQLiteRepository(AssistantRepository):
         source_topic_id = canonical_topic_id
         reminder_id = new_id()
         timestamp = now_iso()
+        has_existing_support = bool(
+            str(supporting_question or "").strip()
+            or str(supporting_response or "").strip()
+        )
+        support_plan_status = "planned" if has_existing_support else "pending"
+        support_planned_at = timestamp if has_existing_support else None
+        support_plan_reason = (
+            "Existing reminder supporting context was preserved."
+            if has_existing_support
+            else None
+        )
+        support_confidence = 1.0 if has_existing_support else None
         cursor.execute(
             """
             INSERT INTO reminders (
                 reminder_id, user_id, source_topic_id, source_hop_id,
                 reminder_time, event_time, timing_plan_status, timing_planned_at, timing_plan_reason,
+                supporting_question_plan_status, supporting_question_planned_at,
+                supporting_question_plan_reason, supporting_question_confidence,
                 status, raw_reminder, reminder_summary, subject,
                 supporting_question, supporting_response, user_timezone,
                 original_time_text, recurrence_rule, recurrence_timezone,
                 next_fire_time, last_fire_time, parent_recurring_reminder_id,
                 created_at, updated_at, version
-            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, 'scheduled', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, ?, ?,
+                      'scheduled', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 1)
             """,
             (
                 reminder_id,
@@ -1740,6 +2022,10 @@ class SQLiteRepository(AssistantRepository):
                 source_hop_id,
                 reminder_time,
                 event_time,
+                support_plan_status,
+                support_planned_at,
+                support_plan_reason,
+                support_confidence,
                 raw_reminder,
                 reminder_summary,
                 subject,
@@ -2864,36 +3150,39 @@ class SQLiteRepository(AssistantRepository):
         reply_text: str,
         response_text: str,
     ) -> HopWrite:
-        context = self.connection.execute(
-            """
-            SELECT r.source_topic_id, r.source_hop_id, r.subject
-            FROM reminders r
-            JOIN reminder_notifications n
-              ON n.reminder_id = r.reminder_id AND n.user_id = r.user_id
-            WHERE r.user_id = ? AND r.reminder_id = ? AND n.notification_id = ?
-            """,
-            (user_id, reminder_id, notification_id),
-        ).fetchone()
+        context = self.load_reminder_reply_context(
+            user_id=user_id,
+            reminder_id=reminder_id,
+            notification_id=notification_id,
+        )
         if not context:
             raise ValueError("Reminder reply context not found for user")
+        from .reminder_reply import build_reminder_state, reminder_reply_hop_entities
+
+        reply_hop_id = new_id()
+        reminder_state = build_reminder_state(
+            context,
+            reminder_id=reminder_id,
+            notification_id=notification_id,
+        )
         with self.transaction() as cursor:
-            topic_id = context["source_topic_id"] or self.ensure_topic(
+            topic_id = context.get("source_topic_id") or self.ensure_topic(
                 cursor, user_id=user_id, title="Reminders"
             )
             hop = self.append_conversation_hop(
                 cursor,
                 topic_id=topic_id,
                 user_id=user_id,
-                parent_hop_id=context["source_hop_id"],
+                parent_hop_id=context.get("source_hop_id"),
                 intent="reminder",
                 raw_user_query=reply_text,
                 rewritten_user_query=reply_text,
                 raw_response=response_text,
                 response_type="reminder_reply",
-                entities={
-                    "reminder_id": reminder_id,
-                    "notification_id": notification_id,
-                    "subject": context["subject"],
-                },
+                entities=reminder_reply_hop_entities(
+                    reminder_state,
+                    reply_hop_id=reply_hop_id,
+                ),
+                hop_id=reply_hop_id,
             )
         return hop

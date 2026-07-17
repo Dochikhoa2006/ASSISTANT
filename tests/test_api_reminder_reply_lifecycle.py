@@ -17,6 +17,7 @@ from assistant_rag.contracts import (
     RateLimitResult,
     ResponseType,
 )
+from assistant_rag.reminder_reply import reminder_state_hash
 
 
 class RecordingLastQAStore:
@@ -61,6 +62,16 @@ class RecordingRepository:
     ) -> dict[str, Any]:
         self.context_loads.append((user_id, reminder_id, notification_id))
         return {
+            "reminder_id": reminder_id,
+            "notification_id": notification_id,
+            "subject": "Project review",
+            "reminder_summary": "Review the project plan",
+            "raw_reminder": "Remind me to review the project plan",
+            "reminder_status": "notified",
+            "reminder_time": "2026-07-18T15:00:00+00:00",
+            "notification_ui_status": "unread",
+            "notification_delivery_status": "sent",
+            "notification_fire_time": "2026-07-18T14:45:00+00:00",
             "source_topic_id": "topic-source",
             "source_hop_id": "hop-source",
             "source_raw_user_query": "Set a project review reminder.",
@@ -207,7 +218,18 @@ def test_reminder_reply_success_uses_lifecycle_and_marks_notification_read() -> 
     assert request.reply_text == "At 3 PM."
     assert request.parent_hop_id == "hop-source"
     assert request.metadata["reminder_reply_context"] is True
-    assert pipeline.last_qa_store.saved[0][1].linked_hop_id == "hop-source"
+    metadata_state = request.metadata["reminder_state"]
+    assert metadata_state["title"] == "Project review"
+    assert metadata_state["supporting_question"] == "When should I remind you?"
+    assert metadata_state["notification_created"] is True
+    assert metadata_state["has_been_notified"] is True
+    assert request.metadata["reminder_state_hash"] == reminder_state_hash(
+        metadata_state
+    )
+    saved_state = pipeline.last_qa_store.saved[0][1]
+    assert saved_state.linked_hop_id == "hop-source"
+    assert saved_state.reminder_state == metadata_state
+    assert saved_state.reminder_state_hash == request.metadata["reminder_state_hash"]
 
 
 def test_reminder_reply_error_stays_unread_and_same_key_can_retry() -> None:

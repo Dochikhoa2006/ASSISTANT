@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 from .bundler import ChatOutput, ResponseBundler
 from .classification import IntentClassifier, LastQAResolver, QueryRewriter
@@ -15,6 +15,7 @@ from .contracts import (
     LastQAInteractionType,
     LastQAPath,
     LastQAResolution,
+    LastQAState,
     RetrievalResult,
 )
 from .last_qa import InMemoryLastQAStore
@@ -28,6 +29,11 @@ from .metrics import GLOBAL_METRICS
 from .observability import StageTimer, current_trace
 from .chat_history import canonical_chat_history_scope, select_chat_history
 from .indexing import BackgroundIndexer
+from .reminder_reply import (
+    mark_reminder_state_replied,
+    reminder_state_hash,
+    verified_reminder_state,
+)
 
 
 def _branch_outbox_job_ids(branch_result: Any) -> list[str]:
@@ -198,6 +204,7 @@ class AssistantPipeline:
                 conversation_retrieval=should_run_broad_retrieval,
                 chat_history=chat_history,
                 chat_history_source=chat_history_source,
+                previous_last_qa_state=last_state,
             )
 
     def _handle_with_chat_history(
@@ -214,6 +221,7 @@ class AssistantPipeline:
         conversation_retrieval: bool,
         chat_history: list[dict[str, Any]],
         chat_history_source: Literal["conversation_retrieval", "last_qa"],
+        previous_last_qa_state: LastQAState | None,
     ) -> BundledResponse:
         with StageTimer("classification"):
             intent = self.classifier.classify(
@@ -256,6 +264,7 @@ class AssistantPipeline:
             chat_history_source=chat_history_source,
             last_qa_trace=last_qa_trace,
             approved_conversation_context=approved_conversation_context,
+            previous_last_qa_state=previous_last_qa_state,
         )
         with StageTimer("branch_execution", {"intent": intent.value}):
             branch_result = self.router.route(context, repository)
@@ -288,9 +297,31 @@ class AssistantPipeline:
                 rewritten_query=intent_classifier_query,
                 branch_result=branch_result,
             )
+        if (
+            resolution.interaction_type
+            is LastQAInteractionType.REMINDER_NOTIFICATION_REPLY
+            and resolution.is_authoritative_state
+            and resolution.state is not None
+        ):
+            reminder_state = verified_reminder_state(
+                resolution.state.reminder_state,
+                resolution.state.reminder_state_hash,
+            )
+            if reminder_state is not None:
+                replied_state = mark_reminder_state_replied(
+                    reminder_state,
+                    reply_hop_id=bundled.conversation_hop_id,
+                )
+                bundled = replace(
+                    bundled,
+                    last_qa_state=replace(
+                        bundled.last_qa_state,
+                        reminder_state=replied_state,
+                        reminder_state_hash=reminder_state_hash(replied_state),
+                    ),
+                )
         with StageTimer("platform_selector"):
             platform_payload = self.platform_selector.select(bundled, request)
-        from dataclasses import replace
         with StageTimer("response_finalize"):
             delivery = platform_payload.get("delivery", {})
             if delivery.get("status") in {"needs_input", "pending_review", "failed", "partial_failure"}:

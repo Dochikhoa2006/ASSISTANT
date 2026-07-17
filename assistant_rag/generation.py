@@ -8,10 +8,57 @@ from typing import Any, Protocol
 
 from .config import GeneralPurposeConfig, QuestionGenerationConfig
 from .contracts import ContentComposerResult, GeneratedQuestion, HumanSupportingDecision, PipelineContext, QuestionSource, ExpectedResponseType
-from .llm import LLMClient, LLMTask
+from .llm import LLMClient, LLMTask, is_structured_fallback
 from .prompts import PromptContext, PromptRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _question_item_schema() -> dict[str, Any]:
+    """Return only values the question model genuinely has to decide."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "question_text": {"type": "string"},
+            "confidence": {"type": "number"},
+            "should_ask": {"type": "boolean"},
+            "expected_response_type": {
+                "type": "string",
+                "enum": [item.value for item in ExpectedResponseType],
+            },
+        },
+        "required": [
+            "question_text",
+            "confidence",
+            "should_ask",
+            "expected_response_type",
+        ],
+    }
+
+
+def _required_question_schema() -> dict[str, Any]:
+    """Represent one included question without a redundant ask/no-ask mirror."""
+    schema = _question_item_schema()
+    schema["properties"].pop("should_ask")
+    schema["required"].remove("should_ask")
+    return schema
+
+
+def _question_list_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "questions": {
+                "type": "array",
+                # Inclusion in this array already means "ask"; an empty array
+                # represents the no-question decision.
+                "items": _required_question_schema(),
+            }
+        },
+        "required": ["questions"],
+    }
 
 
 class QuestionGenerationStrategy(Protocol):
@@ -29,22 +76,8 @@ class LLMClarificationStrategy:
         missing_fields = kwargs.get("missing_fields", [])
         ambiguity_reason = kwargs.get("ambiguity_reason", "Missing required fields for safe action.")
         
-        schema = {
-            "type": "object",
-            "properties": {
-                "question_text": {"type": "string"},
-                "question_source": {"type": "string"},
-                "purpose": {"type": "string"},
-                "confidence": {"type": "number"},
-                "should_ask": {"type": "boolean"},
-                "expected_response_type": {
-                    "type": "string",
-                    "enum": [e.value for e in ExpectedResponseType]
-                },
-                "reason_summary": {"type": "string"}
-            },
-            "required": ["question_text", "question_source", "purpose", "confidence", "should_ask", "expected_response_type", "reason_summary"]
-        }
+        # The branch already owns the ask decision and needs only the question.
+        schema = _required_question_schema()
         
         try:
             payload = self.llm.generate_json(
@@ -70,16 +103,23 @@ class LLMClarificationStrategy:
                 ),
                 schema=schema,
             )
-            
-            should_ask = payload.get("should_ask", True)
-            if not should_ask:
+            if is_structured_fallback(payload):
                 return None
-                
+
+            question_text = str(payload["question_text"]).strip()
+            confidence = float(payload.get("confidence", 0.0))
+            if (
+                not question_text
+                or confidence
+                < self.config.question_generation_confidence_threshold
+            ):
+                return None
+
             return GeneratedQuestion(
-                text=str(payload["question_text"]),
+                text=question_text,
                 source=QuestionSource.CLARIFICATION_QUESTION,
-                purpose=str(payload.get("purpose", "resolve_missing_info")),
-                confidence=float(payload.get("confidence", 1.0)),
+                purpose="resolve_missing_info",
+                confidence=confidence,
                 should_ask=True,
                 expected_response_type=ExpectedResponseType(payload.get("expected_response_type", ExpectedResponseType.UNKNOWN.value)),
             )
@@ -100,31 +140,7 @@ class LLMHumanInTheLoopStrategy:
         if not self.config.enabled:
             return [], None
 
-        schema = {
-            "type": "object",
-            "properties": {
-                "questions": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "question_text": {"type": "string"},
-                            "question_source": {"type": "string"},
-                            "purpose": {"type": "string"},
-                            "confidence": {"type": "number"},
-                            "should_ask": {"type": "boolean"},
-                            "expected_response_type": {
-                                "type": "string",
-                                "enum": [e.value for e in ExpectedResponseType]
-                            },
-                            "reason_summary": {"type": "string"}
-                        },
-                        "required": ["question_text", "question_source", "purpose", "confidence", "should_ask", "expected_response_type", "reason_summary"]
-                    }
-                }
-            },
-            "required": ["questions"]
-        }
+        schema = _question_list_schema()
 
         try:
             payload = self.llm.generate_json(
@@ -144,16 +160,16 @@ class LLMHumanInTheLoopStrategy:
                 ),
                 schema=schema,
             )
+            if is_structured_fallback(payload):
+                return [], None
             
             questions = []
             for q in payload.get("questions", []):
-                if not q.get("should_ask", True):
-                    continue
                 questions.append(
                     GeneratedQuestion(
                         text=str(q["question_text"]),
                         source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
-                        purpose=str(q.get("purpose", "optional_context")),
+                        purpose="optional_context",
                         confidence=float(q.get("confidence", 1.0)),
                         should_ask=True,
                         expected_response_type=ExpectedResponseType(q.get("expected_response_type", ExpectedResponseType.UNKNOWN.value)),
@@ -195,31 +211,9 @@ class LLMGeneralHITLStrategy:
                 reason_summary="Disabled by config", risk_flags=()
             )
             
-        schema = {
-            "type": "object",
-            "properties": {
-                "questions": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "question_text": {"type": "string"},
-                            "question_source": {"type": "string"},
-                            "purpose": {"type": "string"},
-                            "confidence": {"type": "number"},
-                            "should_ask": {"type": "boolean"},
-                            "expected_response_type": {
-                                "type": "string",
-                                "enum": [e.value for e in ExpectedResponseType]
-                            },
-                            "reason_summary": {"type": "string"}
-                        },
-                        "required": ["question_text", "question_source", "purpose", "confidence", "should_ask", "expected_response_type", "reason_summary"]
-                    }
-                }
-            },
-            "required": ["questions"]
-        }
+        # General HITL is contractually limited to one optional question, so an
+        # array wrapper adds output tokens and invalid-shape opportunities.
+        schema = _question_item_schema()
 
         try:
             payload = self.llm.generate_json(
@@ -244,40 +238,48 @@ class LLMGeneralHITLStrategy:
                 ),
                 schema=schema,
             )
+            if is_structured_fallback(payload):
+                return HumanSupportingDecision(
+                    should_ask=False,
+                    question="",
+                    confidence=0.0,
+                    question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+                    expected_response_type=ExpectedResponseType.UNKNOWN,
+                    reason_summary="Supporting-question generation was unavailable.",
+                    risk_flags=("structured_output_fallback",),
+                )
 
-            questions = payload.get("questions", [])[:1]
-            for q in questions:
-                question = str(q.get("question_text") or "").strip()
-                confidence = float(q.get("confidence", 0.0))
-                if (
-                    q.get("should_ask")
-                    and question
-                    and len(question) <= self.config.hitl_supporting_question_max_length
-                    and confidence >= self.config.hitl_supporting_question_confidence_threshold
-                    and self._is_novel_question(
-                        question,
-                        response_text=response_text,
-                        approved_conversation_history=approved_conversation_history,
-                    )
-                ):
-                    try:
-                        expected_response_type = ExpectedResponseType(
-                            q.get(
-                                "expected_response_type",
-                                ExpectedResponseType.UNKNOWN.value,
-                            )
+            question = str(payload.get("question_text") or "").strip()
+            confidence = float(payload.get("confidence", 0.0))
+            if (
+                payload.get("should_ask")
+                and question
+                and len(question) <= self.config.hitl_supporting_question_max_length
+                and confidence >= self.config.hitl_supporting_question_confidence_threshold
+                and self._is_novel_question(
+                    question,
+                    response_text=response_text,
+                    approved_conversation_history=approved_conversation_history,
+                )
+            ):
+                try:
+                    expected_response_type = ExpectedResponseType(
+                        payload.get(
+                            "expected_response_type",
+                            ExpectedResponseType.UNKNOWN.value,
                         )
-                    except (TypeError, ValueError):
-                        expected_response_type = ExpectedResponseType.UNKNOWN
-                    return HumanSupportingDecision(
-                        should_ask=True,
-                        question=question,
-                        confidence=confidence,
-                        question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
-                        expected_response_type=expected_response_type,
-                        reason_summary=str(q.get("reason_summary", "")),
-                        risk_flags=(),
                     )
+                except (TypeError, ValueError):
+                    expected_response_type = ExpectedResponseType.UNKNOWN
+                return HumanSupportingDecision(
+                    should_ask=True,
+                    question=question,
+                    confidence=confidence,
+                    question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+                    expected_response_type=expected_response_type,
+                    reason_summary="One useful follow-up question was selected.",
+                    risk_flags=(),
+                )
         except Exception as e:
             logger.debug("General HITL evaluation failed: %s", e)
 

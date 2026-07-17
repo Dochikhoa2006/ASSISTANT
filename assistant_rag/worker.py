@@ -13,6 +13,7 @@ from .autoscan import ReminderAutoscan
 from .config import OutboxConfig
 from .database import AssistantRepository
 from .indexing import BackgroundIndexer
+from .reminder_supporting import ReminderSupportingQuestionPlanner
 from .reminder_timing import ReminderTimingPlanner
 from .retrieval import SearchIndex
 from .settings import ProductionSettings
@@ -25,6 +26,7 @@ class ProductionWorker:
     chroma: SearchIndex
     settings: ProductionSettings
     reminder_timing_planner: ReminderTimingPlanner | None = None
+    reminder_supporting_question_planner: ReminderSupportingQuestionPlanner | None = None
 
     def __post_init__(self) -> None:
         # A production worker must own a real planner.  Keeping construction
@@ -33,6 +35,14 @@ class ProductionWorker:
         if self.reminder_timing_planner is None:
             from .production_factory import build_reminder_timing_planner
             self.reminder_timing_planner = build_reminder_timing_planner(self.settings)
+        if self.reminder_supporting_question_planner is None:
+            from .production_factory import build_reminder_supporting_question_planner
+            self.reminder_supporting_question_planner = (
+                build_reminder_supporting_question_planner(
+                    self.settings,
+                    llm=getattr(self.reminder_timing_planner, "llm", None),
+                )
+            )
 
     def run_once(self, *, scan_reminders: bool = True) -> dict[str, int]:
         indexer = BackgroundIndexer(
@@ -55,10 +65,15 @@ class ProductionWorker:
             indexed = 0
 
         notified_count = 0
+        catch_up: dict[str, int] = {}
         if scan_reminders:
             try:
                 catch_up = ReminderAutoscan(
-                    self.repository, timing_planner=self.reminder_timing_planner
+                    self.repository,
+                    timing_planner=self.reminder_timing_planner,
+                    supporting_question_planner=(
+                        self.reminder_supporting_question_planner
+                    ),
                 ).catch_up_due(
                     now_value=datetime.now(timezone.utc).isoformat()
                 )
@@ -69,7 +84,19 @@ class ProductionWorker:
                 logger.error("Exception during reminder autoscan", exc_info=e)
                 notified_count = 0
 
-        return {"indexed_jobs": indexed, "notified_reminders": notified_count}
+        return {
+            "indexed_jobs": indexed,
+            "notified_reminders": notified_count,
+            "supporting_question_plans": int(
+                catch_up.get("supporting_planned", 0)
+            ),
+            "supporting_questions_created": int(
+                catch_up.get("supporting_questions_created", 0)
+            ),
+            "supporting_question_needs_review": int(
+                catch_up.get("supporting_needs_review", 0)
+            ),
+        }
 
     def run_forever(self) -> None:
         logger.info("Starting background worker...")

@@ -14,6 +14,7 @@ from assistant_rag.contracts import (
 )
 from assistant_rag.request_lifecycle import (
     ChatRequestExecution,
+    RequestLifecycleConflict,
     bundled_response_payload,
 )
 import streamlit_app
@@ -209,3 +210,100 @@ def test_invalid_artifact_metadata_is_visibly_reported(
     assert rendered.downloads == []
     assert len(rendered.errors) == 1
     assert "unavailable" in rendered.errors[0].casefold()
+
+
+def test_safe_streamlit_execution_preserves_success_and_before_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _response([])
+    expected = _execution(response, replayed=False)
+    observed: dict[str, object] = {}
+
+    def execute(**kwargs: object) -> ChatRequestExecution:
+        observed.update(kwargs)
+        return expected
+
+    before_pipeline = lambda _request: None
+    monkeypatch.setattr(streamlit_app, "_execute_user_request", execute)
+
+    execution, failure = streamlit_app._execute_user_request_safely(
+        pipeline=object(),
+        repository=object(),
+        request=expected.request,
+        before_pipeline=before_pipeline,
+    )
+
+    assert execution is expected
+    assert failure is None
+    assert observed["before_pipeline"] is before_pipeline
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_fragment"),
+    (
+        (
+            RequestLifecycleConflict("already in progress"),
+            "not run again",
+        ),
+        (
+            RuntimeError("backend unavailable"),
+            "current conversation is still available",
+        ),
+    ),
+    ids=("lifecycle-conflict", "unexpected-failure"),
+)
+def test_safe_streamlit_execution_contains_terminal_failures_without_question_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    expected_fragment: str,
+) -> None:
+    def fail(**_kwargs: object) -> ChatRequestExecution:
+        raise error
+
+    monkeypatch.setattr(streamlit_app, "_execute_user_request", fail)
+
+    execution, failure = streamlit_app._execute_user_request_safely(
+        pipeline=object(),
+        repository=object(),
+        request=ChatRequest(
+            user_id="streamlit-failure-user",
+            raw_query="Handle this request.",
+            idempotency_key="streamlit-failure-key",
+        ),
+    )
+
+    assert execution is None
+    assert failure is not None
+    assert failure["response_type"] == ResponseType.ERROR.value
+    assert failure["artifacts"] == []
+    assert failure["pending_confirmations"] == []
+    assert expected_fragment in str(failure["content"]).casefold()
+    assert "?" not in str(failure["content"])
+
+
+def test_reminder_panel_failure_does_not_replace_chat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class WarningCapture:
+        def __init__(self) -> None:
+            self.warnings: list[str] = []
+
+        def warning(self, message: object) -> None:
+            self.warnings.append(str(message))
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("reminder database unavailable")
+
+    rendered = WarningCapture()
+    monkeypatch.setattr(streamlit_app, "_render_reminder_notifications", fail)
+
+    streamlit_app._render_reminder_notifications_safely(
+        rendered,
+        repository=object(),
+        pipeline=object(),
+        user_id="reminder-panel-failure-user",
+    )
+
+    assert rendered.warnings == [
+        "Reminder notifications are temporarily unavailable. Chat remains available."
+    ]

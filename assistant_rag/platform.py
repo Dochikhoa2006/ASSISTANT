@@ -16,7 +16,7 @@ from urllib import request as urlrequest
 
 from .artifacts import artifact_mime_type, resolve_generated_artifacts
 from .contracts import BundledResponse, ChatRequest, ResponseType
-from .llm import LLMClient, LLMTask
+from .llm import LLMClient, LLMTask, is_structured_fallback
 from .chat_history import CHAT_HISTORY_PROMPT_RULE, inject_chat_history
 
 
@@ -24,6 +24,34 @@ logger = logging.getLogger(__name__)
 
 
 _CHANNELS = ("gmail", "zalo", "telegram")
+
+
+PLATFORM_CHANNEL_SELECTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["channel"],
+    "properties": {
+        "channel": {
+            "type": "string",
+            "enum": ["gmail", "zalo", "telegram", "none"],
+        },
+    },
+}
+
+
+PLATFORM_RECIPIENT_EXTRACTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["recipients"],
+    "properties": {
+        "recipients": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+}
+
+
 # A terminal period is ordinary sentence punctuation, not part of an address.
 # Do not reject otherwise-valid recipients written at the end of a sentence.
 _EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w+-])")
@@ -34,14 +62,15 @@ _DO_NOT_SEND = re.compile(
     re.I,
 )
 _DRAFT_WORDS = re.compile(r"\b(compose|draft|write|prepare|soạn)\b", re.I)
-_EMAIL_MESSAGE_WORDS = re.compile(r"\b(?:email|mail|message)\b", re.I)
+_EMAIL_MESSAGE_WORDS = re.compile(r"\b(?:gmail|email|mail|message)\b", re.I)
+_NON_EMAIL_CHANNEL_WORDS = re.compile(r"\b(?:zalo|telegram)\b", re.I)
 _DIRECT_EMAIL_VERB = re.compile(r"\b(?:email|mail)\s+(?:to\s+)?[\w.+-]+@", re.I)
 _EMAIL_OBJECT_DELIVERY = re.compile(
     r"\b(?:email|mail)\b(?:"
     r"\s+(?:it|this|that|them)\s+to\b"
     r"|\s+(?:[\w'-]+\s+){0,6}\.?"
-    r"(?:file|document|workbook|spreadsheet|worksheet|pdf|report|presentation|deck|slides|"
-    r"powerpoint|excel|xlsx|pptx|docx)"
+    r"(?:update|answer|response|message|file|document|workbook|spreadsheet|worksheet|pdf|"
+    r"report|presentation|deck|slides|powerpoint|excel|xlsx|pptx|docx)"
     r"\s+to\b)",
     re.I,
 )
@@ -172,12 +201,49 @@ def _requests_gmail_draft_save(text: str) -> bool:
 
 def _subject_from_bundled_response(text: str) -> str:
     match = _SUBJECT_LINE.search(text or "")
-    return _clean(match.group(1)) if match else ""
+    if match:
+        return _clean(match.group(1))
+    # A model call is unnecessary merely to manufacture a subject. Prefer the
+    # first concise, non-salutation line of the already approved bundled text.
+    for raw_line in (text or "").splitlines():
+        line = _clean(raw_line)
+        if not line or _EMAIL_SALUTATION.match(line):
+            continue
+        return line[:120].rstrip(" .,:;-—")
+    return ""
 
 
-def _body_from_bundled_response(text: str) -> str:
-    """Prefer the drafted message portion when the answer contains one."""
+def _body_from_bundled_response(
+    text: str,
+    artifacts: Any = None,
+) -> str:
+    """Return authored message copy without composer-owned artifact notices."""
     response = _clean(text)
+    artifact_filenames = {
+        _clean(item.get("filename"))
+        for item in (artifacts or [])
+        if isinstance(item, dict) and _clean(item.get("filename"))
+    }
+    if artifact_filenames:
+        paragraphs = re.split(r"\n\s*\n", response)
+        while paragraphs:
+            trailing = _clean(paragraphs[-1])
+            if not (
+                trailing.casefold().startswith("created ")
+                and any(filename in trailing for filename in artifact_filenames)
+            ):
+                break
+            paragraphs.pop()
+        response = "\n\n".join(paragraphs).strip()
+    subject = _SUBJECT_LINE.search(response)
+    if subject:
+        if not response[:subject.start()].strip():
+            return response[subject.start():].strip()
+        drafted_body = response[subject.end():].strip()
+        salutation = _EMAIL_SALUTATION.search(drafted_body)
+        if salutation:
+            return drafted_body[salutation.start():].strip()
+        return drafted_body
     salutation = _EMAIL_SALUTATION.search(response)
     if salutation:
         return response[salutation.start():].strip()
@@ -434,7 +500,7 @@ class PlatformSelector:
                 "source": "safe_fallback_error_response",
             }
             return self._hitl_passthrough(base, response)
-        selection = self._choose_channel(response, rewritten_query)
+        selection = self._choose_channel(rewritten_query)
         channel = selection["channel"]
         base["platform_selection"] = selection
         if channel == "none":
@@ -568,7 +634,6 @@ class PlatformSelector:
 
     def _choose_channel(
         self,
-        response: BundledResponse,
         rewritten_query: str,
     ) -> dict[str, Any]:
         """Choose Gmail deterministically for explicit email messages, else use the LLM."""
@@ -580,14 +645,12 @@ class PlatformSelector:
             }
         if self.llm is None:
             return {"channel": "none", "confidence": 0.0, "source": "safe_fallback_no_llm"}
-        schema = {
-            "type": "object",
-            "required": ["channel", "confidence"],
-            "properties": {
-                "channel": {"type": "string", "enum": ["gmail", "zalo", "telegram", "none"]},
-                "confidence": {"type": "number"},
-            },
-        }
+        if not _NON_EMAIL_CHANNEL_WORDS.search(rewritten_query):
+            return {
+                "channel": "none",
+                "confidence": 1.0,
+                "source": "deterministic_no_platform_request",
+            }
         try:
             plan = self.llm.generate_json(
                 task=LLMTask.ACTION_PLANNING,
@@ -600,23 +663,21 @@ class PlatformSelector:
                     "or questions about how a platform works. Never choose a channel only because the "
                     f"answer mentions it.\n\n{CHAT_HISTORY_PROMPT_RULE}"
                 ),
-                user_prompt=json.dumps(
-                    inject_chat_history({
-                        "rewritten_query": rewritten_query,
-                        "bundled_response": response.final_chat_text,
-                        "available_platforms": list(_CHANNELS),
-                    })
-                ),
-                schema=schema,
+                user_prompt=json.dumps({
+                    "rewritten_query": rewritten_query,
+                    "available_platforms": list(_CHANNELS),
+                }),
+                schema=PLATFORM_CHANNEL_SELECTION_SCHEMA,
             )
+            if is_structured_fallback(plan):
+                return {
+                    "channel": "none",
+                    "confidence": 0.0,
+                    "source": "safe_fallback_structured_output",
+                }
             candidate = _clean(plan.get("channel")).casefold()
             if candidate in (*_CHANNELS, "none"):
-                confidence = plan.get("confidence", 0.0)
-                try:
-                    confidence = max(0.0, min(1.0, float(confidence)))
-                except (TypeError, ValueError):
-                    confidence = 0.0
-                return {"channel": candidate, "confidence": confidence, "source": "llm"}
+                return {"channel": candidate, "confidence": 1.0, "source": "llm"}
         except Exception:
             pass
         # Selection failures are safe: continue to the HITL pass-through path
@@ -632,32 +693,28 @@ class PlatformSelector:
     ) -> dict[str, Any]:
         text = rewritten_query
         extracted: dict[str, Any] = {}
-        if self.llm is not None:
-            schema = {"type": "object", "required": ["subject", "body", "mode"], "properties": {"recipient": {"type": "string"}, "recipients": {"type": "array", "items": {"type": "string"}}, "subject": {"type": "string"}, "body": {"type": "string"}, "mode": {"type": "string", "enum": ["send", "draft"]}}}
+        # Gmail fields are already authoritative without another model call:
+        # recipient addresses and delivery mode come from the rewritten query,
+        # while subject/body come from the bundled response. Non-email channels
+        # still need the model only for opaque recipient IDs.
+        if self.llm is not None and channel != "gmail":
             try:
                 extracted = self.llm.generate_json(
                     task=LLMTask.ACTION_PLANNING,
                     system_prompt=(
-                        f"You extract a {channel} message only from explicit user-provided facts. "
-                        "Do not invent recipients, subject, body, or attachments. Return every explicitly "
-                        "requested recipient in recipients. Mode is send only for an explicit request to "
-                        f"send now; otherwise draft.\n\n{CHAT_HISTORY_PROMPT_RULE}"
+                        f"You extract {channel} recipient IDs only from explicit user-provided facts. "
+                        "Return every explicitly requested recipient in recipients and no message content. "
+                        f"Never invent an ID.\n\n{CHAT_HISTORY_PROMPT_RULE}"
                     ),
                     user_prompt=json.dumps(
                         inject_chat_history({
                             "rewritten_query": text,
-                            "bundled_response": response.final_chat_text,
-                            "available_artifacts": [
-                                {
-                                    "artifact_id": artifact.get("artifact_id"),
-                                    "filename": artifact.get("filename"),
-                                }
-                                for artifact in _public_artifacts(base)
-                            ],
                         })
                     ),
-                    schema=schema,
+                    schema=PLATFORM_RECIPIENT_EXTRACTION_SCHEMA,
                 )
+                if is_structured_fallback(extracted):
+                    extracted = {}
             except Exception:
                 extracted = {}
         allowed_gmail_recipients = _gmail_recipient_candidates(text) if channel == "gmail" else []
@@ -671,14 +728,15 @@ class PlatformSelector:
             # The LLM extractor may neither invent addresses nor narrow the
             # explicit ordered recipient set.
             recipients = allowed_gmail_recipients
-        # The bundled answer is the canonical body unless a platform-specific
-        # extractor safely supplied a body. This makes artifact/general answers
-        # usable by all delivery platforms without a second answer generator.
-        body = _clean(extracted.get("body")) or _body_from_bundled_response(response.final_chat_text)
-        subject = _clean(extracted.get("subject"))
-        if not subject:
-            subject_match = re.search(r"\bsubject\s*[:=-]\s*([^\n.;]+)", text, re.I)
-            subject = subject_match.group(1).strip(" '\"") if subject_match else ""
+        # The bundled answer is the sole message-body authority. Asking an
+        # extractor to repeat it added output tokens and a second opportunity
+        # to alter otherwise approved content.
+        body = _body_from_bundled_response(
+            response.final_chat_text,
+            base.get("artifacts"),
+        )
+        subject_match = re.search(r"\bsubject\s*[:=-]\s*([^\n.;]+)", text, re.I)
+        subject = subject_match.group(1).strip(" '\"") if subject_match else ""
         if not subject:
             subject = _subject_from_bundled_response(response.final_chat_text)
         attachments: list[dict[str, str]] = []
@@ -689,7 +747,7 @@ class PlatformSelector:
             )
         if not subject and attachments:
             subject = "Requested file"
-        mode = _clean(extracted.get("mode"))
+        mode = "draft"
         if _DO_NOT_SEND.search(text):
             mode = "draft"
         elif _DIRECT_SEND_WORDS.search(text):
@@ -698,7 +756,7 @@ class PlatformSelector:
             mode = "draft"
         elif _DIRECT_EMAIL_VERB.search(text) or _EMAIL_OBJECT_DELIVERY.search(text):
             mode = "send"
-        elif mode not in {"send", "draft"}:
+        else:
             mode = "send" if _SEND_WORDS.search(text) and not _DRAFT_WORDS.search(text) else "draft"
         return {
             "channel": channel,

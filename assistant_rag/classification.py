@@ -12,8 +12,16 @@ from .contracts import (
     LastQAInteractionType, QuestionSource, LastQAResolution,
     validate_last_qa_resolution
 )
-from .llm import LLMClient, LLMTask, build_intent_conversation_extra, validate_json_schema
+from .llm import (
+    LLMClient,
+    LLMTask,
+    _has_pending_clarification,
+    build_intent_conversation_extra,
+    is_structured_fallback,
+    validate_json_schema,
+)
 from .prompts import DEFAULT_PROMPT_REGISTRY, PromptContext, PromptRegistry
+from .reminder_reply import verified_reminder_state
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 logger = logging.getLogger(__name__)
@@ -55,6 +63,8 @@ class LLMQueryRewriter:
                 ),
                 schema=schema,
             )
+            if is_structured_fallback(payload):
+                return normalized
             validate_json_schema(payload, schema)
         except Exception as e:
             _log_llm_fallback("Query rewrite", e)
@@ -97,13 +107,41 @@ def _resolve_exact_reminder_notification_reply(
     if not metadata.get("reminder_reply_context") or state is None:
         return None
 
+    metadata_state = verified_reminder_state(
+        metadata.get("reminder_state"),
+        metadata.get("reminder_state_hash"),
+    )
+    last_qa_reminder_state = verified_reminder_state(
+        state.reminder_state,
+        state.reminder_state_hash,
+    )
+    if (
+        metadata_state is None
+        or last_qa_reminder_state is None
+        or metadata_state != last_qa_reminder_state
+    ):
+        return None
+
     source_topic_id = metadata.get("source_topic_id")
     source_hop_id = metadata.get("source_hop_id")
+    reminder_id = str(metadata.get("reminder_id") or "")
+    notification_id = str(metadata.get("notification_id") or "")
     if (
         not source_topic_id
         or not source_hop_id
+        or not reminder_id
+        or not notification_id
         or source_topic_id != state.linked_topic_id
         or source_hop_id != state.linked_hop_id
+        or source_topic_id != metadata_state.get("source_topic_id")
+        or source_hop_id != metadata_state.get("source_hop_id")
+        or reminder_id != metadata_state.get("reminder_id")
+        or notification_id != metadata_state.get("notification_id")
+        or (request.reminder_id is not None and request.reminder_id != reminder_id)
+        or (
+            request.notification_id is not None
+            and request.notification_id != notification_id
+        )
     ):
         return None
 
@@ -118,8 +156,8 @@ def _resolve_exact_reminder_notification_reply(
         question_source=QuestionSource.NONE,
         linked_topic_id=state.linked_topic_id,
         linked_hop_id=state.linked_hop_id,
-        reminder_id=metadata.get("reminder_id"),
-        notification_id=metadata.get("notification_id"),
+        reminder_id=reminder_id,
+        notification_id=notification_id,
         source_topic_id=source_topic_id,
         source_hop_id=source_hop_id,
         merge_reason="exact_reminder_notification_context",
@@ -161,8 +199,6 @@ def can_skip_broad_retrieval(
 ) -> bool:
     confidence = float(payload.get("confidence", 0.0))
     if confidence < config.skip_broad_retrieval_min_confidence:
-        return False
-    if not payload.get("llm_suggested_skip_broad_retrieval") and not payload.get("skip_broad_retrieval"):
         return False
         
         
@@ -321,9 +357,8 @@ class LLMLastQAResolver:
                 "answered_clarification": {"type": "boolean"},
                 "merged_query": {"type": "string"},
                 "confidence": {"type": "number"},
-                "missing_context": {"type": "array", "items": {"type": "string"}},
             },
-            "required": ["answered_clarification", "merged_query", "confidence", "missing_context"],
+            "required": ["answered_clarification", "merged_query", "confidence"],
         }
         try:
             payload = self.llm.generate_json(
@@ -339,6 +374,8 @@ class LLMLastQAResolver:
                 ),
                 schema=schema,
             )
+            if is_structured_fallback(payload):
+                return None
             validate_json_schema(payload, schema)
             
             if not payload.get("answered_clarification"):
@@ -411,7 +448,7 @@ class LLMLastQAResolver:
                     skip_broad_retrieval=False,
                     confidence=float(merge_payload.get("confidence", 0.0)),
                     is_authoritative_state=False,
-                    missing_context=merge_payload.get("missing_context", []),
+                    missing_context=[],
                     merge_reason="current_query_answered_previous_clarification",
                     skip_reason="clarification_merge_must_continue_to_broad_retrieval",
                 )
@@ -437,7 +474,6 @@ class LLMLastQAResolver:
             schema = {
                 "type": "object",
                 "properties": {
-                "interaction_detected": {"type": "boolean"},
                     "interaction_type": {
                         "type": "string",
                         "enum": [
@@ -455,14 +491,12 @@ class LLMLastQAResolver:
                     },
                     "matched_question": {"type": "string"},
                     "confidence": {"type": "number"},
-                    "llm_suggested_skip_broad_retrieval": {"type": "boolean"},
                 },
                 "required": [
-                    "interaction_detected",
                     "interaction_type",
                     "question_source",
+                    "matched_question",
                     "confidence",
-                    "llm_suggested_skip_broad_retrieval",
                 ],
             }
             try:
@@ -481,6 +515,8 @@ class LLMLastQAResolver:
                     ),
                     schema=schema,
                 )
+                if is_structured_fallback(payload):
+                    return self.fallback.resolve(request, rewritten_query, state)
                 validate_json_schema(payload, schema)
 
                 it_str = payload.get("interaction_type")
@@ -494,7 +530,11 @@ class LLMLastQAResolver:
                 except ValueError:
                     question_source = QuestionSource.NONE
 
-                if payload.get("interaction_detected") and interaction_type and float(payload.get("confidence", 0.0)) >= self.config.min_confidence:
+                interaction_detected = bool(
+                    interaction_type
+                    and str(it_str) not in {"unrelated", "ambiguous"}
+                )
+                if interaction_detected and float(payload.get("confidence", 0.0)) >= self.config.min_confidence:
                     if can_skip_broad_retrieval(payload, state, interaction_type, self.config, request):
                         md = request.metadata or {}
                         pc = request.platform_context or {}
@@ -564,10 +604,18 @@ class LLMIntentClassifier(IntentClassifierProtocol):
         schema = {
             "type": "object",
             "properties": {
-                "intent": {"type": "string", "enum": [e.value for e in Intent]},
+                "operation_kind": {
+                    "type": "string",
+                    "enum": [
+                        "durable_knowledge",
+                        "reminder_lifecycle",
+                        "clarification_reply",
+                        "none",
+                    ],
+                },
                 "confidence": {"type": "number"},
             },
-            "required": ["intent", "confidence"],
+            "required": ["operation_kind", "confidence"],
         }
         
         # Include compact approved chat history so intent can resolve safe follow-ups.
@@ -592,11 +640,23 @@ class LLMIntentClassifier(IntentClassifierProtocol):
                 ),
                 schema=schema,
             )
+            if is_structured_fallback(payload):
+                return Intent.GENERAL_RESPONSE
             validate_json_schema(payload, schema)
             
-            intent_str = payload.get("intent")
-            if intent_str and float(payload.get("confidence", 0.0)) >= self.config.min_confidence:
-                return Intent(intent_str)
+            if float(payload.get("confidence", 0.0)) >= self.config.min_confidence:
+                intent = {
+                    "durable_knowledge": Intent.KNOWLEDGE_FACTS,
+                    "reminder_lifecycle": Intent.REMINDER,
+                    "clarification_reply": Intent.CLARIFICATION,
+                    "none": Intent.GENERAL_RESPONSE,
+                }[str(payload["operation_kind"])]
+                if (
+                    intent is Intent.CLARIFICATION
+                    and not _has_pending_clarification(last_qa_resolution)
+                ):
+                    return Intent.GENERAL_RESPONSE
+                return intent
         except Exception as e:
             _log_llm_fallback("Intent classifier", e)
 

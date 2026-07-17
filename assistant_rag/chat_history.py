@@ -100,6 +100,8 @@ def last_qa_chat_history(state: LastQAState | None) -> list[dict[str, Any]]:
             "topic_id": state.linked_topic_id,
             "hop_id": state.linked_hop_id,
             "expected_response_type": _enum_value(state.expected_response_type),
+            "reminder_state": deepcopy(state.reminder_state),
+            "reminder_state_hash": state.reminder_state_hash,
         }
     ]
 
@@ -167,11 +169,13 @@ def supporting_question_context(
         clarification = hop.get("clarification_question")
         reminder_question = hop.get("reminder_supporting_question")
         expected_response_type = hop.get("expected_response_type")
+        reminder_state = hop.get("reminder_state")
         if not (
             questions
             or clarification
             or reminder_question
             or expected_response_type
+            or isinstance(reminder_state, Mapping)
         ):
             continue
         projected.append(
@@ -183,6 +187,12 @@ def supporting_question_context(
                 "clarification_question": clarification,
                 "reminder_supporting_question": reminder_question,
                 "expected_response_type": expected_response_type,
+                "reminder_state": (
+                    dict(reminder_state)
+                    if isinstance(reminder_state, Mapping)
+                    else None
+                ),
+                "reminder_state_hash": hop.get("reminder_state_hash"),
             }
         )
     return projected

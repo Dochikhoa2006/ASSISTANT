@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import logging
 
 from .database import AssistantRepository
+from .reminder_supporting import ReminderSupportingQuestionPlanner
 from .reminder_timing import ReminderTimingPlanner
 
 
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 class ReminderAutoscan:
     repository: AssistantRepository
     timing_planner: ReminderTimingPlanner | None = None
+    supporting_question_planner: ReminderSupportingQuestionPlanner | None = None
 
     def plan_pending_timing(
         self, *, limit: int = 100, now: datetime | None = None
@@ -72,10 +74,76 @@ class ReminderAutoscan:
             logger.info("Reminder timing autoscan: planned=%s needs_review=%s", planned, needs_review)
         return {"planned": planned, "needs_review": needs_review}
 
+    def plan_pending_supporting_questions(
+        self, *, limit: int = 100, now: datetime | None = None
+    ) -> dict[str, int]:
+        """Evaluate each pending reminder once without changing its timing."""
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        if self.supporting_question_planner is None:
+            return {"planned": 0, "needs_review": 0, "questions_created": 0}
+        now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        planned = 0
+        needs_review = 0
+        questions_created = 0
+        pending = self.repository.list_reminders_requiring_supporting_question(
+            limit=limit
+        )
+        for reminder in pending:
+            decision = self.supporting_question_planner.plan(
+                subject=reminder.subject,
+                reminder_summary=reminder.reminder_summary,
+                reminder_context=reminder.raw_reminder,
+                notification_time=reminder.notification_time,
+                event_time=reminder.event_time,
+                user_timezone=reminder.user_timezone,
+                recurrence_rule=reminder.recurrence_rule,
+                now=now_utc,
+            )
+            if decision.needs_review:
+                if self.repository.fail_reminder_supporting_question_plan(
+                    reminder_id=reminder.reminder_id,
+                    user_id=reminder.user_id,
+                    expected_version=reminder.version,
+                    reason=decision.reason,
+                ):
+                    needs_review += 1
+                continue
+            if self.repository.complete_reminder_supporting_question_plan(
+                reminder_id=reminder.reminder_id,
+                user_id=reminder.user_id,
+                expected_version=reminder.version,
+                question=decision.question,
+                confidence=decision.confidence,
+                reason=decision.reason,
+            ):
+                planned += 1
+                if decision.question:
+                    questions_created += 1
+        if planned or needs_review:
+            logger.info(
+                "Reminder supporting-question autoscan: planned=%s "
+                "questions_created=%s needs_review=%s",
+                planned,
+                questions_created,
+                needs_review,
+            )
+        return {
+            "planned": planned,
+            "needs_review": needs_review,
+            "questions_created": questions_created,
+        }
+
     def scan_due(self, *, now_value: str, limit: int = 100) -> list[str]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
         scan_now = _parse_scan_time(now_value)
         self.plan_pending_timing(limit=limit, now=scan_now)
-        return self.repository.scan_due_reminders(now_value=now_value, limit=limit)
+        self.plan_pending_supporting_questions(limit=limit, now=scan_now)
+        return self.repository.scan_due_reminders(
+            now_value=scan_now.isoformat(),
+            limit=limit,
+        )
 
     def catch_up_due(self, *, now_value: str, batch_size: int = 100) -> dict[str, int]:
         """Drain every pending plan and every due reminder in timestamp order.
@@ -87,20 +155,47 @@ class ReminderAutoscan:
         """
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
-        totals = {"planned": 0, "needs_review": 0, "notified": 0, "batches": 0}
+        totals = {
+            "planned": 0,
+            "needs_review": 0,
+            "supporting_planned": 0,
+            "supporting_needs_review": 0,
+            "supporting_questions_created": 0,
+            "notified": 0,
+            "batches": 0,
+        }
         scan_now = _parse_scan_time(now_value)
+        canonical_now_value = scan_now.isoformat()
         while True:
             timing = self.plan_pending_timing(limit=batch_size, now=scan_now)
-            notified = self.repository.scan_due_reminders(now_value=now_value, limit=batch_size)
+            supporting = self.plan_pending_supporting_questions(
+                limit=batch_size,
+                now=scan_now,
+            )
+            notified = self.repository.scan_due_reminders(
+                now_value=canonical_now_value,
+                limit=batch_size,
+            )
             totals["planned"] += timing["planned"]
             totals["needs_review"] += timing["needs_review"]
+            totals["supporting_planned"] += supporting["planned"]
+            totals["supporting_needs_review"] += supporting["needs_review"]
+            totals["supporting_questions_created"] += supporting[
+                "questions_created"
+            ]
             totals["notified"] += len(notified)
             totals["batches"] += 1
             # Each successful plan/review transition removes a row from the
             # pending set; each notification removes a due one-time row or
             # advances a recurring row. If none changed, another process owns
             # the remaining work or the backlog is clear.
-            if not timing["planned"] and not timing["needs_review"] and not notified:
+            if (
+                not timing["planned"]
+                and not timing["needs_review"]
+                and not supporting["planned"]
+                and not supporting["needs_review"]
+                and not notified
+            ):
                 break
         if totals["planned"] or totals["needs_review"] or totals["notified"]:
             logger.info("Reminder autoscan catch-up: %s", totals)

@@ -106,6 +106,7 @@ class OllamaSettings:
     temperature_knowledge_action_extraction: float = 0.0
 
     model_knowledge_action_validation: str = "microsoft/Phi-4-mini-instruct-onnx"
+    model_knowledge_action_validation_fallback: str | None = "qwen3.5:4b"
     timeout_knowledge_action_validation: float = 45.0
     num_ctx_knowledge_action_validation: int = 16384
     num_predict_knowledge_action_validation: int | None = 1024
@@ -113,6 +114,7 @@ class OllamaSettings:
     json_retry_count_knowledge_action_validation: int = 1
 
     model_knowledge_content_finalization: str = "microsoft/Phi-4-mini-instruct-onnx"
+    model_knowledge_content_finalization_fallback: str | None = "qwen3.5:4b"
     timeout_knowledge_content_finalization: float = 90.0
     num_ctx_knowledge_content_finalization: int = 16384
     num_predict_knowledge_content_finalization: int | None = 2048
@@ -128,6 +130,7 @@ class OllamaSettings:
     temperature_reminder_action_extraction: float = 0.0
 
     model_reminder_action_validation: str = "microsoft/Phi-4-mini-instruct-onnx"
+    model_reminder_action_validation_fallback: str | None = "qwen3.5:4b"
     timeout_reminder_action_validation: float = 45.0
     num_ctx_reminder_action_validation: int = 16384
     num_predict_reminder_action_validation: int | None = 2048
@@ -135,6 +138,7 @@ class OllamaSettings:
     json_retry_count_reminder_action_validation: int = 1
 
     model_reminder_content_finalization: str = "microsoft/Phi-4-mini-instruct-onnx"
+    model_reminder_content_finalization_fallback: str | None = "qwen3.5:4b"
     timeout_reminder_content_finalization: float = 90.0
     num_ctx_reminder_content_finalization: int = 16384
     num_predict_reminder_content_finalization: int | None = 2048
@@ -175,6 +179,7 @@ class OllamaSettings:
 
     # Task: WRITING
     model_writing: str = "microsoft/Phi-4-mini-instruct-onnx"
+    model_writing_fallback: str | None = "qwen3.5:4b"
     timeout_writing: float = 90.0
     num_ctx_writing: int = 3096
     num_predict_writing: int | None = 1024
@@ -190,6 +195,7 @@ class OllamaSettings:
 
     # Task: RETRIEVAL_VALIDATION
     model_retrieval_validation: str = "microsoft/Phi-4-mini-instruct-onnx"
+    model_retrieval_validation_fallback: str | None = "qwen3.5:4b"
     timeout_retrieval_validation: float = 35.0
     num_ctx_retrieval_validation: int = 4096
     num_predict_retrieval_validation: int | None = 256
@@ -681,12 +687,14 @@ class ProductionSettings:
                 num_predict_knowledge_action_extraction=_get_int("OLLAMA_KNOWLEDGE_ACTION_EXTRACTION_NUM_PREDICT", OllamaSettings.num_predict_knowledge_action_extraction) if os.getenv("OLLAMA_KNOWLEDGE_ACTION_EXTRACTION_NUM_PREDICT") else OllamaSettings.num_predict_knowledge_action_extraction,
                 temperature_knowledge_action_extraction=_get_float("OLLAMA_KNOWLEDGE_ACTION_EXTRACTION_TEMPERATURE", OllamaSettings.temperature_knowledge_action_extraction),
                 model_knowledge_action_validation=os.getenv("OLLAMA_KNOWLEDGE_ACTION_VALIDATION_MODEL", OllamaSettings.model_knowledge_action_validation),
+                model_knowledge_action_validation_fallback=os.getenv("OLLAMA_KNOWLEDGE_ACTION_VALIDATION_FALLBACK_MODEL", OllamaSettings.model_knowledge_action_validation_fallback) or None,
                 timeout_knowledge_action_validation=_get_float("OLLAMA_KNOWLEDGE_ACTION_VALIDATION_TIMEOUT", OllamaSettings.timeout_knowledge_action_validation),
                 num_ctx_knowledge_action_validation=_get_int("OLLAMA_KNOWLEDGE_ACTION_VALIDATION_NUM_CTX", OllamaSettings.num_ctx_knowledge_action_validation),
                 num_predict_knowledge_action_validation=_get_int("OLLAMA_KNOWLEDGE_ACTION_VALIDATION_NUM_PREDICT", OllamaSettings.num_predict_knowledge_action_validation) if os.getenv("OLLAMA_KNOWLEDGE_ACTION_VALIDATION_NUM_PREDICT") else OllamaSettings.num_predict_knowledge_action_validation,
                 temperature_knowledge_action_validation=_get_float("OLLAMA_KNOWLEDGE_ACTION_VALIDATION_TEMPERATURE", OllamaSettings.temperature_knowledge_action_validation),
                 json_retry_count_knowledge_action_validation=_get_int("KNOWLEDGE_LLM_VALIDATION_JSON_RETRY_COUNT", OllamaSettings.json_retry_count_knowledge_action_validation),
                 model_knowledge_content_finalization=os.getenv("OLLAMA_KNOWLEDGE_CONTENT_FINALIZATION_MODEL", OllamaSettings.model_knowledge_content_finalization),
+                model_knowledge_content_finalization_fallback=os.getenv("OLLAMA_KNOWLEDGE_CONTENT_FINALIZATION_FALLBACK_MODEL", OllamaSettings.model_knowledge_content_finalization_fallback) or None,
                 timeout_knowledge_content_finalization=_get_float("OLLAMA_KNOWLEDGE_CONTENT_FINALIZATION_TIMEOUT", OllamaSettings.timeout_knowledge_content_finalization),
                 num_ctx_knowledge_content_finalization=_get_int("OLLAMA_KNOWLEDGE_CONTENT_FINALIZATION_NUM_CTX", OllamaSettings.num_ctx_knowledge_content_finalization),
                 num_predict_knowledge_content_finalization=_get_int("OLLAMA_KNOWLEDGE_CONTENT_FINALIZATION_NUM_PREDICT", OllamaSettings.num_predict_knowledge_content_finalization) if os.getenv("OLLAMA_KNOWLEDGE_CONTENT_FINALIZATION_NUM_PREDICT") else OllamaSettings.num_predict_knowledge_content_finalization,
@@ -697,12 +705,14 @@ class ProductionSettings:
                 num_predict_reminder_action_extraction=_get_int("OLLAMA_REMINDER_ACTION_EXTRACTION_NUM_PREDICT", OllamaSettings.num_predict_reminder_action_extraction) if os.getenv("OLLAMA_REMINDER_ACTION_EXTRACTION_NUM_PREDICT") else OllamaSettings.num_predict_reminder_action_extraction,
                 temperature_reminder_action_extraction=_get_float("OLLAMA_REMINDER_ACTION_EXTRACTION_TEMPERATURE", OllamaSettings.temperature_reminder_action_extraction),
                 model_reminder_action_validation=os.getenv("OLLAMA_REMINDER_ACTION_VALIDATION_MODEL", OllamaSettings.model_reminder_action_validation),
+                model_reminder_action_validation_fallback=os.getenv("OLLAMA_REMINDER_ACTION_VALIDATION_FALLBACK_MODEL", OllamaSettings.model_reminder_action_validation_fallback) or None,
                 timeout_reminder_action_validation=_get_float("OLLAMA_REMINDER_ACTION_VALIDATION_TIMEOUT", OllamaSettings.timeout_reminder_action_validation),
                 num_ctx_reminder_action_validation=_get_int("OLLAMA_REMINDER_ACTION_VALIDATION_NUM_CTX", OllamaSettings.num_ctx_reminder_action_validation),
                 num_predict_reminder_action_validation=_get_int("OLLAMA_REMINDER_ACTION_VALIDATION_NUM_PREDICT", OllamaSettings.num_predict_reminder_action_validation) if os.getenv("OLLAMA_REMINDER_ACTION_VALIDATION_NUM_PREDICT") else OllamaSettings.num_predict_reminder_action_validation,
                 temperature_reminder_action_validation=_get_float("OLLAMA_REMINDER_ACTION_VALIDATION_TEMPERATURE", OllamaSettings.temperature_reminder_action_validation),
                 json_retry_count_reminder_action_validation=_get_int("REMINDER_LLM_VALIDATION_JSON_RETRY_COUNT", OllamaSettings.json_retry_count_reminder_action_validation),
                 model_reminder_content_finalization=os.getenv("OLLAMA_REMINDER_CONTENT_FINALIZATION_MODEL", OllamaSettings.model_reminder_content_finalization),
+                model_reminder_content_finalization_fallback=os.getenv("OLLAMA_REMINDER_CONTENT_FINALIZATION_FALLBACK_MODEL", OllamaSettings.model_reminder_content_finalization_fallback) or None,
                 timeout_reminder_content_finalization=_get_float("OLLAMA_REMINDER_CONTENT_FINALIZATION_TIMEOUT", OllamaSettings.timeout_reminder_content_finalization),
                 num_ctx_reminder_content_finalization=_get_int("OLLAMA_REMINDER_CONTENT_FINALIZATION_NUM_CTX", OllamaSettings.num_ctx_reminder_content_finalization),
                 num_predict_reminder_content_finalization=_get_int("OLLAMA_REMINDER_CONTENT_FINALIZATION_NUM_PREDICT", OllamaSettings.num_predict_reminder_content_finalization) if os.getenv("OLLAMA_REMINDER_CONTENT_FINALIZATION_NUM_PREDICT") else OllamaSettings.num_predict_reminder_content_finalization,
@@ -733,6 +743,7 @@ class ProductionSettings:
                 num_predict_answer=_get_int("OLLAMA_ANSWER_NUM_PREDICT", OllamaSettings.num_predict_answer) if os.getenv("OLLAMA_ANSWER_NUM_PREDICT") else OllamaSettings.num_predict_answer,
                 temperature_answer=_get_float("OLLAMA_ANSWER_TEMPERATURE", OllamaSettings.temperature_answer),
                 model_writing=os.getenv("OLLAMA_WRITING_MODEL", OllamaSettings.model_writing),
+                model_writing_fallback=os.getenv("OLLAMA_WRITING_FALLBACK_MODEL", OllamaSettings.model_writing_fallback) or None,
                 timeout_writing=_get_float("OLLAMA_WRITING_TIMEOUT", OllamaSettings.timeout_writing),
                 num_ctx_writing=_get_int("OLLAMA_WRITING_NUM_CTX", OllamaSettings.num_ctx_writing),
                 num_predict_writing=_get_int("OLLAMA_WRITING_NUM_PREDICT", OllamaSettings.num_predict_writing) if os.getenv("OLLAMA_WRITING_NUM_PREDICT") else OllamaSettings.num_predict_writing,
@@ -744,6 +755,7 @@ class ProductionSettings:
                 temperature_risky_action=_get_float("OLLAMA_RISKY_ACTION_TEMPERATURE", OllamaSettings.temperature_risky_action),
                 json_retry_count_risky_action=_get_int("OLLAMA_RISKY_ACTION_JSON_RETRY_COUNT", OllamaSettings.json_retry_count_risky_action),
                 model_retrieval_validation=os.getenv("OLLAMA_RETRIEVAL_VALIDATION_MODEL", OllamaSettings.model_retrieval_validation),
+                model_retrieval_validation_fallback=os.getenv("OLLAMA_RETRIEVAL_VALIDATION_FALLBACK_MODEL", OllamaSettings.model_retrieval_validation_fallback) or None,
                 timeout_retrieval_validation=_get_float("OLLAMA_RETRIEVAL_VALIDATION_TIMEOUT", OllamaSettings.timeout_retrieval_validation),
                 num_ctx_retrieval_validation=_get_int("OLLAMA_RETRIEVAL_VALIDATION_NUM_CTX", OllamaSettings.num_ctx_retrieval_validation),
                 num_predict_retrieval_validation=_get_int("OLLAMA_RETRIEVAL_VALIDATION_NUM_PREDICT", OllamaSettings.num_predict_retrieval_validation) if os.getenv("OLLAMA_RETRIEVAL_VALIDATION_NUM_PREDICT") else OllamaSettings.num_predict_retrieval_validation,

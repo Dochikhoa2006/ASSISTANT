@@ -279,7 +279,7 @@ def test_selected_state_branch_calls_extractor_before_considering_action_metadat
     expected_response_type = (
         ResponseType.SAFE_NOOP
         if branch_type is ReminderBranch
-        else ResponseType.CLARIFICATION
+        else ResponseType.ERROR
     )
     assert result.response_type is expected_response_type
     if branch_type is ReminderBranch:

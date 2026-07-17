@@ -895,8 +895,6 @@ KNOWLEDGE_ACTION_EXTRACTION_SCHEMA = {
         "original_text",
         "replacement_text",
         "confidence",
-        "missing_fields",
-        "reason_summary",
     ],
     "properties": {
         "action": {"enum": ["add", "delete", "modify"]},
@@ -904,8 +902,6 @@ KNOWLEDGE_ACTION_EXTRACTION_SCHEMA = {
         "original_text": {"type": "string"},
         "replacement_text": {"type": "string"},
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-        "missing_fields": {"type": "array", "items": {"type": "string"}},
-        "reason_summary": {"type": "string"},
     },
 }
 
@@ -914,21 +910,17 @@ KNOWLEDGE_RETRIEVAL_VALIDATION_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "required": [
-        "operation",
         "decision",
         "selected_candidate_keys",
         "confidence",
         "clarification_question",
-        "reason_summary",
         "candidate_assessments",
     ],
     "properties": {
-        "operation": {"enum": ["add", "delete", "modify"]},
         "decision": {"enum": ["PASS", "FAIL"]},
         "selected_candidate_keys": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "clarification_question": {"type": "string"},
-        "reason_summary": {"type": "string"},
         "candidate_assessments": {
             "type": "array",
             "items": {
@@ -936,20 +928,12 @@ KNOWLEDGE_RETRIEVAL_VALIDATION_SCHEMA = {
                 "additionalProperties": False,
                 "required": [
                     "candidate_key",
-                    "matches_target",
-                    "action_compatible",
                     "confidence",
-                    "matched_fields",
-                    "reason_summary",
                     "matched_text",
                 ],
                 "properties": {
                     "candidate_key": {"type": "string"},
-                    "matches_target": {"type": "boolean"},
-                    "action_compatible": {"type": "boolean"},
                     "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                    "matched_fields": {"type": "array", "items": {"type": "string"}},
-                    "reason_summary": {"type": "string"},
                     "matched_text": {"type": "string"},
                 },
             },
@@ -961,11 +945,10 @@ KNOWLEDGE_RETRIEVAL_VALIDATION_SCHEMA = {
 KNOWLEDGE_CONTENT_FINALIZATION_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["final_content", "confidence", "reason_summary"],
+    "required": ["final_content", "confidence"],
     "properties": {
         "final_content": {"type": "string"},
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-        "reason_summary": {"type": "string"},
     },
 }
 
@@ -1035,16 +1018,12 @@ REMINDER_ACTION_VALIDATION_SCHEMA = {
                 "additionalProperties": False,
                 "required": [
                     "candidate_key",
-                    "match_kind",
                     "confidence",
                     "evidence_field",
                     "matched_text",
                 ],
                 "properties": {
                     "candidate_key": {"type": "string"},
-                    "match_kind": {
-                        "enum": ["NONE", "TARGET", "EQUIVALENT"]
-                    },
                     "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                     "evidence_field": {
                         "enum": [
@@ -1173,10 +1152,10 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "Topical similarity alone does not qualify.",
             ),
             inputs=("rewritten_query", "last_qa_state", "platform reminder metadata when present"),
-            output_contract="Return strict JSON only with interaction_detected, interaction_type, question_source, matched_question, llm_suggested_skip_broad_retrieval, and confidence.",
+            output_contract="Return strict JSON only with interaction_type, question_source, matched_question, and confidence.",
             decision_rules=(
                 "Use this precedence: reminder_notification_reply, supporting_question_answer, normal_follow_up, then unrelated or ambiguous.",
-                "Required shapes (detected,type,source,matched,skip,confidence): supporting=(true,supporting_question_answer,question source,exact prior question,true,0.95); normal=(true,normal_follow_up,none,empty,true,0.95); unrelated/ambiguous=(false,selected type,none,empty,false,0.5).",
+                "For supporting_question_answer, identify the question source and copy the exact prior question into matched_question. For unrelated or ambiguous, use question_source=none and an empty matched_question.",
                 "A reminder reply needs reminder_id, notification_id, source_topic_id, and source_hop_id. Text such as 'done', 'yes', or 'thanks' without those IDs is not a reminder reply.",
                 "A supporting answer directly answers exactly one active question. Copy that question verbatim into matched_question. A short semantic value can answer it.",
                 "A normal follow-up explicitly references, refines, corrects, or requests detail about the previous answer. A new standalone request, even on a similar topic, is unrelated.",
@@ -1185,7 +1164,7 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "Never emit a shape that contradicts the selected interaction_type.",
             ),
             safety_rules=_safety_rules_for_stage("last_qa"),
-            error_handling=("If uncertain, set interaction_detected=false and interaction_type=ambiguous.",),
+            error_handling=("If uncertain, return interaction_type=ambiguous.",),
         ),
         "clarification_merge": PromptTemplate(
             name="clarification_merge",
@@ -1202,7 +1181,7 @@ def _default_templates() -> dict[str, PromptTemplate]:
             inputs=("original vague query", "assistant clarification question", "latest user answer"),
             output_contract=(
                 'Return strict JSON: {"answered_clarification": boolean, "merged_query": string, '
-                '"confidence": number, "missing_context": string[]}.'
+                '"confidence": number}.'
             ),
             decision_rules=(
                 "Merge only when the latest answer directly resolves the clarification question.",
@@ -1214,7 +1193,7 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "For reminder times or targets, keep ambiguity visible when the answer is incomplete.",
             ),
             safety_rules=_safety_rules_for_stage("clarification_merge"),
-            error_handling=("If uncertain, return answered_clarification=false with missing_context.",),
+            error_handling=("If uncertain, return answered_clarification=false.",),
         ),
         "intent_classifier": PromptTemplate(
             name="intent_classifier",
@@ -1225,12 +1204,11 @@ def _default_templates() -> dict[str, PromptTemplate]:
             ),
             inputs=("current query", "trusted recent context"),
             output_contract=(
-                'Return strict JSON only: {"intent":"knowledge_facts|reminder|general_response|clarification",'
-                '"operation_kind":"durable_knowledge|reminder_lifecycle|clarification_reply|none",'
+                'Return strict JSON only: {"operation_kind":"durable_knowledge|reminder_lifecycle|clarification_reply|none",'
                 '"confidence":number from 0.0 to 1.0}. Return no other fields.'
             ),
             decision_rules=(
-                "Choose operation_kind before intent; intent must agree with it. Map durable_knowledge to knowledge_facts, reminder_lifecycle to reminder, clarification_reply to clarification, and none to general_response.",
+                "Choose one operation_kind. Runtime code maps durable_knowledge to knowledge_facts, reminder_lifecycle to reminder, clarification_reply to clarification, and none to general_response.",
                 "durable_knowledge is mutation-only: choose it only for one explicit request to add, modify, or delete the user's stored facts, preferences, rules, notes, or project knowledge.",
                 "reminder_lifecycle is mutation-only: choose it only for one explicit request to add, modify, delete, turn on, or turn off a scheduled future notification.",
                 "Every request to search, find, list, show, inspect, look up, retrieve, recall, read, or answer a question about stored knowledge or reminders is informational none and belongs to general_response, even when it mentions an earlier add, modify, delete, enable, or disable action.",
@@ -1323,11 +1301,11 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "Determine the outer storage operation, not verbs found inside quoted or supplied fact text. A request to remember a rule that discusses deletion or change is still add; modify/delete apply only when the user asks to alter/remove already stored knowledge.",
                 "Every non-empty content field must be grounded verbatim after case and whitespace normalization. ADD text_content and MODIFY replacement_text must come from rewritten_query. DELETE text_content and MODIFY original_text may also resolve a clearly referenced target from canonical chat_history. Never source a new fact or replacement from history. Do not paraphrase or expand content.",
                 "For a normal turn, current-query action wording is authoritative. For confirmation_replay, the lifecycle-verified action context is authoritative. History may resolve a clearly referenced fact but may not supply an omitted mutation or replacement.",
-                "If an action-specific required content field is unavailable, keep it empty and list it in missing_fields.",
+                "If an action-specific required content field is unavailable, keep it empty and lower confidence; model 2 owns completeness.",
             ),
             safety_rules=_safety_rules_for_stage("knowledge_action_extraction"),
             error_handling=(
-                "If the request contains multiple actions, is ambiguous, or lacks required content, return low confidence and missing_fields.",
+                "If the request contains multiple actions, is ambiguous, or lacks required content, return the best grounded state with low confidence.",
             ),
         ),
         "reminder_action_extraction": PromptTemplate(
@@ -1505,7 +1483,8 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "MODIFY may PASS only when exactly one active candidate matches first_model_response.original_text and first_model_response.replacement_text is complete and compatible.",
                 "For an obvious factual impossibility in newly asserted ADD text_content or MODIFY replacement_text, such as arithmetic known to be false, return FAIL and ask a direct confirmation/correction question. Do not apply this rule to a DELETE target, a MODIFY original_text, subjective preferences, personal statements, plans, or uncertain real-world claims.",
                 "Only candidate keys supplied by the caller are permitted. PASS ADD selects none; PASS DELETE/MODIFY selects exactly one; FAIL always selects none.",
-                "For every candidate, matched_text must be the exact minimal verbatim excerpt from that candidate that supports matches_target, or an empty string when matches_target is false. Never paraphrase matched_text.",
+                "For every candidate match, matched_text must be the exact minimal verbatim excerpt from that candidate; use an empty string for a non-match. Never paraphrase matched_text. Runtime derives the match boolean from whether this grounded excerpt is present.",
+                "Return only decision, selected_candidate_keys, confidence, clarification_question, and candidate_assessments. Each assessment contains only candidate_key, confidence, and matched_text; runtime derives the match boolean, operation, action compatibility, matched field, and diagnostic summaries.",
                 "PASS is the final confirmation and immediately authorizes downstream database processing (after MODIFY finalization only). Never return PASS if another confirmation gate, user approval, disambiguation, correction, or scope choice would still be needed.",
                 "The isolated runtime payload deliberately contains exactly two inputs. Never assume or request any other context; use only first_model_response and knowledge_retrieval.",
             ),
@@ -1527,10 +1506,10 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "Do not invent facts or add commentary around final_content.",
             ),
             inputs=(
-                "first_model_response: the highest-priority exact structured action, text_content, original_text, replacement_text, confidence, missing_fields, and reason_summary emitted by model 1",
-                "operation and extracted_action_content: deterministic mirrors that must agree with first_model_response",
+                "first_model_response: the highest-priority exact structured action, text_content, original_text, replacement_text, and confidence emitted by model 1",
+                "operation and extracted_action_content as deterministic consistency mirrors of first_model_response",
                 "the one selected SQL candidate and exact validated matched_text",
-                "high-confidence PASS validation evidence",
+                "the compact high-confidence PASS decision and selected candidate key",
                 "rewritten query, canonical chat_history, supporting_question_context, metadata, and platform context as retained non-authoritative reference context",
             ),
             output_contract="Return strict JSON matching KNOWLEDGE_CONTENT_FINALIZATION_SCHEMA.",
@@ -1539,7 +1518,8 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "For MODIFY, edit the selected existing chunk by replacing only the validated occurrence corresponding to first_model_response.original_text with first_model_response.replacement_text; preserve every unrelated fact in that chunk.",
                 "When the rewritten query or chat history contains several actions, action-like phrases, or different content, ignore those alternatives. They must not change, expand, or compete with first_model_response.",
                 "Use query and chat_history only to understand an already extracted reference or preserve context. Never source an additional action, target, replacement, or new fact from them, metadata, platform context, or supporting_question_context.",
-                "operation and extracted_action_content must be treated only as consistency mirrors of first_model_response, while the selected candidate and PASS evidence constrain the exact replacement location and preservation of unrelated text.",
+                "operation and extracted_action_content are consistency mirrors only; if anything conflicts, first_model_response remains authoritative.",
+                "The selected candidate, exact matched_text, and compact PASS decision constrain the replacement location; they never override first_model_response.",
             ),
             safety_rules=_safety_rules_for_stage("knowledge_content_finalization"),
             error_handling=(
@@ -1568,7 +1548,7 @@ def _default_templates() -> dict[str, PromptTemplate]:
             decision_rules=(
                 "Use first_model_response.action as the fixed operation. Never reinterpret the operation from any reminder candidate.",
                 "Act as the sole semantic duplicate, target, ambiguity, temporal-coherence, recurrence-scope, and objective-impossibility validator for the reminder mutation. Deterministic code separately enforces schema shape, SQL ownership, status compatibility, confidence, selection cardinality, no-op equality, and evidence provenance.",
-                "For PASS, assess every supplied reminder_retrieval candidate exactly once. FAIL may stop after enough grounded evidence establishes why execution is unsafe. For ADD, match_kind is EQUIVALENT only when the candidate represents the same reminder rather than merely a related reminder. For every other action, match_kind is TARGET only when the candidate is the intended existing reminder. Otherwise use NONE.",
+                "For PASS, assess every supplied reminder_retrieval candidate exactly once. FAIL may stop after enough grounded evidence establishes why execution is unsafe. For ADD, provide evidence only when the candidate represents the same reminder rather than merely a related reminder. For every other action, provide evidence only when the candidate is the intended existing reminder. Otherwise leave evidence_field and matched_text empty. Runtime derives EQUIVALENT versus TARGET from the fixed model-1 action.",
                 "A short retrieval_text may match a detail inside a longer subject, summary, raw reminder, time, recurrence, supporting question, or supporting response. Compare identity across all supplied fields, including notification versus event time, recurrence, and supporting context.",
                 "Candidate scores are non-gating diagnostic evidence. Never reject a semantic match found in the complete SQL fields solely because a deterministic score is low.",
                 "Return PASS only when the exact requested reminder action is safe to execute immediately at or above minimum confidence. PASS requires clarification_question to be the empty string.",
@@ -1581,8 +1561,8 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "An impossible calendar value, contradictory event/notification semantics, unsafe recurrence, missing target, incomplete required replacement, or objectively impossible newly asserted value must return FAIL with a correction or confirmation question.",
                 "Treat a populated notification_time or event_time as coherent only when it is a UTC ISO-8601 instant with an explicit offset and is accompanied by user_timezone and original_time_text. Reject naive, non-UTC, missing-companion, or contradictory normalized time state.",
                 "selected_candidate_keys may contain only keys supplied in reminder_retrieval. PASS ADD selects none; PASS DELETE, MODIFY, TURN_ON, and TURN_OFF select exactly one. FAIL always selects none. Never allow a second strong semantic match, including an action-incompatible one, on PASS.",
-                "For each TARGET or EQUIVALENT assessment, evidence_field names exactly one supplied reminder field and matched_text is the exact minimal verbatim excerpt from that same field. For NONE, both evidence_field and matched_text are empty. Never paraphrase evidence.",
-                "Return only validation_result, selected_candidate_keys, confidence, clarification_question, and candidate_assessments. Never emit a decision token other than PASS or FAIL.",
+                "For each matching assessment, evidence_field names exactly one supplied reminder field and matched_text is the exact minimal verbatim excerpt from that same field. For a non-match, both values are empty. Never paraphrase evidence.",
+                "Return only validation_result, selected_candidate_keys, confidence, clarification_question, and candidate_assessments. Each assessment contains only candidate_key, confidence, evidence_field, and matched_text. Never emit a decision token other than PASS or FAIL.",
                 "PASS is final reminder mutation authorization and immediately permits SQL processing, after model-3 finalization for MODIFY only. Never return PASS if another user answer, correction, confirmation, disambiguation, or scope choice is needed.",
                 "The isolated runtime payload deliberately contains exactly two inputs. Never assume or request any other context; use only first_model_response and reminder_retrieval.",
             ),
@@ -1703,12 +1683,13 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "For clarification, ask one short, concrete question for the supplied missing field or ambiguity; do not ask for speculative preferences, architecture, scale, or unrelated context.",
                 "For clarification, generate a new question for the current rewritten_query; never reuse a precomputed clarification_question from request metadata.",
                 "For human_supporting, ask at most one optional next-step question after a useful answer exists.",
+                "For a human_supporting list contract, return an empty questions array when no question should be asked; every included item is a question to ask and therefore has no should_ask mirror.",
                 "Do not mix question types.",
                 "Use only the fields in the caller-provided data contract; never emit JSON-Schema keys such as type, properties, required, items, or $schema.",
-                "Return should_ask=false when the question would be redundant, speculative, unsafe, or low-value.",
+                "For human_supporting only, return should_ask=false when the question would be redundant, speculative, unsafe, or low-value. Clarification is called only after the branch has already decided one question is required.",
             ),
             safety_rules=_safety_rules_for_stage("question_generation"),
-            error_handling=("If task_type or context is insufficient, return should_ask=false.",),
+            error_handling=("For human_supporting uncertainty, return should_ask=false. For clarification uncertainty, return an empty question with low confidence.",),
         ),
         "content_composer_react": PromptTemplate(
             name="content_composer_react",
@@ -1845,6 +1826,8 @@ def _default_messages() -> dict[str, str]:
         "reminder_changed": "I completed the reminder {action} action.",
         "knowledge_no_op": "No changes were made to knowledge.",
         "knowledge_pipeline_unavailable": "I could not safely complete that knowledge change right now. Please try again.",
+        "clarification_generation_unavailable": "I could not reliably determine which detail was missing, so I paused this request instead of asking a generic question. Please restate the complete request when ready.",
+        "clarification_repeat_suppressed": "I still could not safely advance from the previous clarification, so I paused the request instead of asking the same question again. Include the target and desired result together in one message when ready.",
         "reminder_no_op": "No changes were made to reminders.",
         "reminder_not_confident": "I could not validate that reminder change with enough confidence, so nothing was changed.",
         "reminder_pipeline_unavailable": "I could not safely complete that reminder change right now. Please try again.",

@@ -121,6 +121,58 @@ def _execute_user_request(
     )
 
 
+def _execute_user_request_safely(
+    *,
+    pipeline: object,
+    repository: object,
+    request: ChatRequest,
+    before_pipeline: Callable[[ChatRequest], None] | None = None,
+) -> tuple[ChatRequestExecution | None, dict[str, object] | None]:
+    """Keep a terminal lifecycle failure from replacing the Streamlit session.
+
+    The production pipeline remains responsible for its own typed fallbacks.
+    This is only the outer UI boundary for an exception that escaped that
+    contract.  It deliberately returns a terminal statement instead of another
+    clarification question, so a backend outage cannot create a question loop.
+    """
+
+    try:
+        return (
+            _execute_user_request(
+                pipeline=pipeline,
+                repository=repository,
+                request=request,
+                before_pipeline=before_pipeline,
+            ),
+            None,
+        )
+    except RequestLifecycleConflict as exc:
+        logger.warning(
+            "streamlit request lifecycle conflict",
+            extra={"payload": {"user_id": request.user_id, "reason": str(exc)}},
+        )
+        text = (
+            "This request is already being processed or conflicts with an earlier "
+            "request, so it was not run again."
+        )
+    except Exception:
+        logger.exception(
+            "streamlit request execution failed",
+            extra={"payload": {"user_id": request.user_id}},
+        )
+        text = (
+            "I could not complete this request safely. The current conversation "
+            "is still available, and you can retry when the service is ready."
+        )
+    return None, {
+        "role": "assistant",
+        "content": text,
+        "artifacts": [],
+        "pending_confirmations": [],
+        "response_type": ResponseType.ERROR.value,
+    }
+
+
 def _chat_message_from_execution(execution: ChatRequestExecution) -> dict[str, object]:
     response = execution.response
     payload = execution.payload
@@ -445,18 +497,25 @@ def _render_reminder_notifications(
                     else:
                         # The hash lookup restores the source hop's user query,
                         # response, and supporting questions before normal routing.
-                        reply_last_qa = build_reminder_reply_last_qa(context)
+                        reply_last_qa = build_reminder_reply_last_qa(
+                            context,
+                            reminder_id=str(notification["reminder_id"]),
+                            notification_id=str(notification["notification_id"]),
+                        )
                         reply_fingerprint = sha256(
                             (
                                 f"{notification['notification_id']}\0{reply}"
                             ).encode("utf-8")
                         ).hexdigest()
-                        execution = _execute_user_request(
+                        execution, failure_message = _execute_user_request_safely(
                             pipeline=pipeline,
                             repository=repository,
                             request=ChatRequest(
                                 user_id=user_id,
                                 raw_query=reply,
+                                reminder_id=str(notification["reminder_id"]),
+                                notification_id=str(notification["notification_id"]),
+                                reply_text=reply,
                                 parent_hop_id=context.get("source_hop_id"),
                                 idempotency_key=(
                                     f"streamlit-reminder-reply:"
@@ -477,6 +536,17 @@ def _render_reminder_notifications(
                                 reply_last_qa,
                             ),
                         )
+                        if execution is None:
+                            assert failure_message is not None
+                            failure_message["request_query"] = reply
+                            st.session_state.chat_messages.extend([
+                                {"role": "user", "content": reply},
+                                failure_message,
+                            ])
+                            st.error(str(failure_message["content"]))
+                            # The notification remains unread and the stable
+                            # idempotency key makes a later retry safe.
+                            continue
                         response_message = _chat_message_from_execution(execution)
                         response_message["request_query"] = reply
                         st.session_state.chat_messages.extend([
@@ -504,6 +574,32 @@ def _render_reminder_notifications(
                             )
                         st.rerun()
             st.divider()
+
+
+def _render_reminder_notifications_safely(
+    st: object,
+    *,
+    repository: object,
+    pipeline: object,
+    user_id: str,
+) -> None:
+    """Keep a reminder-panel outage isolated from the main chat surface."""
+
+    try:
+        _render_reminder_notifications(
+            st,
+            repository=repository,
+            pipeline=pipeline,
+            user_id=user_id,
+        )
+    except Exception:
+        logger.exception(
+            "streamlit reminder panel failed",
+            extra={"payload": {"user_id": user_id}},
+        )
+        st.warning(
+            "Reminder notifications are temporarily unavailable. Chat remains available."
+        )
 
 
 def main() -> None:
@@ -542,17 +638,32 @@ def main() -> None:
             _catch_up_reminders(st)
             st.rerun()
         autoscan_summary = st.session_state.get("last_reminder_autoscan")
-        if autoscan_summary and any(autoscan_summary.get(key, 0) for key in ("planned", "needs_review", "notified")):
+        if autoscan_summary and any(
+            autoscan_summary.get(key, 0)
+            for key in (
+                "planned",
+                "needs_review",
+                "supporting_planned",
+                "supporting_needs_review",
+                "notified",
+            )
+        ):
             st.caption(
                 "Autoscan catch-up: "
                 f"{autoscan_summary.get('notified', 0)} notified, "
                 f"{autoscan_summary.get('planned', 0)} timed plans finalized, "
-                f"{autoscan_summary.get('needs_review', 0)} future timings need review."
+                f"{autoscan_summary.get('needs_review', 0)} future timings need review, "
+                f"{autoscan_summary.get('supporting_planned', 0)} supporting "
+                "decisions finalized, "
+                f"{autoscan_summary.get('supporting_questions_created', 0)} "
+                "supporting questions created, "
+                f"{autoscan_summary.get('supporting_needs_review', 0)} "
+                "supporting decisions need review."
             )
         if st.session_state.get("reminder_autoscan_error"):
             st.warning("Reminder catch-up is temporarily unavailable. Use refresh to retry; chat remains available.")
 
-        _render_reminder_notifications(
+        _render_reminder_notifications_safely(
             st,
             repository=st.session_state.repository,
             pipeline=st.session_state.pipeline,
@@ -653,35 +764,43 @@ def main() -> None:
             with st.spinner("Thinking…"):
                 # Streamlit uses the same production assembly and request
                 # lifecycle as interactive debug; tracing only observes it.
-                execution = _execute_user_request(
+                request = ChatRequest(
+                    user_id=user_id,
+                    raw_query=query,
+                    idempotency_key=(
+                        f"streamlit-chat:{st.session_state.chat_view_id}:"
+                        f"{uuid4().hex}"
+                    ),
+                    # Do not pass the UI-only chat_view_id or its summary.
+                    # Every visual chat deliberately shares the same
+                    # application-level user/conversation history.
+                    platform_context={
+                        "gmail_username": gmail_username,
+                        "gmail_app_password": gmail_app_password,
+                    },
+                )
+                execution, failure_message = _execute_user_request_safely(
                     pipeline=st.session_state.pipeline,
                     repository=st.session_state.repository,
-                    request=ChatRequest(
-                        user_id=user_id,
-                        raw_query=query,
-                        idempotency_key=(
-                            f"streamlit-chat:{st.session_state.chat_view_id}:"
-                            f"{uuid4().hex}"
-                        ),
-                        # Do not pass the UI-only chat_view_id or its summary.
-                        # Every visual chat deliberately shares the same
-                        # application-level user/conversation history.
-                        platform_context={
-                            "gmail_username": gmail_username,
-                            "gmail_app_password": gmail_app_password,
-                        },
-                    ),
+                    request=request,
                 )
+                if execution is None:
+                    assert failure_message is not None
+                    failure_message["request_query"] = query
+                    st.session_state.chat_messages.append(failure_message)
+                    st.error(str(failure_message["content"]))
+                    return
                 response = execution.response
-                if response is None:
-                    raise RuntimeError(
-                        "New Streamlit request unexpectedly resolved as an idempotent replay"
-                    )
             response_message = _chat_message_from_execution(execution)
             response_message["request_query"] = query
             st.session_state.chat_messages.append(response_message)
-            st.write(response.final_chat_text)
-            response_artifacts = list(response.platform_payload.get("artifacts") or [])
+            platform_payload = (
+                response.platform_payload
+                if response is not None
+                else dict(execution.payload.get("platform_payload") or {})
+            )
+            st.write(response_message["content"])
+            response_artifacts = list(response_message.get("artifacts") or [])
             _render_artifact_downloads(st, response_artifacts)
             _render_confirmation_controls(
                 st,
@@ -694,19 +813,32 @@ def main() -> None:
             )
             if show_pipeline_trace:
                 with st.expander("Production pipeline trace", expanded=False):
-                    st.json(trace_summary_asdict(response.trace_summary) or {})
+                    st.json(
+                        (trace_summary_asdict(response.trace_summary) or {})
+                        if response is not None
+                        else {}
+                    )
         logger.info(
             "streamlit_real_pipeline_request_completed",
             extra={"payload": {
-                "response_type": response.response_type.value,
-                "trace_stage_count": len(response.trace_summary.stages) if response.trace_summary else 0,
-                "conversation_hop_id": response.conversation_hop_id,
+                "response_type": response_message["response_type"],
+                "trace_stage_count": (
+                    len(response.trace_summary.stages)
+                    if response is not None and response.trace_summary
+                    else 0
+                ),
+                "conversation_hop_id": (
+                    response.conversation_hop_id
+                    if response is not None
+                    else execution.payload.get("conversation_hop_id")
+                ),
+                "replayed": execution.replayed,
             }},
         )
-        delivery = response.platform_payload.get("delivery", {})
+        delivery = platform_payload.get("delivery", {})
         if delivery.get("channel") not in (None, "none"):
             st.caption(f"Delivery: {delivery.get('channel')} — {delivery.get('status')}")
-            message = response.platform_payload.get("draft", {})
+            message = platform_payload.get("draft", {})
             if message:
                 with st.expander(
                     f"{str(delivery.get('channel')).title()} delivery details",

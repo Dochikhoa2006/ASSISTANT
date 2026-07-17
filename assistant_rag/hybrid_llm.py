@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import logging
 from typing import Any
-from .llm import LLMTask, OllamaLLMClient, uses_onnx_runtime
+from .llm import (
+    LLMTask,
+    OllamaLLMClient,
+    is_structured_fallback,
+    uses_onnx_runtime,
+)
 from .onnx_llm import ONNXLLMClient
 
 logger = logging.getLogger(__name__)
@@ -45,7 +50,7 @@ class HybridLLMClient:
                 fallback_for=fallback_for,
             )
             onnx_error = self.onnx_client.last_error_by_task.get(task)
-            if not onnx_error:
+            if not onnx_error and not is_structured_fallback(payload):
                 return payload
 
             fallback_model = self.ollama_client._fallback_model_for_task(task)
@@ -68,16 +73,44 @@ class HybridLLMClient:
             )
             # A successful fallback is a recovered condition, not an active
             # user-facing error. The original failure remains in debug logs.
-            if task not in self.ollama_client.last_error_by_task:
+            if (
+                task not in self.ollama_client.last_error_by_task
+                and not is_structured_fallback(fallback_payload)
+            ):
                 self.onnx_client.last_error_by_task.pop(task, None)
             return fallback_payload
-        return self.ollama_client.generate_json(
+        payload = self.ollama_client.generate_json(
             task=task,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             schema=schema,
             model_override=model_override,
             fallback_for=fallback_for,
+        )
+        primary_error = self.ollama_client.last_error_by_task.get(task)
+        if not primary_error and not is_structured_fallback(payload):
+            return payload
+
+        fallback_model = self.ollama_client._fallback_model_for_task(task)
+        if (
+            not fallback_model
+            or fallback_model == model_name
+            or uses_onnx_runtime(fallback_model)
+        ):
+            return payload
+        logger.debug(
+            "Ollama structured generation failed for task %s; retrying with configured fallback %s: %s",
+            task.value,
+            fallback_model,
+            primary_error or getattr(payload, "reason", "structured fallback"),
+        )
+        return self.ollama_client.generate_json(
+            task=task,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            schema=schema,
+            model_override=fallback_model,
+            fallback_for=model_name,
         )
 
     def chat(self, *, task: LLMTask, system_prompt: str, user_prompt: str) -> str:

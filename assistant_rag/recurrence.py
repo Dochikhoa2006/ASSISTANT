@@ -37,6 +37,8 @@ def normalize_recurrence_rule(raw_rule: str | None) -> RecurrenceRule | None:
         freq = parts.get("freq", "")
         if freq in {"daily", "weekly", "monthly"}:
             count = int(parts["count"]) if parts.get("count", "").isdigit() else None
+            if count is not None and count < 1:
+                raise ValueError("Recurrence COUNT must be a positive integer.")
             until = _parse_until(parts.get("until"))
             return RecurrenceRule(RecurrenceFrequency(freq), count=count, until=until)
     if lowered.startswith("rrule:"):
@@ -49,9 +51,17 @@ def calculate_next_fire_time(
     previous_fire_time: str | datetime,
     recurrence_rule: str,
     recurrence_timezone: str,
+    completed_occurrences: int = 1,
 ) -> str | None:
     rule = normalize_recurrence_rule(recurrence_rule)
     if rule is None:
+        return None
+    if completed_occurrences < 1:
+        raise ValueError("completed_occurrences must include the current fire.")
+    # RFC-style COUNT includes the initial occurrence. This helper runs after
+    # the current occurrence has fired, so reaching COUNT means the series is
+    # exhausted and must not receive another next_fire_time.
+    if rule.count is not None and completed_occurrences >= rule.count:
         return None
     zone = _zone(recurrence_timezone)
     previous_utc = _coerce_aware(previous_fire_time)

@@ -147,7 +147,7 @@ def test_poisoned_multi_action_metadata_cannot_bypass_failed_extraction(
     expected_response_type = (
         ResponseType.SAFE_NOOP
         if branch_type is ReminderBranch
-        else ResponseType.CLARIFICATION
+        else ResponseType.ERROR
     )
     assert result.response_type is expected_response_type
     if branch_type is ReminderBranch:

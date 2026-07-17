@@ -69,6 +69,10 @@ from .generation import QuestionGenerationStrategy
 from .branch_orchestration import ValidatedActionBuilder
 from .settings import MutationPartialExecutionPolicy
 from .chat_history import canonical_chat_history_scope, current_chat_history
+from .reminder_reply import (
+    reminder_reply_hop_entities,
+    verified_reminder_state,
+)
 
 
 def _mutation_clarification_message_key(domain: str, missing_fields: list[str]) -> str:
@@ -88,6 +92,47 @@ def _mutation_clarification_message_key(domain: str, missing_fields: list[str]) 
         return "knowledge_missing_action"
 
     raise ValueError(f"Clarification messages are not supported for domain: {domain}")
+
+
+def _normalized_question_text(value: str) -> str:
+    return " ".join(value.casefold().split()).strip(" \t\r\n.,;:!?")
+
+
+def _suppress_repeated_clarification(
+    result: BranchResult,
+    context: PipelineContext,
+    prompt_registry: PromptRegistry,
+) -> BranchResult:
+    """Stop an identical consecutive clarification from becoming a loop."""
+
+    current = result.clarification_question
+    previous_state = getattr(context, "previous_last_qa_state", None)
+    previous = (
+        previous_state.clarification_question
+        if previous_state is not None
+        and previous_state.response_type is ResponseType.CLARIFICATION
+        else None
+    )
+    if (
+        result.response_type is not ResponseType.CLARIFICATION
+        or current is None
+        or previous is None
+        or not _normalized_question_text(current.text)
+        or _normalized_question_text(current.text)
+        != _normalized_question_text(previous.text)
+    ):
+        return result
+
+    return replace(
+        result,
+        response_type=ResponseType.SAFE_NOOP,
+        normal_response_text=prompt_registry.message(
+            "clarification_repeat_suppressed"
+        ),
+        clarification_question=None,
+        fallback_or_error_message=None,
+        warnings=list(result.warnings) + ["clarification_repeat_suppressed"],
+    )
 
 
 def _validated_knowledge_from_dict(payload: dict[str, Any]) -> ValidatedKnowledgeAction:
@@ -149,6 +194,13 @@ class ClarificationBranch:
         question: GeneratedQuestion | None = None
         if self.clarification_strategy:
             question = self.clarification_strategy.generate(context)
+            if not question:
+                return BranchResult(
+                    response_type=ResponseType.ERROR,
+                    fallback_or_error_message=self.prompt_registry.message(
+                        "clarification_generation_unavailable"
+                    ),
+                )
         if not question:
             fallback = self.config.question_generation.fallback_policy if self.config else "fallback_message"
             question = GeneratedQuestion(
@@ -517,15 +569,27 @@ class KnowledgeFactsBranch:
         # semantic completeness and confidence. Only a failed response guard
         # with no usable action state clarifies before retrieval validation.
         if detection.requires_clarification and not actions:
-            return self._generate_clarification(
-                context,
-                getattr(detection, "missing_fields", []),
-                "Missing fields for knowledge action.",
+            if detection.failure_kind == "semantic_gap":
+                return self._generate_clarification(
+                    context,
+                    getattr(detection, "missing_fields", []),
+                    "The extracted knowledge content was not grounded in the current request.",
+                )
+            return BranchResult(
+                response_type=ResponseType.ERROR,
+                fallback_or_error_message=self.prompt_registry.message(
+                    "knowledge_pipeline_unavailable"
+                ),
             )
         context.request.metadata.update(detection.metadata)
                     
         if not actions:
-            return self._generate_clarification(context, [], "No valid knowledge action detected.")
+            return BranchResult(
+                response_type=ResponseType.ERROR,
+                fallback_or_error_message=self.prompt_registry.message(
+                    "knowledge_pipeline_unavailable"
+                ),
+            )
         if len(actions) != 1:
             # Guard 1 hands exactly one canonical model-1 action state to the
             # validation pipeline. Never truncate a malformed multi-action
@@ -922,9 +986,16 @@ class BranchRouter:
         if context.intent not in self.branches:
             raise ValueError(f"No branch registered for intent: {context.intent}")
         branch = self.branches[context.intent]
-        if context.intent is Intent.CLARIFICATION:
-            return branch.execute(context, repository)
-
+        reminder_reply_state: dict[str, Any] | None = None
+        if (
+            context.last_qa_trace.get("interaction_type")
+            == "reminder_notification_reply"
+            and context.last_qa_state is not None
+        ):
+            reminder_reply_state = verified_reminder_state(
+                context.last_qa_state.reminder_state,
+                context.last_qa_state.reminder_state_hash,
+            )
         try:
             result = branch.execute(context, repository)
         except Exception:
@@ -936,6 +1007,14 @@ class BranchRouter:
                     "bundler_empty"
                 ),
             )
+
+        result = _suppress_repeated_clarification(
+            result,
+            context,
+            getattr(branch, "prompt_registry", DEFAULT_PROMPT_REGISTRY),
+        )
+        if context.intent is Intent.CLARIFICATION and reminder_reply_state is None:
+            return result
 
         # Successful mutation/general transactions normally create their hop
         # atomically. Verify that identity and ensure its durable outbox job
@@ -949,6 +1028,16 @@ class BranchRouter:
                 if indexed_hop.user_id != context.request.user_id:
                     raise ValueError("Conversation hop belongs to another user")
                 with repository.transaction() as cursor:
+                    if reminder_reply_state is not None:
+                        repository.merge_conversation_hop_entities(
+                            cursor,
+                            user_id=context.request.user_id,
+                            hop_id=result.linked_hop_id,
+                            entities=reminder_reply_hop_entities(
+                                reminder_reply_state,
+                                reply_hop_id=result.linked_hop_id,
+                            ),
+                        )
                     ensured_hop_job_id = repository.insert_outbox_job(
                         cursor,
                         entity_type=OutboxEntityType.CONVERSATION_HOP,
@@ -1020,6 +1109,7 @@ class BranchRouter:
             )
 
         default_titles = {
+            Intent.CLARIFICATION: "General Conversation",
             Intent.GENERAL_RESPONSE: getattr(
                 getattr(branch, "general_purpose_config", None),
                 "general_response_default_topic_title",
@@ -1048,7 +1138,12 @@ class BranchRouter:
                 "branch_outcome": {
                     "intent": context.intent.value,
                     "response_type": result.response_type.value,
-                }
+                },
+                **(
+                    reminder_reply_hop_entities(reminder_reply_state)
+                    if reminder_reply_state is not None
+                    else {}
+                ),
             },
         )
         if not audit.committed or not audit.audit_hop_id:
