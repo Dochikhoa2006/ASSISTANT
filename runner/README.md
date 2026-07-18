@@ -43,22 +43,25 @@ To run the Streamlit web interface:
 
 Normal runtime uses these central defaults from `assistant_rag/settings.py`:
 
-* Last-QA latest-context relationship resolution: `qwen3.5:9b`, with `qwen3.5:4b` recovery
-* Query rewrite, intent classification, action extraction, clarification, supporting-question generation, and sub-branch detection: `qwen3.5:4b`
-* Final answers, long-form writing, mutation validation/finalization, retrieval validation, and action planning: `microsoft/Phi-4-mini-instruct-onnx`, with configured Ollama recovery models where required
+* Fast structured work uses `qwen3.5:4b`: query rewrite, intent classification, action extraction, clarification, supporting-question generation, merge, risk checks, and sub-branch/composer detection.
+* Strong semantic and generative work uses `qwen3.5:9b`: Last-QA, final answers, long-form writing, mutation validation/finalization, retrieval validation, and action planning. These routes recover through `qwen3.5:4b` where supported.
+* Production validates every primary, fallback, and call-time override against this two-model pool. The hybrid Ollama/ONNX architecture remains available, but no ONNX LLM is routed or loaded by default. Before consolidation, these strong routes used `microsoft/Phi-4-mini-instruct-onnx`, which created a third resident LLM allocation.
 * Embeddings: `BAAI/bge-m3`
+* Cross-encoder reranking: `BAAI/bge-reranker-v2-m3` (the embedding and reranker are retrieval models, not generative LLMs)
 
 Runtime policy defaults:
 
 * Deterministic routing/extraction temperatures: `0.0`
 * Final answer temperature: `0.22`
 * Long-form writing temperature: `0.38`
-* Timeouts: tiny routing `12s`, short JSON `15-18s`, extraction `30s`, validation/planning `35s`, answer `75s`, writing `90s`
-* Context windows: routing `1024-2048`, extraction/merge `3072`, validation/planning `4096`, answer/writing `8192`
-* Retrieval: BM25 `24`, Chroma `24`, RRF `40`, reranker top-k `16`, reranker min score `0.30`, final context `6`
-* Confidence floors: retrieval `0.30`, knowledge context `0.38`, conversation context `0.42`
+* Ollama idle retention: `5m`; override with `OLLAMA_KEEP_ALIVE` when a deployment deliberately trades RAM for fewer cold starts.
+* Timeouts: routing `12-30s`, extraction `24s`, validation/planning `35-45s`, answer `75s`, finalization/writing `90s`
+* Context windows: compact routing `768-2048`, extraction `1536-8192`, candidate validation `4096-12288`, answer/writing `4096`
+* Output caps (`num_predict`): compact routing `64-256`, validation `128-1024`, answer/writing `1024`, lossless knowledge content `2048`
+* Retrieval: BM25 `20`, Chroma `20`, RRF constant `40`, RRF candidates `15`, reranker min score `0.30`, final context `5`
+* Confidence floors: reranker `0.30`, conversation retrieval `0.50`
 * Last-QA: minimum `0.80`, clarification merge `0.84`, broad-retrieval skip `0.90`
-* Actions: action minimum `0.76`, risky action threshold `0.90`, risky ops `delete,modify,turn_off`
+* Actions: action minimum `0.76`, risky action threshold `0.90`, risky ops `delete,turn_off`
 * Reminder context: minimum confidence `0.58`
 * Reminder resolver: candidates `12`, target score `0.78`, ambiguity margin `0.08`, fuzzy threshold `0.82`, LLM validation enabled
 * Knowledge chunks: size `560`, overlap `80`, minimum `80`, maximum `800`

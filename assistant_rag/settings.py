@@ -5,7 +5,7 @@ All operational values live here instead of being embedded in business logic.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum
 import os
 
@@ -20,6 +20,14 @@ from .retrieval_policy import (
     RETRIEVAL_PIPELINE_POLICY,
     RetrievalPipelinePolicy,
 )
+
+
+# Production intentionally uses one fast structured model and one stronger
+# reasoning/generation model.  Keeping these identifiers centralized prevents
+# task defaults from silently growing the resident generative-model set.
+FAST_LLM_MODEL = "qwen3.5:4b"
+CAPABLE_LLM_MODEL = "qwen3.5:9b"
+MAX_CONFIGURED_LLM_MODELS = 2
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -60,22 +68,24 @@ class DatabaseSettings:
 class OllamaSettings:
     base_url: str = "http://localhost:11434"
     structured_retry_count: int = 1
-    keep_alive: int | str = "30m"
+    # Five minutes keeps both models hot during an active conversation without
+    # retaining their weights for half an hour after the assistant becomes idle.
+    keep_alive: int | str = "5m"
     disable_thinking: bool = True
     # Standalone ONNX clients remain lazy. The production pipeline performs its
     # configured startup warm-up before accepting the first user query.
     preload_onnx_models: bool = False
 
     # Task: QUERY_REWRITE
-    model_query_rewrite: str = "qwen3.5:4b"
+    model_query_rewrite: str = FAST_LLM_MODEL
     timeout_query_rewrite: float = 12.0
     num_ctx_query_rewrite: int = 1024
     num_predict_query_rewrite: int | None = 128
     temperature_query_rewrite: float = 0.0
 
     # Task: LAST_QA
-    model_last_qa: str = "qwen3.5:9b"
-    model_last_qa_fallback: str | None = "qwen3.5:4b"
+    model_last_qa: str = CAPABLE_LLM_MODEL
+    model_last_qa_fallback: str | None = FAST_LLM_MODEL
     timeout_last_qa: float = 30.0
     num_ctx_last_qa: int = 2048
     num_predict_last_qa: int | None = 128
@@ -83,15 +93,15 @@ class OllamaSettings:
     json_retry_count_last_qa: int = 0
 
     # Task: INTENT
-    model_intent: str = "qwen3.5:4b"
-    model_intent_fallback: str | None = "qwen3.5:4b"
+    model_intent: str = FAST_LLM_MODEL
+    model_intent_fallback: str | None = FAST_LLM_MODEL
     timeout_intent: float = 20.0
     num_ctx_intent: int = 1536
-    num_predict_intent: int | None = 48
+    num_predict_intent: int | None = 64
     temperature_intent: float = 0.0
 
     # Task: ACTION_EXTRACTION
-    model_action_extraction: str = "qwen3.5:4b"
+    model_action_extraction: str = FAST_LLM_MODEL
     timeout_action_extraction: float = 24.0
     num_ctx_action_extraction: int = 1536
     num_predict_action_extraction: int | None = 160
@@ -100,54 +110,54 @@ class OllamaSettings:
     # Knowledge-only three-stage mutation pipeline. These dedicated tasks keep
     # larger lossless context and strict output capacity from changing reminder
     # validation, generic extraction, or Microsoft file planners.
-    model_knowledge_action_extraction: str = "qwen3.5:4b"
+    model_knowledge_action_extraction: str = FAST_LLM_MODEL
     timeout_knowledge_action_extraction: float = 24.0
     num_ctx_knowledge_action_extraction: int = 8192
     num_predict_knowledge_action_extraction: int | None = 2048
     temperature_knowledge_action_extraction: float = 0.0
 
-    model_knowledge_action_validation: str = "microsoft/Phi-4-mini-instruct-onnx"
-    model_knowledge_action_validation_fallback: str | None = "qwen3.5:4b"
+    model_knowledge_action_validation: str = CAPABLE_LLM_MODEL
+    model_knowledge_action_validation_fallback: str | None = FAST_LLM_MODEL
     timeout_knowledge_action_validation: float = 45.0
-    num_ctx_knowledge_action_validation: int = 16384
+    num_ctx_knowledge_action_validation: int = 8192
     num_predict_knowledge_action_validation: int | None = 1024
     temperature_knowledge_action_validation: float = 0.0
     json_retry_count_knowledge_action_validation: int = 1
 
-    model_knowledge_content_finalization: str = "microsoft/Phi-4-mini-instruct-onnx"
-    model_knowledge_content_finalization_fallback: str | None = "qwen3.5:4b"
+    model_knowledge_content_finalization: str = CAPABLE_LLM_MODEL
+    model_knowledge_content_finalization_fallback: str | None = FAST_LLM_MODEL
     timeout_knowledge_content_finalization: float = 90.0
-    num_ctx_knowledge_content_finalization: int = 16384
+    num_ctx_knowledge_content_finalization: int = 12288
     num_predict_knowledge_content_finalization: int | None = 2048
     temperature_knowledge_content_finalization: float = 0.0
 
-    # Reminder mutation pipeline; the third model is reserved for MODIFY only.
+    # Reminder mutation pipeline; the third LLM stage is reserved for MODIFY only.
     # Dedicated task settings keep its larger structured reminder payloads
     # isolated from generic extraction, knowledge mutation, and file generation.
-    model_reminder_action_extraction: str = "qwen3.5:4b"
+    model_reminder_action_extraction: str = FAST_LLM_MODEL
     timeout_reminder_action_extraction: float = 24.0
     num_ctx_reminder_action_extraction: int = 8192
     num_predict_reminder_action_extraction: int | None = 2048
     temperature_reminder_action_extraction: float = 0.0
 
-    model_reminder_action_validation: str = "microsoft/Phi-4-mini-instruct-onnx"
-    model_reminder_action_validation_fallback: str | None = "qwen3.5:4b"
+    model_reminder_action_validation: str = CAPABLE_LLM_MODEL
+    model_reminder_action_validation_fallback: str | None = FAST_LLM_MODEL
     timeout_reminder_action_validation: float = 45.0
-    num_ctx_reminder_action_validation: int = 16384
-    num_predict_reminder_action_validation: int | None = 2048
+    num_ctx_reminder_action_validation: int = 12288
+    num_predict_reminder_action_validation: int | None = 1024
     temperature_reminder_action_validation: float = 0.0
     json_retry_count_reminder_action_validation: int = 1
 
-    model_reminder_content_finalization: str = "microsoft/Phi-4-mini-instruct-onnx"
-    model_reminder_content_finalization_fallback: str | None = "qwen3.5:4b"
+    model_reminder_content_finalization: str = CAPABLE_LLM_MODEL
+    model_reminder_content_finalization_fallback: str | None = FAST_LLM_MODEL
     timeout_reminder_content_finalization: float = 90.0
-    num_ctx_reminder_content_finalization: int = 16384
-    num_predict_reminder_content_finalization: int | None = 2048
+    num_ctx_reminder_content_finalization: int = 4096
+    num_predict_reminder_content_finalization: int | None = 128
     temperature_reminder_content_finalization: float = 0.0
 
     # Task: GENERATE_CLARIFICATION
-    model_generate_clarification: str = "qwen3.5:4b"
-    model_generate_clarification_fallback: str | None = "qwen3.5:4b"
+    model_generate_clarification: str = FAST_LLM_MODEL
+    model_generate_clarification_fallback: str | None = FAST_LLM_MODEL
     timeout_generate_clarification: float = 15.0
     num_ctx_generate_clarification: int = 1536
     num_predict_generate_clarification: int | None = 160
@@ -155,7 +165,7 @@ class OllamaSettings:
     json_retry_count_generate_clarification: int = 1
 
     # Task: GENERATE_HUMAN_SUPPORTING
-    model_generate_human_supporting: str = "qwen3.5:4b"
+    model_generate_human_supporting: str = FAST_LLM_MODEL
     timeout_generate_human_supporting: float = 15.0
     num_ctx_generate_human_supporting: int = 2048
     num_predict_generate_human_supporting: int | None = 160
@@ -163,7 +173,7 @@ class OllamaSettings:
     json_retry_count_generate_human_supporting: int = 1
 
     # Task: CLARIFICATION_MERGE
-    model_clarification_merge: str = "qwen3.5:4b"
+    model_clarification_merge: str = FAST_LLM_MODEL
     timeout_clarification_merge: float = 24.0
     num_ctx_clarification_merge: int = 1536
     num_predict_clarification_merge: int | None = 256
@@ -171,23 +181,23 @@ class OllamaSettings:
     json_retry_count_clarification_merge: int = 1
 
     # Task: ANSWER
-    model_answer: str = "microsoft/Phi-4-mini-instruct-onnx"
-    model_answer_fallback: str | None = "qwen3.5:4b"
+    model_answer: str = CAPABLE_LLM_MODEL
+    model_answer_fallback: str | None = FAST_LLM_MODEL
     timeout_answer: float = 75.0
     num_ctx_answer: int = 4096
     num_predict_answer: int | None = 1024
     temperature_answer: float = 0.22
 
     # Task: WRITING
-    model_writing: str = "microsoft/Phi-4-mini-instruct-onnx"
-    model_writing_fallback: str | None = "qwen3.5:4b"
+    model_writing: str = CAPABLE_LLM_MODEL
+    model_writing_fallback: str | None = FAST_LLM_MODEL
     timeout_writing: float = 90.0
-    num_ctx_writing: int = 3096
+    num_ctx_writing: int = 4096
     num_predict_writing: int | None = 1024
     temperature_writing: float = 0.38
 
     # Task: RISKY_ACTION
-    model_risky_action: str = "qwen3.5:4b"
+    model_risky_action: str = FAST_LLM_MODEL
     timeout_risky_action: float = 35.0
     num_ctx_risky_action: int = 1024
     num_predict_risky_action: int | None = 192
@@ -195,31 +205,32 @@ class OllamaSettings:
     json_retry_count_risky_action: int = 1
 
     # Task: RETRIEVAL_VALIDATION
-    model_retrieval_validation: str = "microsoft/Phi-4-mini-instruct-onnx"
-    model_retrieval_validation_fallback: str | None = "qwen3.5:4b"
+    model_retrieval_validation: str = CAPABLE_LLM_MODEL
+    model_retrieval_validation_fallback: str | None = FAST_LLM_MODEL
     timeout_retrieval_validation: float = 35.0
     num_ctx_retrieval_validation: int = 4096
-    num_predict_retrieval_validation: int | None = 256
+    num_predict_retrieval_validation: int | None = 512
     temperature_retrieval_validation: float = 0.0
 
     # Task: GENERAL_SUB_BRANCH_DETECTION
-    model_general_sub_branch_detection: str = "qwen3.5:4b"
+    model_general_sub_branch_detection: str = FAST_LLM_MODEL
     timeout_general_sub_branch_detection: float = 30.0
     num_ctx_general_sub_branch_detection: int = 1024
     num_predict_general_sub_branch_detection: int | None = 96
     temperature_general_sub_branch_detection: float = 0.0
 
     # Task: CONTENT_COMPOSER_REACT
-    model_content_composer_react: str = "qwen3.5:4b"
+    model_content_composer_react: str = FAST_LLM_MODEL
     timeout_content_composer_react: float = 35.0
     num_ctx_content_composer_react: int = 768
     num_predict_content_composer_react: int | None = 160
     temperature_content_composer_react: float = 0.0
 
     # Task: ACTION_PLANNING
-    model_action_planning: str = "microsoft/Phi-4-mini-instruct-onnx"
+    model_action_planning: str = CAPABLE_LLM_MODEL
+    model_action_planning_fallback: str | None = FAST_LLM_MODEL
     timeout_action_planning: float = 35.0
-    num_ctx_action_planning: int = 3096
+    num_ctx_action_planning: int = 2048
     num_predict_action_planning: int | None = 256
     temperature_action_planning: float = 0.0
 
@@ -639,6 +650,47 @@ class ProductionSettings:
     context_filter: ContextFilterSettings = field(default_factory=ContextFilterSettings)
     general_purpose: GeneralPurposeSettings = field(default_factory=GeneralPurposeSettings)
 
+    def __post_init__(self) -> None:
+        """Keep every production LLM route inside one warmed two-model pool."""
+
+        configured_models: list[str] = []
+        for field_info in fields(self.ollama):
+            if not field_info.name.startswith("model_"):
+                continue
+            model = str(getattr(self.ollama, field_info.name) or "").strip()
+            if model and model not in configured_models:
+                configured_models.append(model)
+
+        if len(configured_models) > MAX_CONFIGURED_LLM_MODELS:
+            raise ValueError(
+                "Production may configure at most two generative LLM models; "
+                f"resolved {configured_models}. Reuse the fast/capable model pool "
+                "for every primary and fallback route."
+            )
+
+        model_overrides = {
+            "KNOWLEDGE_LLM_VALIDATION_MODEL": (
+                self.retrieval_validation.knowledge_llm_validation_model
+            ),
+            "REMINDER_LLM_VALIDATION_MODEL": (
+                self.retrieval_validation.reminder_llm_validation_model
+            ),
+            "REMINDER_LLM_RERANK_MODEL": (
+                self.reminder_resolver.reminder_llm_rerank_model
+            ),
+        }
+        unwarmed_overrides = {
+            name: str(model).strip()
+            for name, model in model_overrides.items()
+            if model and str(model).strip() not in configured_models
+        }
+        if unwarmed_overrides:
+            raise ValueError(
+                "Per-call LLM model overrides must reuse the configured two-model "
+                f"warmup pool {configured_models}; invalid overrides: "
+                f"{unwarmed_overrides}."
+            )
+
     @classmethod
     def from_env(cls) -> "ProductionSettings":
         return cls(
@@ -776,6 +828,10 @@ class ProductionSettings:
                 num_predict_content_composer_react=_get_int("OLLAMA_CONTENT_COMPOSER_REACT_NUM_PREDICT", OllamaSettings.num_predict_content_composer_react) if os.getenv("OLLAMA_CONTENT_COMPOSER_REACT_NUM_PREDICT") else OllamaSettings.num_predict_content_composer_react,
                 temperature_content_composer_react=_get_float("OLLAMA_CONTENT_COMPOSER_REACT_TEMPERATURE", OllamaSettings.temperature_content_composer_react),
                 model_action_planning=os.getenv("OLLAMA_ACTION_PLANNING_MODEL", OllamaSettings.model_action_planning),
+                model_action_planning_fallback=os.getenv(
+                    "OLLAMA_ACTION_PLANNING_FALLBACK_MODEL",
+                    OllamaSettings.model_action_planning_fallback,
+                ) or None,
                 timeout_action_planning=_get_float("OLLAMA_ACTION_PLANNING_TIMEOUT", OllamaSettings.timeout_action_planning),
                 num_ctx_action_planning=_get_int("OLLAMA_ACTION_PLANNING_NUM_CTX", OllamaSettings.num_ctx_action_planning),
                 num_predict_action_planning=_get_int("OLLAMA_ACTION_PLANNING_NUM_PREDICT", OllamaSettings.num_predict_action_planning) if os.getenv("OLLAMA_ACTION_PLANNING_NUM_PREDICT") else OllamaSettings.num_predict_action_planning,

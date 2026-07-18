@@ -14,7 +14,7 @@ from assistant_rag.llm import (
     normalize_structured_output,
     structured_fallback_payload,
 )
-from assistant_rag.settings import OllamaSettings
+from assistant_rag.settings import CAPABLE_LLM_MODEL, FAST_LLM_MODEL, OllamaSettings
 from assistant_rag.observability import start_trace
 
 
@@ -242,20 +242,23 @@ def test_hybrid_recovers_onnx_finalization_through_configured_ollama_model() -> 
     assert LLMTask.KNOWLEDGE_CONTENT_FINALIZATION not in onnx.last_error_by_task
 
 
-def test_every_onnx_mutation_stage_has_cross_engine_recovery() -> None:
+def test_every_capable_task_has_fast_cross_model_recovery() -> None:
     settings = OllamaSettings()
     for task in (
+        LLMTask.LAST_QA,
         LLMTask.KNOWLEDGE_ACTION_VALIDATION,
         LLMTask.KNOWLEDGE_CONTENT_FINALIZATION,
         LLMTask.REMINDER_ACTION_VALIDATION,
         LLMTask.REMINDER_CONTENT_FINALIZATION,
+        LLMTask.ANSWER,
+        LLMTask.WRITING,
         LLMTask.RETRIEVAL_VALIDATION,
+        LLMTask.ACTION_PLANNING,
     ):
         primary = getattr(settings, f"model_{task.value}")
         fallback = getattr(settings, f"model_{task.value}_fallback")
-        assert "onnx" in primary.casefold()
-        assert fallback
-        assert "onnx" not in fallback.casefold()
+        assert primary == CAPABLE_LLM_MODEL
+        assert fallback == FAST_LLM_MODEL
 
 
 class _FailingChatOnnx:

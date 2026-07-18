@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from datetime import datetime, timedelta, timezone
 from getpass import getpass
 import imaplib
@@ -101,7 +101,11 @@ from assistant_rag.request_lifecycle import (
     RequestLifecycleConflict,
 )
 from assistant_rag.retrieval_validation import KnowledgeRetrievalValidationStrategy
-from assistant_rag.settings import ProductionSettings
+from assistant_rag.settings import (
+    CAPABLE_LLM_MODEL,
+    FAST_LLM_MODEL,
+    ProductionSettings,
+)
 
 
 DEBUG_USER = "debug-user"
@@ -3175,26 +3179,26 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
     default_settings = ProductionSettings()
     router = OllamaModelRouter(default_settings.ollama)
     expected_models = {
-        LLMTask.QUERY_REWRITE: "qwen3.5:4b",
-        LLMTask.LAST_QA: "qwen3.5:9b",
-        LLMTask.INTENT: "qwen3.5:4b",
-        LLMTask.ACTION_EXTRACTION: "qwen3.5:4b",
-        LLMTask.KNOWLEDGE_ACTION_EXTRACTION: "qwen3.5:4b",
-        LLMTask.KNOWLEDGE_ACTION_VALIDATION: "microsoft/Phi-4-mini-instruct-onnx",
-        LLMTask.KNOWLEDGE_CONTENT_FINALIZATION: "microsoft/Phi-4-mini-instruct-onnx",
-        LLMTask.REMINDER_ACTION_EXTRACTION: "qwen3.5:4b",
-        LLMTask.REMINDER_ACTION_VALIDATION: "microsoft/Phi-4-mini-instruct-onnx",
-        LLMTask.REMINDER_CONTENT_FINALIZATION: "microsoft/Phi-4-mini-instruct-onnx",
-        LLMTask.GENERATE_CLARIFICATION: "qwen3.5:4b",
-        LLMTask.GENERATE_HUMAN_SUPPORTING: "qwen3.5:4b",
-        LLMTask.CLARIFICATION_MERGE: "qwen3.5:4b",
-        LLMTask.ANSWER: "microsoft/Phi-4-mini-instruct-onnx",
-        LLMTask.WRITING: "microsoft/Phi-4-mini-instruct-onnx",
-        LLMTask.RISKY_ACTION: "qwen3.5:4b",
-        LLMTask.RETRIEVAL_VALIDATION: "microsoft/Phi-4-mini-instruct-onnx",
-        LLMTask.GENERAL_SUB_BRANCH_DETECTION: "qwen3.5:4b",
-        LLMTask.CONTENT_COMPOSER_REACT: "qwen3.5:4b",
-        LLMTask.ACTION_PLANNING: "microsoft/Phi-4-mini-instruct-onnx",
+        LLMTask.QUERY_REWRITE: FAST_LLM_MODEL,
+        LLMTask.LAST_QA: CAPABLE_LLM_MODEL,
+        LLMTask.INTENT: FAST_LLM_MODEL,
+        LLMTask.ACTION_EXTRACTION: FAST_LLM_MODEL,
+        LLMTask.KNOWLEDGE_ACTION_EXTRACTION: FAST_LLM_MODEL,
+        LLMTask.KNOWLEDGE_ACTION_VALIDATION: CAPABLE_LLM_MODEL,
+        LLMTask.KNOWLEDGE_CONTENT_FINALIZATION: CAPABLE_LLM_MODEL,
+        LLMTask.REMINDER_ACTION_EXTRACTION: FAST_LLM_MODEL,
+        LLMTask.REMINDER_ACTION_VALIDATION: CAPABLE_LLM_MODEL,
+        LLMTask.REMINDER_CONTENT_FINALIZATION: CAPABLE_LLM_MODEL,
+        LLMTask.GENERATE_CLARIFICATION: FAST_LLM_MODEL,
+        LLMTask.GENERATE_HUMAN_SUPPORTING: FAST_LLM_MODEL,
+        LLMTask.CLARIFICATION_MERGE: FAST_LLM_MODEL,
+        LLMTask.ANSWER: CAPABLE_LLM_MODEL,
+        LLMTask.WRITING: CAPABLE_LLM_MODEL,
+        LLMTask.RISKY_ACTION: FAST_LLM_MODEL,
+        LLMTask.RETRIEVAL_VALIDATION: CAPABLE_LLM_MODEL,
+        LLMTask.GENERAL_SUB_BRANCH_DETECTION: FAST_LLM_MODEL,
+        LLMTask.CONTENT_COMPOSER_REACT: FAST_LLM_MODEL,
+        LLMTask.ACTION_PLANNING: CAPABLE_LLM_MODEL,
     }
     actual_models = {task: router.model_for_task(task) for task in expected_models}
     mismatches = {
@@ -3204,7 +3208,21 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
     }
     if mismatches:
         raise AssertionError(f"model routing mismatches: {mismatches}")
-    if default_settings.ollama.model_last_qa_fallback != "qwen3.5:4b":
+    configured_models = {
+        str(getattr(default_settings.ollama, field_info.name))
+        for field_info in fields(default_settings.ollama)
+        if field_info.name.startswith("model_")
+        and getattr(default_settings.ollama, field_info.name)
+    }
+    if configured_models != {FAST_LLM_MODEL, CAPABLE_LLM_MODEL}:
+        raise AssertionError(
+            f"production must resolve exactly the two-model pool: {configured_models}"
+        )
+    if any(uses_onnx_runtime(model) for model in actual_models.values()):
+        raise AssertionError("default production routes must not retain ONNX LLM weights")
+    if default_settings.ollama.keep_alive != "5m":
+        raise AssertionError("idle Ollama weights should expire after five minutes")
+    if default_settings.ollama.model_last_qa_fallback != FAST_LLM_MODEL:
         raise AssertionError("Last-QA needs a local cross-model recovery route")
     if default_settings.ollama.json_retry_count_last_qa != 0:
         raise AssertionError(
@@ -3303,33 +3321,38 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         raise AssertionError(f"embedding model mismatch: {default_settings.embeddings.model_name}")
     if router.decision_for_task(LLMTask.ANSWER).num_ctx != default_settings.ollama.num_ctx_answer:
         raise AssertionError("answer task should use writing context window")
-    knowledge_capacity = {
+    task_capacity = {
+        LLMTask.QUERY_REWRITE: (1024, 128),
+        LLMTask.LAST_QA: (2048, 128),
+        LLMTask.INTENT: (1536, 64),
+        LLMTask.ACTION_EXTRACTION: (1536, 160),
         LLMTask.KNOWLEDGE_ACTION_EXTRACTION: (8192, 2048),
-        LLMTask.KNOWLEDGE_ACTION_VALIDATION: (16384, 1024),
-        LLMTask.KNOWLEDGE_CONTENT_FINALIZATION: (16384, 2048),
-    }
-    for task, expected in knowledge_capacity.items():
-        decision = router.decision_for_task(task)
-        if (decision.num_ctx, decision.num_predict) != expected:
-            raise AssertionError(
-                f"{task.value} capacity mismatch: "
-                f"{(decision.num_ctx, decision.num_predict)}"
-            )
-    reminder_capacity = {
+        LLMTask.KNOWLEDGE_ACTION_VALIDATION: (8192, 1024),
+        LLMTask.KNOWLEDGE_CONTENT_FINALIZATION: (12288, 2048),
         LLMTask.REMINDER_ACTION_EXTRACTION: (8192, 2048),
-        LLMTask.REMINDER_ACTION_VALIDATION: (16384, 2048),
-        LLMTask.REMINDER_CONTENT_FINALIZATION: (16384, 2048),
+        LLMTask.REMINDER_ACTION_VALIDATION: (12288, 1024),
+        LLMTask.REMINDER_CONTENT_FINALIZATION: (4096, 128),
+        LLMTask.GENERATE_CLARIFICATION: (1536, 160),
+        LLMTask.GENERATE_HUMAN_SUPPORTING: (2048, 160),
+        LLMTask.CLARIFICATION_MERGE: (1536, 256),
+        LLMTask.ANSWER: (4096, 1024),
+        LLMTask.WRITING: (4096, 1024),
+        LLMTask.RISKY_ACTION: (1024, 192),
+        LLMTask.RETRIEVAL_VALIDATION: (4096, 512),
+        LLMTask.GENERAL_SUB_BRANCH_DETECTION: (1024, 96),
+        LLMTask.CONTENT_COMPOSER_REACT: (768, 160),
+        LLMTask.ACTION_PLANNING: (2048, 256),
     }
-    for task, expected in reminder_capacity.items():
+    for task, expected in task_capacity.items():
         decision = router.decision_for_task(task)
         if (decision.num_ctx, decision.num_predict) != expected:
             raise AssertionError(
                 f"{task.value} capacity mismatch: "
                 f"{(decision.num_ctx, decision.num_predict)}"
             )
-    if default_settings.ollama.model_intent != "qwen3.5:4b":
+    if default_settings.ollama.model_intent != FAST_LLM_MODEL:
         raise AssertionError("intent must use the validated semantic routing model")
-    if default_settings.ollama.model_intent_fallback != "qwen3.5:4b":
+    if default_settings.ollama.model_intent_fallback != FAST_LLM_MODEL:
         raise AssertionError("intent must have a non-ONNX recovery model")
     if default_settings.ollama.preload_onnx_models:
         raise AssertionError("ONNX model preloading must remain opt-in")
@@ -3668,11 +3691,13 @@ def scenario_debug_hybrid_llm_compatibility(settings: ProductionSettings) -> Sce
         "engine: hybrid_ollama_onnx",
         "base_url: http://localhost:11434",
         "onnx_cache_dir: .onnx_models",
-        "answer=microsoft/Phi-4-mini-instruct-onnx",
+        "onnx_loaded_models: []",
+        "onnx_routes: []",
+        "answer=qwen3.5:9b",
         "last_qa=qwen3.5:9b",
         "query_rewrite=qwen3.5:4b",
         "synthetic ONNX compatibility error",
-        '"model": "microsoft/Phi-4-mini-instruct-onnx"',
+        '"model": "qwen3.5:9b"',
     )
     missing = [fragment for fragment in required_fragments if fragment not in text]
     if missing:
@@ -4750,7 +4775,7 @@ def run_llm_smoke_test(settings: ProductionSettings) -> int:
         response = llm.chat(
             task=LLMTask.ANSWER,
             system_prompt="You are a concise compatibility smoke test.",
-            user_prompt="Reply with the exact words: Phi ONNX smoke test passed.",
+            user_prompt="Reply with the exact words: Qwen two-model smoke test passed.",
         )
     except Exception as exc:
         print_current_debug_trace()
