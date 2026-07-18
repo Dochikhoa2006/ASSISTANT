@@ -209,13 +209,19 @@ def _without_raw_user_queries(value: Any) -> Any:
 def _compact_value(value: Any, *, max_string: int = 1500, max_items: int = 12, depth: int = 0, max_depth: int = 4) -> Any:
     """Bound runtime context size while preserving useful structure."""
     value = _redact(value)
+    if isinstance(value, str):
+        if len(value) > max_string:
+            head_size = max(1, max_string // 2)
+            tail_size = max(1, max_string - head_size)
+            return (
+                value[:head_size]
+                + "...<truncated-middle>..."
+                + value[-tail_size:]
+            )
+        return value
     if depth >= max_depth:
         if isinstance(value, (dict, list, tuple)):
             return "<truncated>"
-        return value
-    if isinstance(value, str):
-        if len(value) > max_string:
-            return value[:max_string] + "...<truncated>"
         return value
     if isinstance(value, dict):
         items = list(value.items())
@@ -302,6 +308,7 @@ FAST_PLATFORM_KEYS = (
 
 FAST_EXTRA_KEYS = (
     "active_supporting_questions",
+    "latest_exchange",
     "active_outbound_state",
     "last_qa_state",
     "last_qa_resolution",
@@ -514,8 +521,8 @@ def _task_guidance(name: str) -> tuple[str, ...]:
             "Preserve language, constraints, times, quotes, code, filenames, IDs, and action.",
         ),
         "last_qa": (
-            "Select one active supporting-question index only for a direct answer.",
-            "Use -1 unless one exact state-bound question is answered.",
+            "Classify only the relationship to the immediately preceding exchange.",
+            "Evaluate authoritative active supporting questions first; bind one index only for a direct answer, otherwise use -1.",
         ),
         "outbound_follow_up": (
             "Classify only the latest message's relationship to the active outbound envelope.",
@@ -663,9 +670,9 @@ def _intent_routing_safety_rules() -> tuple[str, ...]:
 
 def _last_qa_safety_rules() -> tuple[str, ...]:
     return (
-        "This is a conservative temporary-context gate, not an answer, intent, or execution stage.",
-        "Skip broad retrieval only when the declared relationship has the exact required evidence in Last-QA state or trusted reminder metadata.",
-        "Do not infer a relationship from topical similarity, a short acknowledgement, or an omitted target.",
+        "This is a calibrated latest-context relationship gate, not an answer, intent, retrieval, or execution stage.",
+        "Choose latest context only when the current message depends on or directly reacts to the immediately preceding exchange and that exchange is sufficient to interpret it.",
+        "A clear acknowledgement may continue the latest exchange; topical similarity, an independent request, an older-context reference, or uncertainty does not.",
         "Return strict JSON only.",
     )
 
@@ -1174,22 +1181,31 @@ def _default_templates() -> dict[str, PromptTemplate]:
         ),
         "last_qa": PromptTemplate(
             name="last_qa",
-            role="Decide whether the current message answers exactly one active optional supporting question.",
+            role="Decide whether the current message directly continues the immediately preceding exchange, answers one active supporting question, or requires broader conversation retrieval.",
             non_responsibilities=(
                 "Do not answer, route final intent, retrieve, mutate, or invent links.",
-                "Do not classify normal follow-ups, reminder replies, or clarification answers; code resolves those paths separately.",
-                "Topical similarity alone does not qualify.",
+                "Do not classify source-verified reminder-notification replies, clarification answers, or outbound-message actions; code resolves those paths separately.",
+                "Do not choose latest context merely because the topic or vocabulary is similar.",
             ),
-            inputs=("rewritten_query", "indexed active_supporting_questions"),
-            output_contract="Return strict JSON only with matched_question_index and confidence. Use index=-1 when no question is answered.",
+            inputs=("rewritten_query", "latest_exchange", "indexed active_supporting_questions"),
+            output_contract="Return strict JSON only with relationship and confidence. When active_supporting_questions is nonempty, also return matched_question_index. Relationship is unrelated_or_uncertain, normal_follow_up, or, only when active questions exist, supporting_question_answer.",
             decision_rules=(
-                "Choose an index only when the latest message directly supplies the answer requested by that one question.",
-                "A short semantic value can answer a question even without repeating its words.",
-                "Example: for 'Which format?' followed by 'PDF', choose that question's index; for 'Which environment?' followed by 'Explain PDF files', use -1.",
-                "If more than one question could match, or the message is a new request, follow-up, acknowledgement, partial answer, or merely topically similar, use -1.",
+                "Active human- or reminder-sourced supporting questions are authoritative parts of the immediately preceding turn; they may have been displayed separately and need not appear verbatim in previous_assistant_response.",
+                "Evaluate every indexed active supporting question before considering normal_follow_up or unrelated_or_uncertain.",
+                "Use supporting_question_answer only when the latest message directly supplies the answer requested by exactly one indexed question, and return that index.",
+                "A short value counts as a direct answer when its semantic type fits exactly one question's expected_response_type, even without repeating the question's words.",
+                "Pair rewritten_query with each active question as a candidate question-answer exchange; a coherent unique pair is supporting_question_answer even when rewritten_query is only a bare label, date, number, selection, confirmation, or preference.",
+                "When exactly one active question is answered and latest-exchange continuity is also plausible, supporting_question_answer takes precedence.",
+                "Use normal_follow_up when the latest message asks to expand, revise, explain, compare, continue, or react to the immediately preceding exchange and that one exchange is sufficient context.",
+                "An unresolved pronoun, deictic expression, or elliptical reference with exactly one plausible referent in the previous assistant response is normal_follow_up.",
+                "A question about the cause, rationale, detail, implication, or correction of a statement in the previous assistant response is normal_follow_up.",
+                "A clear acknowledgement or correction of the immediately preceding response is normal_follow_up even when short.",
+                "Use unrelated_or_uncertain for a standalone new request, a reference requiring older history, topical similarity without dependency, multiple plausible referents, or uncertainty.",
+                "When matched_question_index is present, use -1 for any relationship other than supporting_question_answer.",
+                "Reserve confidence of 0.90 or higher for a clear relationship; lower it whenever the message is independently understandable or context ownership is ambiguous.",
             ),
             safety_rules=_safety_rules_for_stage("last_qa"),
-            error_handling=("If uncertain, return matched_question_index=-1.",),
+            error_handling=("If uncertain, return relationship=unrelated_or_uncertain, low confidence, and matched_question_index=-1 only when that field is requested.",),
         ),
         "outbound_follow_up": PromptTemplate(
             name="outbound_follow_up",

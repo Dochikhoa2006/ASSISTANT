@@ -1382,6 +1382,33 @@ class SQLiteRepository(AssistantRepository):
             )
         return hydrated
 
+    def is_active_conversation_link(
+        self,
+        *,
+        user_id: str,
+        topic_id: str,
+        hop_id: str,
+    ) -> bool:
+        """Validate a cached Last-QA link as the user's active latest SQL hop."""
+
+        row = self.connection.execute(
+            """
+            SELECT 1
+            FROM conversation_hops h
+            JOIN conversation_topics t
+              ON t.topic_id = h.topic_id
+             AND t.user_id = h.user_id
+            WHERE h.user_id = ?
+              AND h.topic_id = ?
+              AND h.hop_id = ?
+              AND t.status = 'active'
+              AND t.last_hop_id = h.hop_id
+            LIMIT 1
+            """,
+            (user_id, topic_id, hop_id),
+        ).fetchone()
+        return row is not None
+
     def list_all_outbox_entities(self) -> list[tuple[str, str]]:
         cursor = self.connection.cursor()
         results = []

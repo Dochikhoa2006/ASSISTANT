@@ -359,6 +359,18 @@ class AssistantRepository(ABC):
     def hydrate_conversation_retrieval_results(self, *, user_id: str, results: list[RetrievalResult]) -> list[RetrievalResult]:
         pass
 
+    def is_active_conversation_link(
+        self,
+        *,
+        user_id: str,
+        topic_id: str,
+        hop_id: str,
+    ) -> bool:
+        """Conservatively reject cached links unless a repository validates them."""
+
+        del user_id, topic_id, hop_id
+        return False
+
     @abstractmethod
     def list_all_outbox_entities(self) -> list[tuple[str, str]]:
         pass

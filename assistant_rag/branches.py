@@ -568,7 +568,10 @@ class GeneralResponseBranch:
         )
 
     def _detect_answer_mode(self, context: PipelineContext, approved_context: Any) -> AnswerMode:
-        if context.last_qa_state and getattr(context.last_qa_state, "supporting_questions", []):
+        if (
+            (context.last_qa_trace or {}).get("interaction_type")
+            == "supporting_question_answer"
+        ):
             return AnswerMode.SUPPORT_QUESTION_ANSWER
         if not approved_context.approved_conversation_history and not context.last_qa_state:
             return AnswerMode.NEW_CONVERSATION

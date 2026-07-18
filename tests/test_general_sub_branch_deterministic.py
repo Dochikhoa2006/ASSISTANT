@@ -88,6 +88,9 @@ def _context(
     last_qa_state: LastQAState | None = None,
     approved_context: ApprovedConversationContext | None = None,
     resolution_confidence: float = 1.0,
+    interaction_type: str = "supporting_question_answer",
+    question_source: str = "human_supporting_question",
+    matched_question: str = "Which environment?",
 ) -> PipelineContext:
     return PipelineContext(
         request=ChatRequest(user_id="test-user", raw_query="Continue Project Atlas"),
@@ -95,7 +98,15 @@ def _context(
         last_qa_state=last_qa_state,
         conversation_results=[],
         intent=Intent.GENERAL_RESPONSE,
-        last_qa_trace={"resolution_confidence": resolution_confidence},
+        last_qa_trace={
+            "resolution_confidence": resolution_confidence,
+            "interaction_type": interaction_type,
+            "path": "latest_context_interaction",
+            "skip_broad_retrieval": True,
+            "is_authoritative_state": True,
+            "question_source": question_source,
+            "matched_question": matched_question,
+        },
         approved_conversation_context=approved_context,
     )
 
@@ -201,6 +212,74 @@ def test_support_question_rule_has_precedence_and_uses_linked_last_qa_ids() -> N
     assert decision.confidence == 1.0
     assert decision.reason_summary == "Deterministic rule fired: SUPPORT_QUESTION_ANSWER."
     _assert_unchanged_defaults(decision)
+
+
+def test_normal_follow_up_with_pending_supporting_question_stays_conversation_follow_up() -> None:
+    decision = _detector().detect(
+        _context(
+            last_qa_state=_last_qa(),
+            approved_context=_approved_context(),
+            interaction_type="normal_follow_up",
+        ),
+        GeneralPurposeConfig(),
+    )
+
+    assert decision.sub_branch is GeneralSubBranch.CONVERSATION_FOLLOW_UP
+    assert decision.persistence_mode is PersistenceMode.APPEND_TO_EXISTING_TOPIC
+    assert decision.selected_topic_id == "topic-linked"
+    assert decision.selected_hop_id == "hop-linked"
+
+
+def test_reminder_supporting_answer_uses_exact_supporting_sub_branch() -> None:
+    state = _last_qa(supporting_questions=False)
+    state.reminder_supporting_question = GeneratedQuestion(
+        text="Which preparation is complete?",
+        source=QuestionSource.REMINDER_SUPPORTING_QUESTION,
+        purpose="reminder_followup",
+        confidence=1.0,
+        expected_response_type=ExpectedResponseType.REMINDER_FOLLOWUP_ANSWER,
+    )
+
+    decision = _detector().detect(
+        _context(
+            last_qa_state=state,
+            approved_context=_approved_context(),
+            interaction_type="supporting_question_answer",
+            question_source="reminder_supporting_question",
+            matched_question="Which preparation is complete?",
+        ),
+        GeneralPurposeConfig(),
+    )
+
+    assert decision.sub_branch is GeneralSubBranch.SUPPORT_QUESTION_ANSWER
+    assert decision.persistence_mode is PersistenceMode.APPEND_TO_EXISTING_TOPIC
+    assert decision.selected_topic_id == "topic-linked"
+    assert decision.selected_hop_id == "hop-linked"
+
+
+@pytest.mark.parametrize(
+    ("question_source", "matched_question"),
+    (
+        ("human_supporting_question", "A forged question"),
+        ("reminder_supporting_question", "Which environment?"),
+        ("none", "Which environment?"),
+    ),
+)
+def test_supporting_sub_branch_rejects_forged_question_identity(
+    question_source: str,
+    matched_question: str,
+) -> None:
+    decision = _detector().detect(
+        _context(
+            last_qa_state=_last_qa(),
+            approved_context=_approved_context(),
+            question_source=question_source,
+            matched_question=matched_question,
+        ),
+        GeneralPurposeConfig(),
+    )
+
+    assert decision.sub_branch is GeneralSubBranch.CONVERSATION_FOLLOW_UP
 
 
 @pytest.mark.parametrize("missing_requirement", ("last_qa", "supporting_questions", "approved_context", "hop_candidates"))

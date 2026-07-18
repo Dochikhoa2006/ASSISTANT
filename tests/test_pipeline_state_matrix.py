@@ -33,7 +33,11 @@ from assistant_rag.contracts import (
     ResponseType,
     RetrievalResult,
 )
-from assistant_rag.llm import OllamaIntentClassifier
+from assistant_rag.llm import (
+    LLMTask,
+    OllamaIntentClassifier,
+    StructuredFallbackPayload,
+)
 from assistant_rag.generation import LLMGeneralHITLStrategy
 from assistant_rag.pipeline import AssistantPipeline
 from assistant_rag.platform import PlatformSelector
@@ -65,6 +69,8 @@ def _resolution(*, state: LastQAState | None, skip: bool) -> LastQAResolution:
         skip_broad_retrieval=skip,
         interaction_type=(LastQAInteractionType.NORMAL_FOLLOW_UP if skip else None),
         question_source=QuestionSource.NONE,
+        linked_topic_id=(state.linked_topic_id if skip and state else None),
+        linked_hop_id=(state.linked_hop_id if skip and state else None),
         is_authoritative_state=skip,
     )
 
@@ -145,9 +151,20 @@ class _ContextFilter:
 
 
 class _Repository:
-    def __init__(self, hydrated: list[RetrievalResult]) -> None:
+    def __init__(
+        self,
+        hydrated: list[RetrievalResult],
+        *,
+        active_link_valid: bool = True,
+    ) -> None:
         self.hydrated = hydrated
+        self.active_link_valid = active_link_valid
         self.hydration_calls: list[dict[str, Any]] = []
+        self.link_validation_calls: list[dict[str, Any]] = []
+
+    def is_active_conversation_link(self, **kwargs: Any) -> bool:
+        self.link_validation_calls.append(kwargs)
+        return self.active_link_valid
 
     def hydrate_conversation_retrieval_results(
         self, **kwargs: Any
@@ -164,10 +181,14 @@ def _pipeline_probe(
     raw_results: list[RetrievalResult],
     hydrated_results: list[RetrievalResult],
     approved_context: ApprovedConversationContext | None,
+    active_link_valid: bool = True,
 ) -> tuple[AssistantPipeline, _Retriever, _ContextFilter, _Repository]:
     retriever = _Retriever(raw_results)
     context_filter = _ContextFilter(approved_context)
-    repository = _Repository(hydrated_results)
+    repository = _Repository(
+        hydrated_results,
+        active_link_valid=active_link_valid,
+    )
     pipeline = AssistantPipeline(
         config=SimpleNamespace(
             context_filter=SimpleNamespace(
@@ -248,6 +269,47 @@ def test_pipeline_retrieval_gate_exhaustive_boolean_matrix(
     assert len(repository.hydration_calls) == int(expected_to_run)
     assert len(context_filter.calls) == int(expected_to_run)
     assert current_chat_history() == []
+
+
+def test_pipeline_rejects_stale_last_qa_link_before_skipping_broad_retrieval() -> None:
+    state = _last_qa_state()
+    pipeline, retriever, _context_filter, repository = _pipeline_probe(
+        resolution=_resolution(state=state, skip=True),
+        after_last_qa_enabled=True,
+        before_intent_enabled=True,
+        raw_results=[],
+        hydrated_results=[],
+        approved_context=None,
+        active_link_valid=False,
+    )
+    observed: dict[str, Any] = {}
+
+    def stop_after_history_selection(self: AssistantPipeline, **kwargs: Any) -> str:
+        observed.update(kwargs)
+        return "probe-complete"
+
+    pipeline._handle_with_chat_history = MethodType(
+        stop_after_history_selection,
+        pipeline,
+    )
+    output = pipeline.handle(
+        ChatRequest(user_id="user-1", raw_query="Continue"),
+        repository,
+    )
+
+    assert output == "probe-complete"
+    assert repository.link_validation_calls == [
+        {
+            "user_id": "user-1",
+            "topic_id": "topic-atlas",
+            "hop_id": "hop-atlas",
+        }
+    ]
+    assert len(retriever.calls) == 1
+    assert observed["conversation_retrieval"] is True
+    assert observed["resolution"].path is LastQAPath.BROAD_RETRIEVAL_REQUIRED
+    assert observed["resolution"].state is None
+    assert observed["resolution"].is_authoritative_state is False
 
 
 @pytest.mark.parametrize(
@@ -459,7 +521,11 @@ def test_pipeline_routes_each_intent_exactly_once(
     assert routed_context.chat_history_source == "last_qa"
     assert routed_context.chat_history == last_qa_chat_history(state)
     assert classifier.calls[0]["last_qa_resolution"].state is state
-    assert classifier.calls[0]["approved_conversation_context"] is None
+    approved = classifier.calls[0]["approved_conversation_context"]
+    assert approved is not None
+    assert approved.approved_conversation_history == last_qa_chat_history(state)
+    assert approved._internal_selected_topic_candidates == ["topic-atlas"]
+    assert approved._internal_selected_hop_candidates == ["hop-atlas"]
     assert len(store.saved) == 1
     assert current_chat_history() == []
 
@@ -680,6 +746,8 @@ class _LLMStub:
         if self.error is not None:
             raise self.error
         assert self.payload is not None
+        if isinstance(self.payload, StructuredFallbackPayload):
+            return self.payload
         return dict(self.payload)
 
 
@@ -719,8 +787,13 @@ def test_deterministic_last_qa_resolver_no_state_requires_broad_retrieval() -> N
     assert resolution.is_authoritative_state is False
 
 
-def test_llm_last_qa_skips_model_when_no_active_question_can_authorize_skip() -> None:
-    llm = _LLMStub(error=AssertionError("Last-QA LLM must not run"))
+def test_llm_last_qa_models_latest_relationship_without_active_question() -> None:
+    llm = _LLMStub(
+        payload={
+            "relationship": "unrelated_or_uncertain",
+            "confidence": 0.98,
+        }
+    )
     resolver = LLMLastQAResolver(llm=llm, config=LastQAConfig())
 
     resolution = resolver.resolve(
@@ -731,7 +804,34 @@ def test_llm_last_qa_skips_model_when_no_active_question_can_authorize_skip() ->
 
     assert resolution.path is LastQAPath.BROAD_RETRIEVAL_REQUIRED
     assert resolution.skip_broad_retrieval is False
-    assert llm.calls == []
+    assert len(llm.calls) == 1
+    assert set(llm.calls[0]["schema"]["properties"]) == {
+        "relationship",
+        "confidence",
+    }
+    assert "latest_exchange" in llm.calls[0]["user_prompt"]
+    assert "Atlas rolls out after QA signoff." in llm.calls[0]["user_prompt"]
+
+
+def test_llm_last_qa_prompt_preserves_tail_of_long_latest_response() -> None:
+    state = _last_qa_state()
+    state.last_response = "A" * 700 + " FINAL_CONCLUSION_DEPLOY_FRIDAY"
+    llm = _LLMStub(
+        payload={
+            "relationship": "unrelated_or_uncertain",
+            "confidence": 0.98,
+        }
+    )
+
+    LLMLastQAResolver(llm=llm, config=LastQAConfig()).resolve(
+        ChatRequest(user_id="user-1", raw_query="Why that conclusion?"),
+        "Why that conclusion?",
+        state,
+    )
+
+    prompt = llm.calls[0]["user_prompt"]
+    assert "...<truncated-middle>..." in prompt
+    assert "FINAL_CONCLUSION_DEPLOY_FRIDAY" in prompt
 
 
 def test_llm_last_qa_binds_minimal_question_index_to_exact_state_question() -> None:
@@ -745,7 +845,11 @@ def test_llm_last_qa_binds_minimal_question_index_to_exact_state_question() -> N
     state = _last_qa_state()
     state.supporting_questions = [question]
     llm = _LLMStub(
-        payload={"matched_question_index": 0, "confidence": 1.0}
+        payload={
+            "relationship": "supporting_question_answer",
+            "matched_question_index": 0,
+            "confidence": 1.0,
+        }
     )
     resolver = LLMLastQAResolver(llm=llm, config=LastQAConfig())
 
@@ -761,11 +865,177 @@ def test_llm_last_qa_binds_minimal_question_index_to_exact_state_question() -> N
     assert resolution.question_source is QuestionSource.HUMAN_SUPPORTING_QUESTION
     assert resolution.matched_question == question.text
     assert set(llm.calls[0]["schema"]["properties"]) == {
+        "relationship",
         "matched_question_index",
         "confidence",
     }
+    assert "latest_exchange" in llm.calls[0]["user_prompt"]
     assert "active_supporting_questions" in llm.calls[0]["user_prompt"]
     assert question.text in llm.calls[0]["user_prompt"]
+    assert question.expected_response_type.value in llm.calls[0]["user_prompt"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("structured_fallback", "exception"),
+)
+def test_llm_last_qa_model_failure_never_uses_lexical_skip_fallback(
+    failure: str,
+) -> None:
+    question = GeneratedQuestion(
+        text="Which environment should I use?",
+        source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+        purpose="optional_context",
+        confidence=1.0,
+        expected_response_type=ExpectedResponseType.SELECTION_ANSWER,
+    )
+    state = _last_qa_state()
+    state.supporting_questions = [question]
+    if failure == "structured_fallback":
+        llm = _LLMStub(
+            payload=StructuredFallbackPayload(
+                {
+                    "relationship": "unrelated_or_uncertain",
+                    "matched_question_index": -1,
+                    "confidence": 0.0,
+                },
+                task=LLMTask.LAST_QA,
+                reason="synthetic terminal model failure",
+            )
+        )
+    else:
+        llm = _LLMStub(error=RuntimeError("synthetic terminal model failure"))
+
+    resolution = LLMLastQAResolver(
+        llm=llm,
+        config=LastQAConfig(),
+    ).resolve(
+        ChatRequest(
+            user_id="user-1",
+            raw_query="Which environment should I avoid?",
+        ),
+        "Which environment should I avoid?",
+        state,
+    )
+
+    assert resolution.path is LastQAPath.BROAD_RETRIEVAL_REQUIRED
+    assert resolution.skip_broad_retrieval is False
+    assert resolution.state is None
+    assert resolution.interaction_type is None
+    assert resolution.diagnostic_context["model_failure_policy"] == (
+        "conservative_broad_retrieval"
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "relationship",
+        "confidence",
+        "question_index",
+        "linked",
+        "expected_latest",
+    ),
+    (
+        ("normal_follow_up", 0.96, -1, True, True),
+        ("normal_follow_up", 0.89, -1, True, False),
+        ("normal_follow_up", 0.99, 0, True, False),
+        ("normal_follow_up", 0.99, -1, False, False),
+        ("normal_follow_up", 1.01, -1, True, False),
+        ("normal_follow_up", float("inf"), -1, True, False),
+        ("normal_follow_up", float("nan"), -1, True, False),
+        ("unrelated_or_uncertain", 0.99, -1, True, False),
+    ),
+)
+def test_llm_last_qa_calibrates_normal_latest_context_without_overmatching(
+    relationship: str,
+    confidence: float,
+    question_index: int,
+    linked: bool,
+    expected_latest: bool,
+) -> None:
+    state = _last_qa_state()
+    if not linked:
+        state.linked_topic_id = None
+        state.linked_hop_id = None
+    payload: dict[str, Any] = {
+        "relationship": relationship,
+        "confidence": confidence,
+    }
+    if question_index != -1:
+        state.supporting_questions = [
+            GeneratedQuestion(
+                text="Which explanation mode should I use?",
+                source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
+                purpose="optional_context",
+                confidence=1.0,
+                expected_response_type=ExpectedResponseType.SELECTION_ANSWER,
+            )
+        ]
+        payload["matched_question_index"] = question_index
+    llm = _LLMStub(
+        payload=payload
+    )
+
+    resolution = LLMLastQAResolver(
+        llm=llm,
+        config=LastQAConfig(),
+    ).resolve(
+        ChatRequest(
+            user_id="user-1",
+            raw_query="Could you explain why that signoff is required?",
+        ),
+        "Could you explain why that signoff is required?",
+        state,
+    )
+
+    assert resolution.path is (
+        LastQAPath.LATEST_CONTEXT_INTERACTION
+        if expected_latest
+        else LastQAPath.BROAD_RETRIEVAL_REQUIRED
+    )
+    assert resolution.skip_broad_retrieval is expected_latest
+    assert resolution.state is (state if expected_latest else None)
+    assert resolution.interaction_type is (
+        LastQAInteractionType.NORMAL_FOLLOW_UP if expected_latest else None
+    )
+    assert resolution.is_authoritative_state is expected_latest
+
+
+@pytest.mark.parametrize(
+    "response_type",
+    (
+        ResponseType.NORMAL,
+        ResponseType.KNOWLEDGE_ACTION,
+        ResponseType.REMINDER_ACTION,
+        ResponseType.REMINDER_REPLY,
+        ResponseType.ERROR,
+        ResponseType.SAFE_NOOP,
+    ),
+)
+def test_llm_last_qa_recognizes_latest_relationship_for_every_eligible_state(
+    response_type: ResponseType,
+) -> None:
+    state = _last_qa_state()
+    state.response_type = response_type
+    llm = _LLMStub(
+        payload={
+            "relationship": "normal_follow_up",
+            "confidence": 0.96,
+        }
+    )
+
+    resolution = LLMLastQAResolver(
+        llm=llm,
+        config=LastQAConfig(),
+    ).resolve(
+        ChatRequest(user_id="user-1", raw_query="Why did that happen?"),
+        "Why did that happen?",
+        state,
+    )
+
+    assert resolution.path is LastQAPath.LATEST_CONTEXT_INTERACTION
+    assert resolution.interaction_type is LastQAInteractionType.NORMAL_FOLLOW_UP
+    assert resolution.skip_broad_retrieval is True
 
 
 @pytest.mark.parametrize(

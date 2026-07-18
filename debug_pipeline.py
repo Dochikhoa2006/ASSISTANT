@@ -51,6 +51,7 @@ from assistant_rag.contracts import (
     HumanSupportingDecision,
     Intent,
     LastQAInteractionType,
+    LastQAPath,
     LastQAState,
     PipelineContext,
     QuestionSource,
@@ -1626,7 +1627,11 @@ def scenario_general_hitl_supporting_question_printed(settings: ProductionSettin
             properties = kwargs.get("schema", {}).get("properties", {})
             if "matched_question_index" not in properties:
                 raise AssertionError("supporting-answer scenario received an unrelated schema")
-            return {"matched_question_index": 0, "confidence": 1.0}
+            return {
+                "relationship": "supporting_question_answer",
+                "matched_question_index": 0,
+                "confidence": 1.0,
+            }
 
     state.pipeline.last_qa_resolver = LLMLastQAResolver(
         llm=SupportingAnswerLLM(),
@@ -3171,7 +3176,7 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
     router = OllamaModelRouter(default_settings.ollama)
     expected_models = {
         LLMTask.QUERY_REWRITE: "qwen3.5:4b",
-        LLMTask.LAST_QA: "qwen3.5:4b",
+        LLMTask.LAST_QA: "qwen3.5:9b",
         LLMTask.INTENT: "qwen3.5:4b",
         LLMTask.ACTION_EXTRACTION: "qwen3.5:4b",
         LLMTask.KNOWLEDGE_ACTION_EXTRACTION: "qwen3.5:4b",
@@ -3199,6 +3204,12 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
     }
     if mismatches:
         raise AssertionError(f"model routing mismatches: {mismatches}")
+    if default_settings.ollama.model_last_qa_fallback != "qwen3.5:4b":
+        raise AssertionError("Last-QA needs a local cross-model recovery route")
+    if default_settings.ollama.json_retry_count_last_qa != 0:
+        raise AssertionError(
+            "Last-QA should fail over models instead of repeating the same malformed output"
+        )
 
     # Check some basic policy settings
     policy_values = {
@@ -3325,7 +3336,7 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
 
     expected_timeouts = {
         LLMTask.QUERY_REWRITE: 12.0,
-        LLMTask.LAST_QA: 18.0,
+        LLMTask.LAST_QA: 30.0,
         LLMTask.INTENT: 20.0,
         LLMTask.ACTION_EXTRACTION: 24.0,
         LLMTask.KNOWLEDGE_ACTION_EXTRACTION: 24.0,
@@ -3511,6 +3522,7 @@ def scenario_last_qa_relationship_policy(settings: ProductionSettings) -> Scenar
     forged_supporting = {**supporting, "matched_question": "What output format should I use?"}
     normal = {
         **standard,
+        "relationship": LastQAInteractionType.NORMAL_FOLLOW_UP.value,
         "question_source": QuestionSource.NONE.value,
         "matched_question": "",
     }
@@ -3553,7 +3565,7 @@ def scenario_last_qa_relationship_policy(settings: ProductionSettings) -> Scenar
     expected = {
         "exact supporting answer": True,
         "forged supporting match": False,
-        "direct normal follow-up": False,
+        "direct normal follow-up": True,
         "normal follow-up carrying a question": False,
         "metadata-backed reminder reply": True,
         "metadata-free reminder reply": False,
@@ -3563,12 +3575,70 @@ def scenario_last_qa_relationship_policy(settings: ProductionSettings) -> Scenar
     if wrong:
         raise AssertionError(f"Last-QA retrieval-skip evidence policy regressed: {wrong}")
 
+    class RelationshipScenarioLLM:
+        def __init__(self, relationship: str, confidence: float) -> None:
+            self.relationship = relationship
+            self.confidence = confidence
+
+        def generate_json(self, **kwargs: Any) -> dict[str, Any]:
+            properties = kwargs.get("schema", {}).get("properties", {})
+            if set(properties) != {
+                "relationship",
+                "matched_question_index",
+                "confidence",
+            }:
+                raise AssertionError(
+                    f"Last-QA relationship schema regressed: {set(properties)}"
+                )
+            if "latest_exchange" not in kwargs.get("user_prompt", ""):
+                raise AssertionError("Last-QA model did not receive the latest exchange")
+            return {
+                "relationship": self.relationship,
+                "matched_question_index": -1,
+                "confidence": self.confidence,
+            }
+
+    latest_resolution = LLMLastQAResolver(
+        llm=RelationshipScenarioLLM("normal_follow_up", 0.96),
+        config=config,
+        prompt_registry=DEFAULT_PROMPT_REGISTRY,
+    ).resolve(
+        ChatRequest(user_id=DEBUG_USER, raw_query="Explain why that is required."),
+        "Explain why that is required.",
+        state,
+    )
+    if (
+        latest_resolution.path is not LastQAPath.LATEST_CONTEXT_INTERACTION
+        or latest_resolution.interaction_type
+        is not LastQAInteractionType.NORMAL_FOLLOW_UP
+        or not latest_resolution.skip_broad_retrieval
+    ):
+        raise AssertionError(
+            f"clear latest-context follow-up was underrated: {latest_resolution!r}"
+        )
+
+    unrelated_resolution = LLMLastQAResolver(
+        llm=RelationshipScenarioLLM("unrelated_or_uncertain", 0.99),
+        config=config,
+        prompt_registry=DEFAULT_PROMPT_REGISTRY,
+    ).resolve(
+        ChatRequest(user_id=DEBUG_USER, raw_query="Explain photosynthesis."),
+        "Explain photosynthesis.",
+        state,
+    )
+    if unrelated_resolution.path is not LastQAPath.BROAD_RETRIEVAL_REQUIRED:
+        raise AssertionError(
+            f"unrelated request incorrectly reused latest context: {unrelated_resolution!r}"
+        )
+
     prompt = DEFAULT_PROMPT_REGISTRY.system("last_qa")
     required_rules = (
-        "matched_question_index and confidence",
-        "Use index=-1 when no question is answered.",
-        "Do not classify normal follow-ups, reminder replies, or clarification answers",
-        "merely topically similar, use -1.",
+        "with relationship and confidence",
+        "also return matched_question_index",
+        "When matched_question_index is present, use -1",
+        "Do not classify source-verified reminder-notification replies, clarification answers, or outbound-message actions",
+        "topical similarity without dependency",
+        "normal_follow_up",
     )
     missing = [rule for rule in required_rules if rule not in prompt]
     if missing:
@@ -3577,7 +3647,11 @@ def scenario_last_qa_relationship_policy(settings: ProductionSettings) -> Scenar
     standalone_rule = "A latest message that starts a distinct standalone request is not a clarification answer"
     if standalone_rule not in clarification_prompt:
         raise AssertionError("clarification merge lost its standalone-request safeguard")
-    return ScenarioResult("last_qa_relationship_policy", True, "Last-QA skips retrieval only for exact supporting-question or reminder evidence; normal follow-up requires reranked conversation evidence")
+    return ScenarioResult(
+        "last_qa_relationship_policy",
+        True,
+        "Last-QA recognizes high-confidence latest-exchange continuity while keeping unrelated or weak evidence on broad retrieval",
+    )
 
 
 def scenario_debug_hybrid_llm_compatibility(settings: ProductionSettings) -> ScenarioResult:
@@ -3595,6 +3669,7 @@ def scenario_debug_hybrid_llm_compatibility(settings: ProductionSettings) -> Sce
         "base_url: http://localhost:11434",
         "onnx_cache_dir: .onnx_models",
         "answer=microsoft/Phi-4-mini-instruct-onnx",
+        "last_qa=qwen3.5:9b",
         "query_rewrite=qwen3.5:4b",
         "synthetic ONNX compatibility error",
         '"model": "microsoft/Phi-4-mini-instruct-onnx"',

@@ -2757,6 +2757,43 @@ class PostgresRepository(AssistantRepository):
             )
         return hydrated
 
+    def is_active_conversation_link(
+        self,
+        *,
+        user_id: str,
+        topic_id: str,
+        hop_id: str,
+    ) -> bool:
+        """Validate a cached Last-QA link as the user's active latest SQL hop."""
+
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(conversation_hops.c.hop_id)
+                .select_from(
+                    conversation_hops.join(
+                        conversation_topics,
+                        and_(
+                            conversation_topics.c.topic_id
+                            == conversation_hops.c.topic_id,
+                            conversation_topics.c.user_id
+                            == conversation_hops.c.user_id,
+                        ),
+                    )
+                )
+                .where(
+                    and_(
+                        conversation_hops.c.user_id == user_id,
+                        conversation_hops.c.topic_id == topic_id,
+                        conversation_hops.c.hop_id == hop_id,
+                        conversation_topics.c.status == "active",
+                        conversation_topics.c.last_hop_id
+                        == conversation_hops.c.hop_id,
+                    )
+                )
+                .limit(1)
+            ).fetchone()
+        return row is not None
+
     def list_all_outbox_entities(self) -> list[tuple[str, str]]:
         results = []
         with self.engine.connect() as conn:

@@ -12,6 +12,7 @@ from .contracts import (
     GeneralSubBranchDecision,
     PersistenceMode,
     PipelineContext,
+    QuestionSource,
 )
 from .llm import LLMClient, LLMTask
 from .prompts import GENERAL_SUB_BRANCH_DETECTION_SCHEMA, PromptContext, PromptRegistry
@@ -44,10 +45,56 @@ class GeneralSubBranchDetector:
         resolution_confidence = self._finite_score(
             (context.last_qa_trace or {}).get("resolution_confidence")
         )
+        last_qa_interaction_type = str(
+            (context.last_qa_trace or {}).get("interaction_type") or ""
+        )
+        latest_path_is_authoritative = bool(
+            (context.last_qa_trace or {}).get("path")
+            == "latest_context_interaction"
+            and (context.last_qa_trace or {}).get("skip_broad_retrieval") is True
+            and (context.last_qa_trace or {}).get("is_authoritative_state") is True
+        )
+        question_source = str(
+            (context.last_qa_trace or {}).get("question_source") or ""
+        )
+        matched_question = " ".join(
+            str((context.last_qa_trace or {}).get("matched_question") or "")
+            .casefold()
+            .split()
+        )
+        human_questions = {
+            " ".join(question.text.casefold().split())
+            for question in (
+                last_qa_state.supporting_questions if last_qa_state else []
+            )
+            if question.text.strip()
+        }
+        reminder_question = (
+            last_qa_state.reminder_supporting_question
+            if last_qa_state is not None
+            else None
+        )
+        reminder_questions = {
+            " ".join(reminder_question.text.casefold().split())
+        } if reminder_question and reminder_question.text.strip() else set()
+        state_has_supporting_question = bool(
+            (
+                question_source
+                == QuestionSource.HUMAN_SUPPORTING_QUESTION.value
+                and matched_question in human_questions
+            )
+            or (
+                question_source
+                == QuestionSource.REMINDER_SUPPORTING_QUESTION.value
+                and matched_question in reminder_questions
+            )
+        )
         support_question_rule_fired = bool(
-            last_qa_state is not None
-            and last_qa_state.supporting_questions
+            last_qa_interaction_type == "supporting_question_answer"
+            and latest_path_is_authoritative
+            and state_has_supporting_question
             and approved_context is not None
+            and approved_context._internal_selected_topic_candidates
             and approved_context._internal_selected_hop_candidates
             and resolution_confidence
             >= config.support_question_resolution_min_confidence
@@ -64,6 +111,30 @@ class GeneralSubBranchDetector:
                 selected_hop_id=selected_hop_id,
                 selected_parent_hop_id=selected_hop_id,
                 reason_summary="Deterministic rule fired: SUPPORT_QUESTION_ANSWER.",
+            )
+
+        latest_context_followup_rule_fired = bool(
+            last_qa_interaction_type == "normal_follow_up"
+            and latest_path_is_authoritative
+            and last_qa_state is not None
+            and last_qa_state.linked_topic_id
+            and last_qa_state.linked_hop_id
+            and approved_context is not None
+            and approved_context.approved_conversation_history
+            and approved_context._internal_selected_topic_candidates
+            and approved_context._internal_selected_hop_candidates
+        )
+        if latest_context_followup_rule_fired:
+            return GeneralSubBranchDecision(
+                sub_branch=GeneralSubBranch.CONVERSATION_FOLLOW_UP,
+                confidence=1.0,
+                persistence_mode=PersistenceMode.APPEND_TO_EXISTING_TOPIC,
+                selected_topic_id=last_qa_state.linked_topic_id,
+                selected_hop_id=last_qa_state.linked_hop_id,
+                selected_parent_hop_id=last_qa_state.linked_hop_id,
+                reason_summary=(
+                    "Deterministic rule fired: CONVERSATION_FOLLOW_UP."
+                ),
             )
 
         top_hop_rerank_score = self._finite_score(

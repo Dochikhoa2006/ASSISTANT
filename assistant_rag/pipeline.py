@@ -17,6 +17,7 @@ from .contracts import (
     LastQAResolution,
     LastQAState,
     OutboundMessageState,
+    QuestionSource,
     RetrievalResult,
 )
 from .last_qa import InMemoryLastQAStore
@@ -28,7 +29,11 @@ from .database import AssistantRepository
 from .context_filter import TwoLayerContextFilter
 from .metrics import GLOBAL_METRICS
 from .observability import StageTimer, current_trace
-from .chat_history import canonical_chat_history_scope, select_chat_history
+from .chat_history import (
+    canonical_chat_history_scope,
+    last_qa_chat_history,
+    select_chat_history,
+)
 from .indexing import BackgroundIndexer
 from .reminder_reply import (
     mark_reminder_state_replied,
@@ -277,7 +282,79 @@ class AssistantPipeline:
         with StageTimer("last_qa_resolution") as last_qa_stage:
             last_state = self.last_qa_store.get(request.user_id)
             resolution = self.last_qa_resolver.resolve(request, rewritten, last_state)
+            requires_active_link = bool(
+                resolution.skip_broad_retrieval
+                and resolution.interaction_type
+                in {
+                    LastQAInteractionType.NORMAL_FOLLOW_UP,
+                    LastQAInteractionType.SUPPORTING_QUESTION_ANSWER,
+                }
+            )
+            if requires_active_link:
+                active_link_validator = getattr(
+                    repository, "is_active_conversation_link", None
+                )
+                if callable(active_link_validator):
+                    try:
+                        active_link_valid = bool(
+                            resolution.linked_topic_id
+                            and resolution.linked_hop_id
+                            and active_link_validator(
+                                user_id=request.user_id,
+                                topic_id=resolution.linked_topic_id,
+                                hop_id=resolution.linked_hop_id,
+                            )
+                        )
+                    except Exception as exc:
+                        active_link_valid = False
+                        last_qa_stage.metadata["link_validation_error"] = (
+                            type(exc).__name__
+                        )
+                    last_qa_stage.metadata["active_link_valid"] = active_link_valid
+                    if not active_link_valid:
+                        resolution = replace(
+                            resolution,
+                            path=LastQAPath.BROAD_RETRIEVAL_REQUIRED,
+                            interaction_type=None,
+                            question_source=QuestionSource.NONE,
+                            state=None,
+                            did_merge_query=False,
+                            skip_broad_retrieval=False,
+                            linked_topic_id=None,
+                            linked_hop_id=None,
+                            matched_question=None,
+                            is_authoritative_state=False,
+                            diagnostic_context={
+                                **resolution.diagnostic_context,
+                                "cached_link_validation": "rejected",
+                            },
+                            merge_reason="cached_last_qa_link_not_active",
+                            skip_reason="broad_retrieval_required",
+                        )
+                else:
+                    # Lightweight injected repositories used by deterministic
+                    # tests may omit this capability. The production repository
+                    # always implements the user/topic/hop lifecycle check.
+                    last_qa_stage.metadata["active_link_valid"] = "not_available"
             last_qa_stage.metadata["path"] = resolution.path.value
+            last_qa_stage.metadata["confidence"] = resolution.confidence
+            last_qa_stage.metadata["skip_broad_retrieval"] = (
+                resolution.skip_broad_retrieval
+            )
+            last_qa_stage.metadata["interaction_type"] = (
+                resolution.interaction_type.value
+                if resolution.interaction_type is not None
+                else None
+            )
+            model_relationship = resolution.diagnostic_context.get(
+                "model_relationship"
+            )
+            if model_relationship:
+                last_qa_stage.metadata["model_relationship"] = model_relationship
+            if resolution.skip_reason:
+                last_qa_stage.metadata["decision_reason"] = (
+                    resolution.skip_reason
+                )
         
         # Semantic authority boundary: after Last-QA resolution, every
         # downstream consumer must use this rewritten value. The request's
@@ -314,7 +391,6 @@ class AssistantPipeline:
                 )
             if not conversation_results:
                 GLOBAL_METRICS.increment("retrieval_empty_total", entity_type="conversation_hop")
-            from dataclasses import replace
             resolution = replace(resolution, state=None)
             if conversation_results:
                 approved_conversation_context = self.context_filter.filter_conversation_only(
@@ -379,6 +455,46 @@ class AssistantPipeline:
                 _internal_selected_hop_candidates=[state.linked_hop_id],
                 _validation_summary=(
                     "Authoritative Last-QA supporting-question identity."
+                ),
+            )
+
+        # A high-confidence normal follow-up is bound to the immediately
+        # preceding SQL-linked hop by the Last-QA resolver. Preserve that one
+        # hop as approved context so the existing sub-branch detector appends
+        # to it instead of incorrectly creating a new conversation topic.
+        if (
+            not should_run_broad_retrieval
+            and resolution.path == LastQAPath.LATEST_CONTEXT_INTERACTION
+            and resolution.interaction_type
+            == LastQAInteractionType.NORMAL_FOLLOW_UP
+            and resolution.is_authoritative_state
+            and resolution.state is not None
+            and resolution.state.linked_topic_id
+            and resolution.state.linked_hop_id
+        ):
+            state = resolution.state
+            approved_conversation_context = ApprovedConversationContext(
+                approved_conversation_history=last_qa_chat_history(state),
+                human_supporting_questions=list(state.supporting_questions),
+                reminder_supporting_questions=(
+                    [state.reminder_supporting_question]
+                    if state.reminder_supporting_question is not None
+                    else []
+                ),
+                clarification_question_context=state.clarification_question,
+                extracted_expected_response_types=(
+                    [state.expected_response_type]
+                    if state.expected_response_type is not None
+                    else []
+                ),
+                conversation_retrieval_ran=False,
+                conversation_context_status="approved",
+                approved_conversation_count=1,
+                top_hop_rerank_score=None,
+                _internal_selected_topic_candidates=[state.linked_topic_id],
+                _internal_selected_hop_candidates=[state.linked_hop_id],
+                _validation_summary=(
+                    "Authoritative high-confidence latest-exchange relationship."
                 ),
             )
         

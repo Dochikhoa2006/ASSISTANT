@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import logging
+import math
 from typing import Any
 
 from .config import ClassificationConfig, LastQAConfig
@@ -31,6 +32,21 @@ logger = logging.getLogger(__name__)
 
 def _log_llm_fallback(stage: str, exc: Exception) -> None:
     logger.debug("%s LLM fallback engaged: %s", stage, exc)
+
+
+def _unit_confidence(value: Any) -> float | None:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        return None
+    return confidence
+
+
+def _confidence_meets(value: Any, threshold: float) -> bool:
+    confidence = _unit_confidence(value)
+    return confidence is not None and confidence >= threshold
 
 
 
@@ -199,8 +215,10 @@ class SupportingQuestionMatcher:
 def can_skip_broad_retrieval(
     payload: dict[str, Any], state: LastQAState, interaction_type: LastQAInteractionType, config: LastQAConfig, request: ChatRequest
 ) -> bool:
-    confidence = float(payload.get("confidence", 0.0))
-    if confidence < config.skip_broad_retrieval_min_confidence:
+    if not _confidence_meets(
+        payload.get("confidence", 0.0),
+        config.skip_broad_retrieval_min_confidence,
+    ):
         return False
         
         
@@ -211,10 +229,16 @@ def can_skip_broad_retrieval(
     matched_question = " ".join(str(payload.get("matched_question") or "").casefold().split())
 
     if interaction_type == LastQAInteractionType.NORMAL_FOLLOW_UP:
-        # Conversation follow-up ownership requires broad retrieval plus a
-        # validated top-hop reranker score. Last-QA may recognize continuity,
-        # but it must not bypass that conversation evidence gate.
-        return False
+        return bool(
+            state.linked_topic_id
+            and state.linked_hop_id
+            and state.last_user_query.strip()
+            and state.last_response.strip()
+            and question_source == QuestionSource.NONE.value
+            and not matched_question
+            and str(payload.get("relationship") or "")
+            == LastQAInteractionType.NORMAL_FOLLOW_UP.value
+        )
 
     if interaction_type == LastQAInteractionType.SUPPORTING_QUESTION_ANSWER:
         human_questions = {
@@ -299,7 +323,14 @@ class LastQAResolver:
             validate_last_qa_resolution(resolution)
             return resolution
 
-        if state.response_type in (ResponseType.NORMAL, ResponseType.KNOWLEDGE_ACTION, ResponseType.REMINDER_ACTION, ResponseType.REMINDER_REPLY, ResponseType.ERROR):
+        if state.response_type in (
+            ResponseType.NORMAL,
+            ResponseType.KNOWLEDGE_ACTION,
+            ResponseType.REMINDER_ACTION,
+            ResponseType.REMINDER_REPLY,
+            ResponseType.ERROR,
+            ResponseType.SAFE_NOOP,
+        ):
             support_confidence = self.matcher.confidence(
                 rewritten_query, state.supporting_questions
             )
@@ -347,8 +378,27 @@ class LLMLastQAResolver:
     config: LastQAConfig
     prompt_registry: PromptRegistry = field(default_factory=lambda: DEFAULT_PROMPT_REGISTRY)
 
-    def __post_init__(self) -> None:
-        self.fallback = LastQAResolver()
+    @staticmethod
+    def _require_broad_retrieval(
+        rewritten_query: str,
+        *,
+        reason: str,
+        diagnostic_context: dict[str, Any] | None = None,
+    ) -> LastQAResolution:
+        resolution = LastQAResolution(
+            path=LastQAPath.BROAD_RETRIEVAL_REQUIRED,
+            rewritten_query=rewritten_query,
+            state=None,
+            did_merge_query=False,
+            skip_broad_retrieval=False,
+            confidence=0.0,
+            is_authoritative_state=False,
+            diagnostic_context=dict(diagnostic_context or {}),
+            merge_reason=reason,
+            skip_reason="broad_retrieval_required",
+        )
+        validate_last_qa_resolution(resolution)
+        return resolution
 
     def resolve_outbound_follow_up(
         self,
@@ -412,7 +462,9 @@ class LLMLastQAResolver:
             validate_json_schema(payload, schema)
             action_value = str(payload.get("outbound_action") or "none")
             confidence = float(payload.get("confidence", 0.0))
-            if action_value == "none" or confidence < self.config.min_confidence:
+            if action_value == "none" or not _confidence_meets(
+                confidence, self.config.min_confidence
+            ):
                 return None
             action = OutboundFollowUpAction(action_value)
         except Exception as exc:
@@ -472,7 +524,10 @@ class LLMLastQAResolver:
             
             if not payload.get("answered_clarification"):
                 return None
-            if float(payload.get("confidence", 0.0)) < self.config.clarification_merge_min_confidence:
+            if not _confidence_meets(
+                payload.get("confidence", 0.0),
+                self.config.clarification_merge_min_confidence,
+            ):
                 return None
             if not str(payload.get("merged_query") or "").strip():
                 return None
@@ -570,7 +625,14 @@ class LLMLastQAResolver:
             validate_last_qa_resolution(res)
             return res
 
-        if state.response_type in (ResponseType.NORMAL, ResponseType.KNOWLEDGE_ACTION, ResponseType.REMINDER_ACTION, ResponseType.REMINDER_REPLY, ResponseType.ERROR):
+        if state.response_type in (
+            ResponseType.NORMAL,
+            ResponseType.KNOWLEDGE_ACTION,
+            ResponseType.REMINDER_ACTION,
+            ResponseType.REMINDER_REPLY,
+            ResponseType.ERROR,
+            ResponseType.SAFE_NOOP,
+        ):
             active_questions: list[tuple[QuestionSource, GeneratedQuestion]] = [
                 (QuestionSource.HUMAN_SUPPORTING_QUESTION, question)
                 for question in state.supporting_questions
@@ -587,28 +649,33 @@ class LLMLastQAResolver:
                     )
                 )
 
-            # No model classification in this state can authorize a retrieval
-            # skip: normal follow-ups require reranked conversation evidence,
-            # while exact reminder replies were resolved above from source IDs.
-            if not active_questions:
-                return self.fallback.resolve(request, rewritten_query, state)
-
-            deterministic_resolution = self.fallback.resolve(
-                request, rewritten_query, state
-            )
-            if deterministic_resolution.skip_broad_retrieval:
-                return deterministic_resolution
+            relationship_values = [
+                "unrelated_or_uncertain",
+                LastQAInteractionType.NORMAL_FOLLOW_UP.value,
+            ]
+            properties: dict[str, Any] = {
+                "relationship": {
+                    "type": "string",
+                    "enum": relationship_values,
+                },
+                "confidence": {"type": "number"},
+            }
+            required = ["relationship", "confidence"]
+            if active_questions:
+                relationship_values.append(
+                    LastQAInteractionType.SUPPORTING_QUESTION_ANSWER.value
+                )
+                properties["matched_question_index"] = {
+                    "type": "integer",
+                    "default": -1,
+                }
+                required.insert(1, "matched_question_index")
 
             schema = {
                 "type": "object",
-                "properties": {
-                    "matched_question_index": {
-                        "type": "integer",
-                        "default": -1,
-                    },
-                    "confidence": {"type": "number"},
-                },
-                "required": ["matched_question_index", "confidence"],
+                "additionalProperties": False,
+                "properties": properties,
+                "required": required,
             }
             try:
                 payload = self.llm.generate_json(
@@ -622,11 +689,28 @@ class LLMLastQAResolver:
                             metadata=request.metadata,
                             platform_context=request.platform_context,
                             extra={
+                                "latest_exchange": {
+                                    "previous_user_query": state.last_user_query,
+                                    "previous_assistant_response": state.last_response,
+                                    "response_type": state.response_type.value,
+                                    "expected_response_type": (
+                                        state.expected_response_type.value
+                                        if state.expected_response_type is not None
+                                        else None
+                                    ),
+                                    "linked_context_available": bool(
+                                        state.linked_topic_id
+                                        and state.linked_hop_id
+                                    ),
+                                },
                                 "active_supporting_questions": [
                                     {
                                         "index": index,
                                         "source": source.value,
                                         "question": question.text,
+                                        "expected_response_type": (
+                                            question.expected_response_type.value
+                                        ),
                                     }
                                     for index, (source, question) in enumerate(
                                         active_questions
@@ -638,18 +722,30 @@ class LLMLastQAResolver:
                     schema=schema,
                 )
                 if is_structured_fallback(payload):
-                    return self.fallback.resolve(request, rewritten_query, state)
+                    return self._require_broad_retrieval(
+                        rewritten_query,
+                        reason="last_qa_structured_generation_failed",
+                        diagnostic_context={
+                            "model_failure_policy": "conservative_broad_retrieval"
+                        },
+                    )
                 validate_json_schema(payload, schema)
 
-                question_index = int(payload["matched_question_index"])
-                confidence = float(payload.get("confidence", 0.0))
+                relationship = str(payload.get("relationship") or "")
+                question_index = int(payload.get("matched_question_index", -1))
+                confidence = _unit_confidence(payload.get("confidence", 0.0))
+                if confidence is None:
+                    confidence = 0.0
                 if (
-                    0 <= question_index < len(active_questions)
+                    relationship
+                    == LastQAInteractionType.SUPPORTING_QUESTION_ANSWER.value
+                    and 0 <= question_index < len(active_questions)
                     and confidence >= self.config.min_confidence
                 ):
                     question_source, matched_question = active_questions[question_index]
                     interaction_type = LastQAInteractionType.SUPPORTING_QUESTION_ANSWER
                     bound_payload = {
+                        "relationship": relationship,
                         "question_source": question_source.value,
                         "matched_question": matched_question.text,
                         "confidence": confidence,
@@ -680,10 +776,85 @@ class LLMLastQAResolver:
                         )
                         validate_last_qa_resolution(res)
                         return res
+
+                if (
+                    relationship == LastQAInteractionType.NORMAL_FOLLOW_UP.value
+                    and question_index == -1
+                    and confidence >= self.config.min_confidence
+                ):
+                    interaction_type = LastQAInteractionType.NORMAL_FOLLOW_UP
+                    bound_payload = {
+                        "relationship": relationship,
+                        "question_source": QuestionSource.NONE.value,
+                        "matched_question": "",
+                        "confidence": confidence,
+                    }
+                    if can_skip_broad_retrieval(
+                        bound_payload,
+                        state,
+                        interaction_type,
+                        self.config,
+                        request,
+                    ):
+                        res = LastQAResolution(
+                            path=LastQAPath.LATEST_CONTEXT_INTERACTION,
+                            interaction_type=interaction_type,
+                            question_source=QuestionSource.NONE,
+                            rewritten_query=rewritten_query,
+                            state=state,
+                            did_merge_query=False,
+                            skip_broad_retrieval=True,
+                            confidence=confidence,
+                            linked_topic_id=state.linked_topic_id,
+                            linked_hop_id=state.linked_hop_id,
+                            is_authoritative_state=True,
+                            missing_context=[],
+                            diagnostic_context={
+                                "model_relationship": relationship,
+                            },
+                            merge_reason=(
+                                "current_message_depends_on_latest_exchange"
+                            ),
+                            skip_reason=(
+                                "high_confidence_latest_context_relationship"
+                            ),
+                        )
+                        validate_last_qa_resolution(res)
+                        return res
+
+                res = LastQAResolution(
+                    path=LastQAPath.BROAD_RETRIEVAL_REQUIRED,
+                    rewritten_query=rewritten_query,
+                    state=None,
+                    did_merge_query=False,
+                    skip_broad_retrieval=False,
+                    confidence=confidence,
+                    is_authoritative_state=False,
+                    diagnostic_context={
+                        "model_relationship": relationship,
+                        "matched_question_index": question_index,
+                    },
+                    merge_reason="model_did_not_authorize_latest_context",
+                    skip_reason=(
+                        "relationship_uncertain_or_latest_context_guard_failed"
+                    ),
+                )
+                validate_last_qa_resolution(res)
+                return res
             except Exception as e:
                 _log_llm_fallback("Last-QA resolver", e)
+                return self._require_broad_retrieval(
+                    rewritten_query,
+                    reason="last_qa_model_error",
+                    diagnostic_context={
+                        "model_failure_policy": "conservative_broad_retrieval"
+                    },
+                )
 
-        return self.fallback.resolve(request, rewritten_query, state)
+        return self._require_broad_retrieval(
+            rewritten_query,
+            reason="last_qa_response_type_not_eligible",
+        )
 
 
 

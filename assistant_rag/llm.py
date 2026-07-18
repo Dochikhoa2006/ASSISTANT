@@ -220,7 +220,11 @@ class OllamaLLMClient:
             retry_count = getattr(self.settings, f"json_retry_count_{task.value}", self.settings.structured_retry_count)
             attempt_errors: list[str] = []
             total_attempts = retry_count + 1
-            attempt_plan = _structured_attempt_plan(total_attempts)
+            attempt_plan = (
+                ["schema"]
+                if fallback_for and total_attempts == 1
+                else _structured_attempt_plan(total_attempts)
+            )
             for attempt_index, attempt_mode in enumerate(attempt_plan, start=1):
                 try:
                     attempt_prompt = _structured_attempt_prompt(
@@ -665,8 +669,13 @@ def structured_fallback_payload(
         properties = schema.get("properties") or {}
         if "outbound_action" in properties:
             payload.update({"outbound_action": "none", "confidence": 0.0})
-        elif "matched_question_index" in properties:
-            payload.update({"matched_question_index": -1, "confidence": 0.0})
+        elif "relationship" in properties:
+            payload.update({
+                "relationship": "unrelated_or_uncertain",
+                "confidence": 0.0,
+            })
+            if "matched_question_index" in properties:
+                payload["matched_question_index"] = -1
         else:
             payload.update({
                 "interaction_type": "ambiguous",

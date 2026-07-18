@@ -74,12 +74,13 @@ class OllamaSettings:
     temperature_query_rewrite: float = 0.0
 
     # Task: LAST_QA
-    model_last_qa: str = "qwen3.5:4b"
-    timeout_last_qa: float = 18.0
+    model_last_qa: str = "qwen3.5:9b"
+    model_last_qa_fallback: str | None = "qwen3.5:4b"
+    timeout_last_qa: float = 30.0
     num_ctx_last_qa: int = 2048
-    num_predict_last_qa: int | None = 160
+    num_predict_last_qa: int | None = 128
     temperature_last_qa: float = 0.0
-    json_retry_count_last_qa: int = 1
+    json_retry_count_last_qa: int = 0
 
     # Task: INTENT
     model_intent: str = "qwen3.5:4b"
@@ -665,6 +666,10 @@ class ProductionSettings:
                 num_predict_query_rewrite=_get_int("OLLAMA_QUERY_REWRITE_NUM_PREDICT", OllamaSettings.num_predict_query_rewrite) if os.getenv("OLLAMA_QUERY_REWRITE_NUM_PREDICT") else OllamaSettings.num_predict_query_rewrite,
                 temperature_query_rewrite=_get_float("OLLAMA_QUERY_REWRITE_TEMPERATURE", OllamaSettings.temperature_query_rewrite),
                 model_last_qa=os.getenv("OLLAMA_LAST_QA_MODEL", OllamaSettings.model_last_qa),
+                model_last_qa_fallback=os.getenv(
+                    "OLLAMA_LAST_QA_FALLBACK_MODEL",
+                    OllamaSettings.model_last_qa_fallback,
+                ) or None,
                 timeout_last_qa=_get_float("OLLAMA_LAST_QA_TIMEOUT", OllamaSettings.timeout_last_qa),
                 num_ctx_last_qa=_get_int("OLLAMA_LAST_QA_NUM_CTX", OllamaSettings.num_ctx_last_qa),
                 num_predict_last_qa=_get_int("OLLAMA_LAST_QA_NUM_PREDICT", OllamaSettings.num_predict_last_qa) if os.getenv("OLLAMA_LAST_QA_NUM_PREDICT") else OllamaSettings.num_predict_last_qa,

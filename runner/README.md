@@ -43,10 +43,9 @@ To run the Streamlit web interface:
 
 Normal runtime uses these central defaults from `assistant_rag/settings.py`:
 
-* Query rewrite: `qwen3.5:0.8b`
-* Last-QA, intent classification, supporting-question generation, sub-branch detection, and lightweight tool routing: `qwen3.5:2b`
-* Action extraction, clarification merge, and action planning: `qwen3.5:4b`
-* Final answers, long-form writing, risky-action validation, and retrieval validation: `qwen3.5:9b`
+* Last-QA latest-context relationship resolution: `qwen3.5:9b`, with `qwen3.5:4b` recovery
+* Query rewrite, intent classification, action extraction, clarification, supporting-question generation, and sub-branch detection: `qwen3.5:4b`
+* Final answers, long-form writing, mutation validation/finalization, retrieval validation, and action planning: `microsoft/Phi-4-mini-instruct-onnx`, with configured Ollama recovery models where required
 * Embeddings: `BAAI/bge-m3`
 
 Runtime policy defaults:

@@ -4,6 +4,7 @@ import json
 from types import MethodType, SimpleNamespace
 
 import pytest
+from sqlalchemy import update
 
 from assistant_rag.chat_history import (
     CHAT_HISTORY_PROMPT_RULE,
@@ -32,6 +33,7 @@ from assistant_rag.contracts import (
 from assistant_rag.database import SQLiteRepository
 from assistant_rag.pipeline import AssistantPipeline
 from assistant_rag.postgres_repository import PostgresRepository
+from assistant_rag.postgres_schema import conversation_topics
 from assistant_rag.prompts import DEFAULT_PROMPT_REGISTRY, PromptContext
 
 
@@ -509,6 +511,99 @@ def test_sql_hydration_quarantines_raw_query_audit_fields(
         assert raw_sentinel not in serialized
         assert vector_raw_sentinel not in serialized
         assert rewritten_sentinel in serialized
+    finally:
+        close = getattr(repository, "close", None)
+        if callable(close):
+            close()
+        else:
+            repository.connection.close()
+
+
+@pytest.mark.parametrize("repository_kind", ("sqlite", "sqlalchemy"))
+def test_active_conversation_link_requires_owner_topic_lifecycle_and_latest_hop(
+    repository_kind: str,
+) -> None:
+    repository = (
+        SQLiteRepository.in_memory()
+        if repository_kind == "sqlite"
+        else PostgresRepository.create("sqlite+pysqlite:///:memory:")
+    )
+    repository.initialize_schema()
+    try:
+        with repository.transaction() as cursor:
+            topic_id = repository.ensure_topic(
+                cursor,
+                user_id="link-owner",
+                title="Last-QA link",
+            )
+            first_hop = repository.append_conversation_hop(
+                cursor,
+                topic_id=topic_id,
+                user_id="link-owner",
+                intent="general_response",
+                raw_user_query="First",
+                rewritten_user_query="First",
+                raw_response="First response",
+                response_type="normal",
+            )
+
+        assert repository.is_active_conversation_link(
+            user_id="link-owner",
+            topic_id=topic_id,
+            hop_id=first_hop.hop_id,
+        )
+        assert not repository.is_active_conversation_link(
+            user_id="different-user",
+            topic_id=topic_id,
+            hop_id=first_hop.hop_id,
+        )
+        assert not repository.is_active_conversation_link(
+            user_id="link-owner",
+            topic_id="different-topic",
+            hop_id=first_hop.hop_id,
+        )
+
+        with repository.transaction() as cursor:
+            second_hop = repository.append_conversation_hop(
+                cursor,
+                topic_id=topic_id,
+                user_id="link-owner",
+                intent="general_response",
+                raw_user_query="Second",
+                rewritten_user_query="Second",
+                raw_response="Second response",
+                response_type="normal",
+            )
+
+        assert not repository.is_active_conversation_link(
+            user_id="link-owner",
+            topic_id=topic_id,
+            hop_id=first_hop.hop_id,
+        )
+        assert repository.is_active_conversation_link(
+            user_id="link-owner",
+            topic_id=topic_id,
+            hop_id=second_hop.hop_id,
+        )
+
+        with repository.transaction() as cursor:
+            if repository_kind == "sqlite":
+                cursor.execute(
+                    "UPDATE conversation_topics SET status = ? WHERE topic_id = ?",
+                    ("archived", topic_id),
+                )
+            else:
+                cursor.execute(
+                    update(conversation_topics)
+                    .where(conversation_topics.c.topic_id == topic_id)
+                    .values(status="archived")
+                )
+
+        assert not repository.is_active_conversation_link(
+            user_id="link-owner",
+            topic_id=topic_id,
+            hop_id=second_hop.hop_id,
+        )
     finally:
         close = getattr(repository, "close", None)
         if callable(close):
