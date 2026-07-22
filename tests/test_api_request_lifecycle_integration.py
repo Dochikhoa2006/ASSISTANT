@@ -86,9 +86,6 @@ def test_chat_endpoint_preserves_shared_idempotency_replay_and_conflict_contract
     assert len(pipeline.requests) == 1
     assert limiter.keys == [
         "chat:lifecycle-user",
-        "mutation:lifecycle-user",
         "chat:lifecycle-user",
-        "mutation:lifecycle-user",
         "chat:lifecycle-user",
-        "mutation:lifecycle-user",
     ]

@@ -7,7 +7,7 @@ import logging
 import math
 from typing import Any
 
-from .config import ClassificationConfig, LastQAConfig
+from .config import LastQAConfig
 from .contracts import (
     ChatRequest, GeneratedQuestion, Intent, LastQAState, ResponseType, LastQAPath,
     LastQAInteractionType, OutboundFollowUpAction, QuestionSource, LastQAResolution,
@@ -16,10 +16,6 @@ from .contracts import (
 from .llm import (
     LLMClient,
     LLMTask,
-    _has_pending_clarification,
-    _is_authoritative_outbound_action,
-    build_intent_conversation_extra,
-    intent_classification_schema,
     is_structured_fallback,
     validate_json_schema,
 )
@@ -870,90 +866,6 @@ class IntentClassifierProtocol:
         approved_conversation_context: ApprovedConversationContext | None = None
     ) -> Intent:
         ...
-
-@dataclass
-class LLMIntentClassifier(IntentClassifierProtocol):
-    llm: LLMClient
-    config: ClassificationConfig
-    prompt_registry: PromptRegistry = field(default_factory=lambda: DEFAULT_PROMPT_REGISTRY)
-
-    def classify(
-        self, 
-        request: ChatRequest, 
-        rewritten_query: str, 
-        last_qa_resolution: LastQAResolution | None = None,
-        approved_conversation_context: ApprovedConversationContext | None = None
-    ) -> Intent:
-        explicit_intent = request.metadata.get("intent")
-        if explicit_intent:
-            try:
-                return Intent(explicit_intent)
-            except ValueError:
-                pass
-
-        if _is_authoritative_outbound_action(last_qa_resolution):
-            return Intent.GENERAL_RESPONSE
-
-        schema = intent_classification_schema()
-        
-        # Include compact approved chat history so intent can resolve safe follow-ups.
-        context_extra = build_intent_conversation_extra(
-            approved_conversation_context=approved_conversation_context,
-            last_qa_resolution=last_qa_resolution,
-        )
-
-        try:
-            payload = self.llm.generate_json(
-                task=LLMTask.INTENT,
-                system_prompt=self.prompt_registry.system("intent_classifier"),
-                user_prompt=self.prompt_registry.user(
-                    PromptContext(
-                        stage="intent_classifier",
-                        user_id=request.user_id,
-                        rewritten_query=rewritten_query,
-                        metadata=request.metadata,
-                        platform_context=request.platform_context,
-                        extra=context_extra,
-                    )
-                ),
-                schema=schema,
-            )
-            if is_structured_fallback(payload):
-                return Intent.GENERAL_RESPONSE
-            validate_json_schema(payload, schema)
-            
-            if float(payload.get("confidence", 0.0)) >= self.config.min_confidence:
-                intent = Intent(str(payload["intent"]))
-                if (
-                    intent is Intent.CLARIFICATION
-                    and not _has_pending_clarification(last_qa_resolution)
-                ):
-                    return Intent.GENERAL_RESPONSE
-                return intent
-        except Exception as e:
-            _log_llm_fallback("Intent classifier", e)
-
-        return Intent.GENERAL_RESPONSE
-
-class KeywordIntentClassifier(IntentClassifierProtocol):
-    def __init__(self, config: ClassificationConfig) -> None:
-        self.config = config
-
-    def classify(
-        self, 
-        request: ChatRequest, 
-        rewritten_query: str, 
-        last_qa_resolution: LastQAResolution | None = None,
-        approved_conversation_context: ApprovedConversationContext | None = None
-    ) -> Intent:
-        explicit_intent = request.metadata.get("intent")
-        if explicit_intent:
-            return Intent(explicit_intent)
-        query = rewritten_query.casefold()
-        for intent_name, keywords in self.config.intent_keywords.items():
-            if any(keyword.casefold() in query for keyword in keywords):
-                return Intent(intent_name)
-        return Intent.GENERAL_RESPONSE
 
 # Expose IntentClassifier as the base protocol for type hints
 IntentClassifier = IntentClassifierProtocol

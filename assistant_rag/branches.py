@@ -56,7 +56,12 @@ SUB_BRANCH_PROMPT_POLICIES = {
     },
 }
 from .database import AssistantRepository
-from .llm import LLMClient, LLMTask
+from .llm import (
+    LLMClient,
+    LLMTask,
+    StructuredOutputInvariantError,
+    is_structured_fallback,
+)
 from .prompts import DEFAULT_PROMPT_REGISTRY, PromptContext, PromptRegistry
 from .retrieval import HybridRetriever
 from .canonical_retrieval import retrieve_knowledge
@@ -73,7 +78,57 @@ from .reminder_reply import (
     reminder_reply_hop_entities,
     verified_reminder_state,
 )
-from .platform import is_explicit_email_message_request
+from .semantic_actions import semantic_action_from_internal_payload
+from .answer_grounding import (
+    AnswerGenerationOutcome,
+    generate_answer,
+    is_grounded_answer_text,
+)
+
+
+_PERSONAL_CONTEXT_DEPENDENCY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "requires_unavailable_context": {"type": "boolean"},
+        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "reason_summary": {"type": "string"},
+    },
+    "required": [
+        "requires_unavailable_context",
+        "confidence",
+        "reason_summary",
+    ],
+}
+
+_PERSONAL_CONTEXT_DEGRADED_ANSWER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "answerable_without_unavailable_context": {"type": "boolean"},
+        "answer_text": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "reason_summary": {"type": "string"},
+    },
+    "required": [
+        "answerable_without_unavailable_context",
+        "answer_text",
+        "confidence",
+        "reason_summary",
+    ],
+}
+
+_PERSONAL_CONTEXT_CERTIFICATE_MIN_CONFIDENCE = 0.9
+
+
+@dataclass(frozen=True)
+class _DegradedContextAuthorization:
+    certified_answer_text: str = ""
+    answer_stage_attempted: bool = False
+
+    @property
+    def authorized(self) -> bool:
+        return bool(self.certified_answer_text.strip())
 
 
 def _mutation_clarification_message_key(domain: str, missing_fields: list[str]) -> str:
@@ -245,6 +300,8 @@ class GeneralResponseBranch:
 
     def execute(self, context: PipelineContext, repository: AssistantRepository) -> BranchResult:
         general_warnings: list[str] = []
+        personal_context_unavailable = False
+        unavailable_context_domains: set[str] = set()
         try:
             knowledge_results = retrieve_knowledge(
                 retriever=self.retriever,
@@ -254,6 +311,8 @@ class GeneralResponseBranch:
             )
         except Exception as exc:
             knowledge_results = []
+            personal_context_unavailable = True
+            unavailable_context_domains.add("knowledge")
             general_warnings.append(
                 f"general_knowledge_retrieval_unavailable:{type(exc).__name__}"
             )
@@ -272,6 +331,8 @@ class GeneralResponseBranch:
             ]
         except Exception as exc:
             reminder_raw = []
+            personal_context_unavailable = True
+            unavailable_context_domains.add("reminder")
             general_warnings.append(
                 f"general_reminder_retrieval_unavailable:{type(exc).__name__}"
             )
@@ -286,6 +347,8 @@ class GeneralResponseBranch:
                 intent=context.intent,
             )
         except Exception as exc:
+            personal_context_unavailable = True
+            unavailable_context_domains.add("context_filter")
             approved_context = ApprovedContext(
                 knowledge_evidence=[],
                 reminder_context=[],
@@ -365,6 +428,21 @@ class GeneralResponseBranch:
                 resolved_sub_branch = GeneralSubBranch.CONVERSATION_FOLLOW_UP
             
         resolved_persistence_mode = plan.persistence_mode if plan else PersistenceMode.CREATE_NEW_TOPIC
+        explicit_conversation_resume = bool(
+            context.request.conversation_id
+            and context.request.parent_hop_id
+            and context.last_qa_state is not None
+            and context.last_qa_state.linked_topic_id
+        )
+        if (
+            explicit_conversation_resume
+            and resolved_sub_branch is not GeneralSubBranch.SUPPORT_QUESTION_ANSWER
+        ):
+            # An ownership-validated explicit hop cursor outranks a heuristic
+            # new-topic classification. It is the deterministic process variant
+            # for reopening or continuing a saved conversation.
+            resolved_sub_branch = GeneralSubBranch.CONVERSATION_FOLLOW_UP
+            resolved_persistence_mode = PersistenceMode.APPEND_TO_EXISTING_TOPIC
         
         policy_dict = SUB_BRANCH_PROMPT_POLICIES.get(resolved_sub_branch, SUB_BRANCH_PROMPT_POLICIES[GeneralSubBranch.NEW_CONVERSATION_TOPIC])
         prompt_ctx = SubBranchPromptContext(
@@ -390,7 +468,49 @@ class GeneralResponseBranch:
             expected_response_type=prompt_ctx.expected_response_type.value,
         ) + "\nRetrieved supporting detail:\n" + merged_supporting_detail
 
-        if (
+        composer_result = None
+        degraded_authorization = (
+            self._authorize_degraded_personal_context(
+                context=context,
+                unavailable_domains=unavailable_context_domains,
+            )
+            if personal_context_unavailable
+            else _DegradedContextAuthorization()
+        )
+        degraded_certified_answer = (
+            degraded_authorization.certified_answer_text.strip()
+        )
+        blocked_by_context_dependency = bool(
+            personal_context_unavailable
+            and not degraded_authorization.authorized
+        )
+        answer_generation_attempted = False
+        answer_generation_succeeded = False
+        writer_generation_attempted = False
+        writer_generation_succeeded = False
+        answer_delivery_text = ""
+        answer_recovery_scope = context.rewritten_query
+        if blocked_by_context_dependency:
+            # The mandatory answer stage still executes, but its ungrounded
+            # prose cannot authorize a guess about unavailable durable state.
+            answer_generation_attempted = (
+                degraded_authorization.answer_stage_attempted
+            )
+            if not answer_generation_attempted:
+                answer_generation_attempted = True
+                self._generate_response(
+                    context,
+                    approved_context,
+                    prompt_ctx,
+                    sub_branch_supporting_prompt,
+                    merged_supporting_detail,
+                )
+            response = self.prompt_registry.message(
+                "personal_context_temporarily_unavailable"
+            )
+            answer_generation_succeeded = False
+            general_warnings.append("personal_context_safe_retry")
+        elif (
             self.content_composer is not None
             and self.general_purpose_config is not None
         ):
@@ -412,18 +532,188 @@ class GeneralResponseBranch:
                 sub_branch_supporting_prompt=sub_branch_supporting_prompt,
                 repository=repository,
                 merged_supporting_detail=merged_supporting_detail,
+                approved_knowledge_records=approved_context.knowledge_records,
             )
-            composer_result = self.content_composer.compose(composer_input, self.general_purpose_config)
-            response = composer_result.final_response_text
+            try:
+                composer_result = self.content_composer.compose(
+                    composer_input, self.general_purpose_config
+                )
+            except Exception as exc:
+                composer_result = None
+                general_warnings.append(
+                    f"content_composer_unavailable:{type(exc).__name__}"
+                )
+            if composer_result is not None:
+                answer_generation_attempted = (
+                    "answer_generation" in composer_result.used_tool_names
+                )
+                trace_payload: dict[str, Any] = {}
+                try:
+                    decoded_trace = json.loads(composer_result.tool_trace_summary)
+                    if isinstance(decoded_trace, dict):
+                        trace_payload = decoded_trace
+                except (TypeError, ValueError):
+                    trace_payload = {}
+                outcomes = trace_payload.get("stage_outcomes")
+                outcomes = outcomes if isinstance(outcomes, dict) else {}
+                traced_answer_scope = str(
+                    trace_payload.get("answer_request_scope") or ""
+                ).strip()
+                if traced_answer_scope:
+                    answer_recovery_scope = traced_answer_scope
+                answer_outcome = outcomes.get("answer_generation")
+                if isinstance(answer_outcome, dict):
+                    answer_generation_succeeded = bool(
+                        answer_outcome.get("succeeded")
+                    )
+                else:
+                    # Compatibility for injected composers predating detailed
+                    # stage outcomes. They must still identify the mandatory
+                    # answer stage and report that no fallback was used.
+                    answer_generation_succeeded = bool(
+                        answer_generation_attempted
+                        and not composer_result.fallback_used
+                        and str(composer_result.final_response_text or "").strip()
+                    )
+                if (
+                    answer_generation_succeeded
+                    and approved_context.knowledge_records
+                ):
+                    # A composer cannot self-certify grounding. Recheck its
+                    # separately-delimited answer at the branch boundary.
+                    answer_generation_succeeded = is_grounded_answer_text(
+                        str(composer_result.answer_response_text or ""),
+                        approved_context.knowledge_records,
+                    )
+                if answer_generation_succeeded:
+                    answer_delivery_text = str(
+                        composer_result.answer_response_text or ""
+                    ).strip()
+                writer_outcomes = [
+                    outcome
+                    for name, outcome in outcomes.items()
+                    if name != "answer_generation" and isinstance(outcome, dict)
+                ]
+                writer_generation_attempted = bool(writer_outcomes) or any(
+                    name != "answer_generation"
+                    for name in composer_result.used_tool_names
+                )
+                writer_generation_succeeded = any(
+                    bool(outcome.get("succeeded")) for outcome in writer_outcomes
+                )
+                if not writer_outcomes and writer_generation_attempted:
+                    writer_generation_succeeded = bool(
+                        composer_result.artifacts and not composer_result.fallback_used
+                    )
+                response = str(composer_result.final_response_text or "").strip()
+                if (
+                    approved_context.knowledge_records
+                    and answer_generation_succeeded
+                ):
+                    # Reconstruct the user-visible prose from the separately
+                    # validated answer boundary. Arbitrary combined composer
+                    # prose cannot smuggle unsupported personal claims.
+                    response = answer_delivery_text
+                    if composer_result.artifacts:
+                        response = "\n\n".join(
+                            [
+                                response,
+                                self.prompt_registry.message(
+                                    "generated_artifacts_available"
+                                ),
+                            ]
+                        )
+                if (
+                    approved_context.knowledge_records
+                    and not answer_generation_succeeded
+                ):
+                    response = ""
+                elif not answer_generation_succeeded:
+                    # Once the mandatory answer stage is known to have failed,
+                    # none of the composer's combined prose has an attributable
+                    # trust boundary.  Discard it before direct recovery.  A
+                    # successful artifact remains available through the typed
+                    # artifact payload and a code-owned status message below.
+                    response = ""
+            else:
+                response = ""
+
+            if degraded_certified_answer:
+                # The capable ANSWER task already produced the only prose that
+                # is certified not to depend on the unavailable durable store.
+                # Composer output is retained only for typed artifacts/actions.
+                answer_generation_attempted = True
+                answer_generation_succeeded = True
+                answer_delivery_text = degraded_certified_answer
+                response = degraded_certified_answer
+                if composer_result is not None and composer_result.artifacts:
+                    response = "\n\n".join(
+                        (
+                            response,
+                            self.prompt_registry.message(
+                                "generated_artifacts_available"
+                            ),
+                        )
+                    )
+
+            # The branch, rather than an arbitrary injected composer, owns the
+            # unconditional answer-stage invariant. Missing, failed, or blank
+            # answer output gets one direct ANSWER-model recovery attempt.
+            if not answer_generation_succeeded or not response:
+                answer_generation_attempted = True
+                recovery = self._generate_response(
+                    context,
+                    approved_context,
+                    prompt_ctx,
+                    sub_branch_supporting_prompt,
+                    merged_supporting_detail,
+                    rewritten_query=answer_recovery_scope,
+                )
+                recovered_answer = recovery.text.strip()
+                unavailable = self.prompt_registry.message(
+                    "answer_model_unavailable"
+                ).strip()
+                recovery_succeeded = recovery.model_succeeded
+                answer_generation_succeeded = recovery_succeeded
+                if recovery_succeeded:
+                    answer_delivery_text = recovered_answer
+                    response = recovered_answer
+                    if composer_result is not None and composer_result.artifacts:
+                        response = "\n\n".join(
+                            (
+                                response,
+                                self.prompt_registry.message(
+                                    "generated_artifacts_available"
+                                ),
+                            )
+                        )
+                    general_warnings.append("answer_generation_recovered")
+                elif recovered_answer and approved_context.knowledge_evidence:
+                    # SQL-approved evidence is a safer terminal response than a
+                    # generic model-unavailable string emitted by the composer.
+                    response = recovered_answer
+                    general_warnings.append("answer_grounded_evidence_fallback")
+                elif not response:
+                    response = recovered_answer or unavailable
+                    general_warnings.append("answer_model_unavailable")
         else:
-            composer_result = None
-            response = self._generate_response(
-                context,
-                approved_context,
-                prompt_ctx,
-                sub_branch_supporting_prompt,
-                merged_supporting_detail,
-            )
+            answer_generation_attempted = True
+            if degraded_certified_answer:
+                response = degraded_certified_answer
+                answer_generation_succeeded = True
+                answer_delivery_text = degraded_certified_answer
+            else:
+                generation = self._generate_response(
+                    context,
+                    approved_context,
+                    prompt_ctx,
+                    sub_branch_supporting_prompt,
+                    merged_supporting_detail,
+                )
+                response = generation.text
+                answer_generation_succeeded = generation.model_succeeded
+                if answer_generation_succeeded:
+                    answer_delivery_text = generation.text.strip()
         response_warnings = list(
             dict.fromkeys(
                 [
@@ -438,13 +728,32 @@ class GeneralResponseBranch:
         )
 
         completed_explicit_request_reason = ""
-        if is_explicit_email_message_request(context.rewritten_query):
+        semantic_action = semantic_action_from_internal_payload(
+            (
+                composer_result.semantic_action_decision
+                if composer_result is not None
+                else None
+            ),
+            canonical_query=context.rewritten_query,
+        )
+        if (
+            semantic_action.message.requests_message
+            and answer_generation_succeeded
+        ):
             completed_explicit_request_reason = "explicit_delivery_request_is_actionable"
         elif composer_result and composer_result.artifacts:
             completed_explicit_request_reason = "requested_artifact_was_created"
 
         if self.general_purpose_config is not None:
-            if completed_explicit_request_reason:
+            if blocked_by_context_dependency:
+                hitl_questions = []
+                hitl_result = {
+                    "triggered": False,
+                    "confidence": 1.0,
+                    "question_count": 0,
+                    "reason": "personal_context_safe_retry",
+                }
+            elif completed_explicit_request_reason:
                 hitl_questions = []
                 hitl_result = {
                     "triggered": False,
@@ -479,21 +788,58 @@ class GeneralResponseBranch:
         supporting_questions = hitl_questions
         
         topic_title = context.request.metadata.get("topic_title", self.general_purpose_config.general_response_default_topic_title if self.general_purpose_config else "General Conversation")
+
+        composition_payload = {
+            "answer_attempted": answer_generation_attempted,
+            "answer_succeeded": answer_generation_succeeded,
+            "writer_attempted": writer_generation_attempted,
+            "writer_succeeded": writer_generation_succeeded,
+        }
         
         try:
             with repository.transaction() as cursor:
-                if plan and plan.persistence_mode == PersistenceMode.APPEND_TO_EXISTING_TOPIC and plan.topic_id:
+                explicit_parent_topic_id = (
+                    context.last_qa_state.linked_topic_id
+                    if context.request.conversation_id
+                    and context.request.parent_hop_id
+                    and context.last_qa_state is not None
+                    else None
+                )
+                if explicit_parent_topic_id:
+                    topic_id = explicit_parent_topic_id
+                elif plan and plan.persistence_mode == PersistenceMode.APPEND_TO_EXISTING_TOPIC and plan.topic_id:
                     topic_id = plan.topic_id
                 elif plan and plan.persistence_mode == PersistenceMode.BRANCH_FROM_EXISTING_HOP and plan.topic_id:
                     topic_id = plan.topic_id
                 else:
-                    topic_id = repository.ensure_topic(
-                        cursor, user_id=context.request.user_id, title=topic_title
-                    )
+                    fresh_topic_creator = getattr(repository, "create_topic", None)
+                    if callable(fresh_topic_creator):
+                        topic_id = fresh_topic_creator(
+                            cursor,
+                            user_id=context.request.user_id,
+                            title=topic_title,
+                        )
+                    else:
+                        topic_id = repository.ensure_topic(
+                            cursor, user_id=context.request.user_id, title=topic_title
+                        )
                 
-                parent_hop_id = plan.parent_hop_id if plan else context.request.parent_hop_id
+                parent_hop_id = (
+                    context.request.parent_hop_id
+                    if explicit_parent_topic_id
+                    else (
+                        plan.parent_hop_id
+                        if plan
+                        else context.request.parent_hop_id
+                    )
+                )
 
-                entities = {}
+                entities = {
+                    "process_variant": resolved_sub_branch.value,
+                    "persistence_mode": resolved_persistence_mode.value,
+                }
+                if context.request.conversation_id:
+                    entities["conversation_id"] = context.request.conversation_id
                 if decision:
                     entities["sub_branch"] = decision.sub_branch.value
                 if composer_result:
@@ -545,7 +891,29 @@ class GeneralResponseBranch:
                 "conversation_hop_job_id": hop.outbox_job_id,
                 "outbox_job_ids": [hop.outbox_job_id],
             },
-            platform_payload={"artifacts": list(composer_result.artifacts)} if composer_result and composer_result.artifacts else {},
+            platform_payload={
+                **(
+                    {"artifacts": list(composer_result.artifacts)}
+                    if composer_result and composer_result.artifacts
+                    else {}
+                ),
+                **(
+                    {
+                        "semantic_action_decision": (
+                            composer_result.semantic_action_decision
+                        )
+                    }
+                    if composer_result
+                    and composer_result.semantic_action_decision
+                    else {}
+                ),
+                **(
+                    {"answer_generation_text": answer_delivery_text}
+                    if answer_delivery_text
+                    else {}
+                ),
+                "content_composition": composition_payload,
+            },
         )
 
     def _general_sub_branch_to_answer_mode(self, sub_branch: Any) -> AnswerMode:
@@ -561,6 +929,7 @@ class GeneralResponseBranch:
         return json.dumps(
             {
                 "knowledge_evidence": approved_context.knowledge_evidence,
+                "knowledge_records": approved_context.knowledge_records,
                 "reminder_context": approved_context.reminder_context,
             },
             ensure_ascii=False,
@@ -577,6 +946,154 @@ class GeneralResponseBranch:
             return AnswerMode.NEW_CONVERSATION
         return AnswerMode.FOLLOW_UP_CONVERSATION
 
+    def _authorize_degraded_personal_context(
+        self,
+        *,
+        context: PipelineContext,
+        unavailable_domains: set[str],
+    ) -> _DegradedContextAuthorization:
+        """Require a fast denial plus a capable-model answer certificate.
+
+        RETRIEVAL_VALIDATION can only provisionally deny dependency.  The
+        independently routed ANSWER task must then certify and supply the exact
+        context-free prose that may cross the response boundary.  Any missing,
+        malformed, low-confidence, or contradictory certificate fails closed.
+        No vocabulary or phrase table is used.
+        """
+
+        if self.llm is None:
+            return _DegradedContextAuthorization()
+
+        def validate(
+            payload: dict[str, Any],
+            *,
+            boolean_field: str,
+            answer_envelope: bool = False,
+        ) -> None:
+            if not isinstance(payload.get(boolean_field), bool):
+                raise StructuredOutputInvariantError(
+                    f"{boolean_field} must be boolean"
+                )
+            try:
+                confidence = float(payload.get("confidence"))
+            except (TypeError, ValueError) as exc:
+                raise StructuredOutputInvariantError(
+                    "confidence must be numeric"
+                ) from exc
+            if not 0.0 <= confidence <= 1.0:
+                raise StructuredOutputInvariantError(
+                    "confidence must be between zero and one"
+                )
+            if not str(payload.get("reason_summary") or "").strip():
+                raise StructuredOutputInvariantError(
+                    "reason_summary must be non-empty"
+                )
+            if answer_envelope:
+                answer_text = payload.get("answer_text")
+                if not isinstance(answer_text, str):
+                    raise StructuredOutputInvariantError(
+                        "answer_text must be a string"
+                    )
+                if bool(payload[boolean_field]) != bool(answer_text.strip()):
+                    raise StructuredOutputInvariantError(
+                        "answer_text must be non-empty exactly when the request "
+                        "is certified context-independent"
+                    )
+
+        def decide(
+            *,
+            stage: str,
+            boolean_field: str,
+            schema: dict[str, Any],
+            decision_contract: str,
+            task: LLMTask = LLMTask.RETRIEVAL_VALIDATION,
+            answer_envelope: bool = False,
+        ) -> dict[str, Any] | None:
+            try:
+                payload = self.llm.generate_json(
+                    task=task,
+                    system_prompt=self.prompt_registry.system(stage),
+                    user_prompt=self.prompt_registry.user(
+                        PromptContext(
+                            stage=stage,
+                            user_id=context.request.user_id,
+                            rewritten_query=context.rewritten_query,
+                            intent=context.intent.value,
+                            metadata=context.request.metadata,
+                            platform_context=context.request.platform_context,
+                            extra={
+                                "unavailable_context_domains": sorted(
+                                    unavailable_domains
+                                ),
+                                "decision_contract": decision_contract,
+                            },
+                            # These gates classify only the current request.
+                            # Earlier conversation is neither available context
+                            # nor evidence that the current request is safe.
+                            chat_history=[],
+                        )
+                    ),
+                    schema=schema,
+                    invariant_validator=lambda candidate: validate(
+                        candidate,
+                        boolean_field=boolean_field,
+                        answer_envelope=answer_envelope,
+                    ),
+                )
+                if is_structured_fallback(payload):
+                    return None
+                validate(
+                    payload,
+                    boolean_field=boolean_field,
+                    answer_envelope=answer_envelope,
+                )
+                return payload
+            except Exception:
+                return None
+
+        dependency = decide(
+            stage="personal_context_dependency",
+            boolean_field="requires_unavailable_context",
+            schema=_PERSONAL_CONTEXT_DEPENDENCY_SCHEMA,
+            decision_contract=(
+                "Determine whether completing the current request requires "
+                "information from any unavailable durable context domain. "
+                "Evaluate semantic dependency, not surface wording."
+            ),
+        )
+        if (
+            dependency is None
+            or bool(dependency["requires_unavailable_context"])
+            or float(dependency["confidence"])
+            < _PERSONAL_CONTEXT_CERTIFICATE_MIN_CONFIDENCE
+        ):
+            return _DegradedContextAuthorization()
+
+        certificate = decide(
+            stage="personal_context_degraded_answer",
+            boolean_field="answerable_without_unavailable_context",
+            schema=_PERSONAL_CONTEXT_DEGRADED_ANSWER_SCHEMA,
+            decision_contract=(
+                "Return the exact proposed user-facing answer only when the "
+                "complete current request can be answered using its supplied "
+                "content and general knowledge, with no fact, state, history, "
+                "target, or record from an unavailable durable context domain."
+            ),
+            task=LLMTask.ANSWER,
+            answer_envelope=True,
+        )
+        if (
+            certificate is None
+            or not bool(certificate["answerable_without_unavailable_context"])
+            or float(certificate["confidence"])
+            < _PERSONAL_CONTEXT_CERTIFICATE_MIN_CONFIDENCE
+        ):
+            return _DegradedContextAuthorization(answer_stage_attempted=True)
+        return _DegradedContextAuthorization(
+            certified_answer_text=str(certificate["answer_text"]).strip(),
+            answer_stage_attempted=True,
+        )
+
     def _generate_response(
         self,
         context: PipelineContext,
@@ -584,39 +1101,35 @@ class GeneralResponseBranch:
         prompt_ctx: SubBranchPromptContext,
         sub_branch_supporting_prompt: str,
         merged_supporting_detail: str,
-    ) -> str:
-        evidence = approved_context.knowledge_evidence
-        fallback = " ".join(evidence) if evidence else self.prompt_registry.message("answer_model_unavailable")
-        if self.llm is None:
-            return fallback
-        try:
-            response = self.llm.chat(
-                task=LLMTask.ANSWER,
-                system_prompt=self.prompt_registry.system("answer_generation"),
-                user_prompt=self.prompt_registry.user(
-                    PromptContext(
-                        stage="answer_generation",
-                        user_id=context.request.user_id,
-                        rewritten_query=context.rewritten_query,
-                        intent=context.intent.value,
-                        metadata=context.request.metadata,
-                        platform_context=context.request.platform_context,
-                        extra={
-                            "approved_conversation_history": approved_context.approved_conversation_history,
-                            "approved_knowledge_evidence": approved_context.knowledge_evidence,
-                            "approved_reminder_context": approved_context.reminder_context,
-                            "merged_supporting_detail": merged_supporting_detail,
-                            "sub_branch_supporting_prompt": sub_branch_supporting_prompt,
-                            "human_supporting_questions": [q.text for q in context.approved_conversation_context.human_supporting_questions] if context.approved_conversation_context else [],
-                            "reminder_supporting_questions": [q.text for q in context.approved_conversation_context.reminder_supporting_questions] if context.approved_conversation_context else [],
-                            "extracted_expected_response_types": [t.value for t in context.approved_conversation_context.extracted_expected_response_types] if context.approved_conversation_context else [],
-                        },
-                    )
-                ),
-            ).strip()
-        except Exception:
-            return fallback
-        return response or fallback
+        *,
+        rewritten_query: str | None = None,
+    ) -> AnswerGenerationOutcome:
+        answer_query = str(rewritten_query or context.rewritten_query).strip()
+        return generate_answer(
+            llm=self.llm,
+            prompt_registry=self.prompt_registry,
+            prompt_context=PromptContext(
+                stage="answer_generation",
+                user_id=context.request.user_id,
+                rewritten_query=answer_query,
+                intent=context.intent.value,
+                metadata=context.request.metadata,
+                platform_context=context.request.platform_context,
+                extra={
+                    "approved_conversation_history": approved_context.approved_conversation_history,
+                    "approved_knowledge_evidence": approved_context.knowledge_evidence,
+                    "approved_knowledge_records": approved_context.knowledge_records,
+                    "approved_reminder_context": approved_context.reminder_context,
+                    "merged_supporting_detail": merged_supporting_detail,
+                    "sub_branch_supporting_prompt": sub_branch_supporting_prompt,
+                    "human_supporting_questions": [q.text for q in context.approved_conversation_context.human_supporting_questions] if context.approved_conversation_context else [],
+                    "reminder_supporting_questions": [q.text for q in context.approved_conversation_context.reminder_supporting_questions] if context.approved_conversation_context else [],
+                    "extracted_expected_response_types": [t.value for t in context.approved_conversation_context.extracted_expected_response_types] if context.approved_conversation_context else [],
+                },
+            ),
+            approved_knowledge_records=approved_context.knowledge_records,
+            approved_knowledge_evidence=approved_context.knowledge_evidence,
+        )
 
 
 @dataclass
@@ -814,6 +1327,7 @@ class KnowledgeFactsBranch:
                     intent=Intent.KNOWLEDGE_FACTS.value,
                     response_type=ResponseType.SAFE_NOOP.value,
                     parent_hop_id=context.request.parent_hop_id,
+                    conversation_id=context.request.conversation_id,
                 )
                 return BranchResult(
                     response_type=ResponseType.KNOWLEDGE_ACTION,
@@ -862,6 +1376,7 @@ class KnowledgeFactsBranch:
             response_text=success_text,
             actions=executable_actions,
             parent_hop_id=context.request.parent_hop_id,
+            conversation_id=context.request.conversation_id,
         )
         
         if result.committed:
@@ -1006,6 +1521,7 @@ class ReminderBranch:
                     intent=Intent.REMINDER.value,
                     response_type=ResponseType.SAFE_NOOP.value,
                     parent_hop_id=context.request.parent_hop_id,
+                    conversation_id=context.request.conversation_id,
                 )
                 return BranchResult(
                     response_type=ResponseType.REMINDER_ACTION,
@@ -1046,6 +1562,7 @@ class ReminderBranch:
             response_text=success_text,
             actions=executable_actions,
             parent_hop_id=context.request.parent_hop_id,
+            conversation_id=context.request.conversation_id,
         )
         
         if result.committed:
@@ -1108,9 +1625,6 @@ class BranchRouter:
             context,
             getattr(branch, "prompt_registry", DEFAULT_PROMPT_REGISTRY),
         )
-        if context.intent is Intent.CLARIFICATION and reminder_reply_state is None:
-            return result
-
         # Successful mutation/general transactions normally create their hop
         # atomically. Verify that identity and ensure its durable outbox job
         # before allowing the branch to bypass fallback persistence.
@@ -1180,6 +1694,10 @@ class BranchRouter:
                     "question_source": result.clarification_question.source.value,
                     "purpose": result.clarification_question.purpose,
                     "confidence": result.clarification_question.confidence,
+                    "should_ask": result.clarification_question.should_ask,
+                    "expected_response_type": (
+                        result.clarification_question.expected_response_type.value
+                    ),
                 }
             )
         supporting_questions.extend(
@@ -1188,6 +1706,8 @@ class BranchRouter:
                 "question_source": question.source.value,
                 "purpose": question.purpose,
                 "confidence": question.confidence,
+                "should_ask": question.should_ask,
+                "expected_response_type": question.expected_response_type.value,
             }
             for question in result.human_supporting_questions
         )
@@ -1200,6 +1720,10 @@ class BranchRouter:
                     ),
                     "purpose": result.reminder_supporting_question.purpose,
                     "confidence": result.reminder_supporting_question.confidence,
+                    "should_ask": result.reminder_supporting_question.should_ask,
+                    "expected_response_type": (
+                        result.reminder_supporting_question.expected_response_type.value
+                    ),
                 }
             )
 
@@ -1229,6 +1753,7 @@ class BranchRouter:
             response_type=result.response_type.value,
             supporting_questions=supporting_questions,
             parent_hop_id=context.request.parent_hop_id,
+            conversation_id=context.request.conversation_id,
             entities={
                 "branch_outcome": {
                     "intent": context.intent.value,

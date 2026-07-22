@@ -7,14 +7,6 @@ through implementation code.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Mapping
-
-from .content_keywords import (
-    DOCUMENT_FILE_KEYWORDS,
-    EXCEL_FILE_KEYWORDS,
-    FILE_CREATION_VERB_KEYWORDS,
-    POWERPOINT_FILE_KEYWORDS,
-)
 from .contracts import Intent, ResponseType
 from .settings import KnowledgeChunkSettings, MutationPartialExecutionPolicy, TargetNotFoundPolicy, UnsupportedActionPolicy
 from .retrieval_policy import RETRIEVAL_PIPELINE_POLICY, RetrievalPipelinePolicy
@@ -38,6 +30,8 @@ class RetrievalConfig:
     semantic_weight: float = 1.0
     rerank_candidate_limit: int = RETRIEVAL_PIPELINE_POLICY.rrf_top_k
     conversation_min_confidence_score: float = 0.50
+    # Strict total active-row budget for an authoritative SQL recovery snapshot.
+    sql_fallback_candidate_limit: int = 200
     general_response_reminder_limit: int = 4
     general_response_reminder_statuses: tuple[str, ...] = ("scheduled", "notified")
 
@@ -53,6 +47,8 @@ class RetrievalConfig:
             raise ValueError(
                 "conversation_min_confidence_score must be in [0.0, 1.0]"
             )
+        if self.sql_fallback_candidate_limit <= 0:
+            raise ValueError("sql_fallback_candidate_limit budget must be positive")
 
 
 @dataclass(frozen=True)
@@ -66,11 +62,6 @@ class OutboxConfig:
 @dataclass(frozen=True)
 class AutoscanConfig:
     interval_seconds: int
-
-
-@dataclass(frozen=True)
-class ClassificationConfig:
-    intent_keywords: Mapping[str, tuple[str, ...]]
 
 
 @dataclass(frozen=True)
@@ -239,13 +230,6 @@ class GeneralPurposeConfig:
     content_composer_default_tool: str = "answer_generation"
     content_composer_fallback_tool: str = "answer_generation"
 
-    # Deterministic file-intent signals. A file tool requires at least one
-    # rewritten-query match from the verb list and exactly one file-type group.
-    file_creation_verb_keywords: tuple[str, ...] = FILE_CREATION_VERB_KEYWORDS
-    document_tool_signal_keywords: tuple[str, ...] = DOCUMENT_FILE_KEYWORDS
-    excel_tool_signal_keywords: tuple[str, ...] = EXCEL_FILE_KEYWORDS
-    pptx_tool_signal_keywords: tuple[str, ...] = POWERPOINT_FILE_KEYWORDS
-
     # HITL
     hitl_supporting_question_enabled: bool = True
     hitl_supporting_question_confidence_threshold: float = 0.72
@@ -301,7 +285,6 @@ class AssistantConfig:
     retrieval: RetrievalConfig
     outbox: OutboxConfig
     autoscan: AutoscanConfig
-    classification: ClassificationConfig
     reminder_resolver: ReminderTargetResolverConfig
     retrieval_validation: RetrievalValidationConfig
     knowledge_chunk_settings: KnowledgeChunkSettings = field(default_factory=KnowledgeChunkSettings)

@@ -22,13 +22,24 @@ from .contracts import (
 
 @dataclass
 class InMemoryLastQAStore:
-    _states: dict[str, LastQAState] = field(default_factory=dict)
+    _states: dict[tuple[str, str], LastQAState] = field(default_factory=dict)
 
-    def get(self, user_id: str) -> LastQAState | None:
-        return self._states.get(user_id)
+    @staticmethod
+    def _key(user_id: str, conversation_id: str | None) -> tuple[str, str]:
+        return (user_id, str(conversation_id or "").strip())
 
-    def save(self, user_id: str, state: LastQAState) -> None:
-        self._states[user_id] = state
+    def get(
+        self, user_id: str, conversation_id: str | None = None
+    ) -> LastQAState | None:
+        return self._states.get(self._key(user_id, conversation_id))
+
+    def save(
+        self,
+        user_id: str,
+        state: LastQAState,
+        conversation_id: str | None = None,
+    ) -> None:
+        self._states[self._key(user_id, conversation_id)] = state
 
 
 class DiskCacheLastQAStore:
@@ -52,17 +63,55 @@ class DiskCacheLastQAStore:
             )
             """
         )
+        # Keep the legacy user-only cache readable for callers which do not yet
+        # provide a conversation cursor.  Scoped clients use this composite-key
+        # table and can therefore keep independent drafts in multiple tabs.
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS last_qa_state_by_conversation (
+                user_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                PRIMARY KEY (user_id, conversation_id)
+            )
+            """
+        )
         self.connection.commit()
 
-    def get(self, user_id: str) -> LastQAState | None:
-        row = self.connection.execute(
-            "SELECT payload_json, expires_at FROM last_qa_state WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
+    def get(
+        self, user_id: str, conversation_id: str | None = None
+    ) -> LastQAState | None:
+        scope = str(conversation_id or "").strip()
+        if scope:
+            row = self.connection.execute(
+                """
+                SELECT payload_json, expires_at
+                FROM last_qa_state_by_conversation
+                WHERE user_id = ? AND conversation_id = ?
+                """,
+                (user_id, scope),
+            ).fetchone()
+        else:
+            row = self.connection.execute(
+                "SELECT payload_json, expires_at FROM last_qa_state WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
         if not row:
             return None
         if float(row[1]) < time.time():
-            self.connection.execute("DELETE FROM last_qa_state WHERE user_id = ?", (user_id,))
+            if scope:
+                self.connection.execute(
+                    """
+                    DELETE FROM last_qa_state_by_conversation
+                    WHERE user_id = ? AND conversation_id = ?
+                    """,
+                    (user_id, scope),
+                )
+            else:
+                self.connection.execute(
+                    "DELETE FROM last_qa_state WHERE user_id = ?", (user_id,)
+                )
             self.connection.commit()
             return None
         payload = json.loads(str(row[0]))
@@ -131,6 +180,33 @@ class DiskCacheLastQAStore:
                     if outbound.get("source_hop_id")
                     else None
                 ),
+                excluded_recipients=tuple(
+                    str(value)
+                    for value in (
+                        outbound.get("excluded_recipients")
+                        if isinstance(outbound.get("excluded_recipients"), list)
+                        else []
+                    )
+                    if str(value).strip()
+                ),
+                delivered_recipients=tuple(
+                    str(value)
+                    for value in (
+                        outbound.get("delivered_recipients")
+                        if isinstance(outbound.get("delivered_recipients"), list)
+                        else []
+                    )
+                    if str(value).strip()
+                ),
+                refused_recipients=tuple(
+                    str(value)
+                    for value in (
+                        outbound.get("refused_recipients")
+                        if isinstance(outbound.get("refused_recipients"), list)
+                        else []
+                    )
+                    if str(value).strip()
+                ),
             )
 
         return LastQAState(
@@ -160,7 +236,12 @@ class DiskCacheLastQAStore:
             outbound_state=outbound_state,
         )
 
-    def save(self, user_id: str, state: LastQAState) -> None:
+    def save(
+        self,
+        user_id: str,
+        state: LastQAState,
+        conversation_id: str | None = None,
+    ) -> None:
         from dataclasses import asdict
         
         payload = {
@@ -179,14 +260,30 @@ class DiskCacheLastQAStore:
                 asdict(state.outbound_state) if state.outbound_state else None
             ),
         }
-        self.connection.execute(
-            """
-            INSERT INTO last_qa_state (user_id, payload_json, expires_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                payload_json = excluded.payload_json,
-                expires_at = excluded.expires_at
-            """,
-            (user_id, json.dumps(payload), time.time() + self.ttl_seconds),
-        )
+        scope = str(conversation_id or "").strip()
+        serialized = json.dumps(payload)
+        expires_at = time.time() + self.ttl_seconds
+        if scope:
+            self.connection.execute(
+                """
+                INSERT INTO last_qa_state_by_conversation (
+                    user_id, conversation_id, payload_json, expires_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, conversation_id) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    expires_at = excluded.expires_at
+                """,
+                (user_id, scope, serialized, expires_at),
+            )
+        else:
+            self.connection.execute(
+                """
+                INSERT INTO last_qa_state (user_id, payload_json, expires_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    expires_at = excluded.expires_at
+                """,
+                (user_id, serialized, expires_at),
+            )
         self.connection.commit()

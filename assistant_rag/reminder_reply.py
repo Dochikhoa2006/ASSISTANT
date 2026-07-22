@@ -26,6 +26,43 @@ def reminder_notification_key(reminder_id: str, notification_id: str) -> str:
     return sha256(encoded).hexdigest()
 
 
+def reminder_reply_conversation_id(context: dict[str, Any]) -> str | None:
+    """Return the source hop's persisted UI conversation scope, if present."""
+
+    direct = _optional_text(context.get("conversation_id"))
+    if direct:
+        return direct
+    value = context.get("source_entities_json")
+    if isinstance(value, dict):
+        entities = value
+    else:
+        try:
+            decoded = json.loads(str(value or "{}"))
+        except (TypeError, ValueError):
+            decoded = {}
+        entities = decoded if isinstance(decoded, dict) else {}
+    return _optional_text(entities.get("conversation_id"))
+
+
+def save_reminder_reply_last_qa(
+    store: Any,
+    *,
+    user_id: str,
+    state: LastQAState,
+    conversation_id: str | None,
+) -> None:
+    """Save scoped state while supporting legacy injected Last-QA stores."""
+
+    try:
+        store.save(
+            user_id,
+            state,
+            conversation_id=conversation_id,
+        )
+    except TypeError:
+        store.save(user_id, state)
+
+
 def build_reminder_reply_context_index(
     *, repository: Any, user_id: str, notifications: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:

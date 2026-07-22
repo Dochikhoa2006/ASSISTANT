@@ -5,6 +5,7 @@ from typing import Any
 
 from assistant_rag.branches import BranchRouter, ClarificationBranch
 from assistant_rag.config import QuestionGenerationConfig
+from assistant_rag.database import SQLiteRepository
 from assistant_rag.contracts import (
     ChatRequest,
     ExpectedResponseType,
@@ -200,11 +201,14 @@ def test_identical_consecutive_clarification_is_safely_suppressed() -> None:
         }
     )
 
+    repository = SQLiteRepository.in_memory()
+    repository.initialize_schema()
     result = BranchRouter(
         {Intent.CLARIFICATION: StaticClarificationBranch(repeated)}
-    ).route(context, repository=object())
+    ).route(context, repository=repository)
 
     assert result.response_type is ResponseType.SAFE_NOOP
     assert result.clarification_question is None
     assert result.normal_response_text
     assert "clarification_repeat_suppressed" in result.warnings
+    assert result.linked_hop_id is not None

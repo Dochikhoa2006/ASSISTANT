@@ -7,7 +7,7 @@ import logging
 import os
 import re
 from dataclasses import replace
-from typing import Any
+from typing import Any, Callable
 
 import onnxruntime_genai as og
 from huggingface_hub import snapshot_download
@@ -16,6 +16,8 @@ from .llm import (
     LLMTask,
     ModelDecision,
     OllamaModelRouter,
+    StructuredOutputInvariantError,
+    _SCHEMA_FIRST_STRUCTURED_TASKS,
     _structured_attempt_plan,
     _structured_attempt_prompt,
     llm_trace_stage_name_for_prompt,
@@ -251,8 +253,10 @@ class ONNXLLMClient:
             if trace and trace._active_timers:
                 timer = trace._active_timers[-1]
                 timer.metadata["model"] = decision.model
-                timer.metadata["input_count"] = len(tokens)
-                timer.metadata["output_count"] = max(0, generator.token_count() - len(tokens))
+                timer.metadata["input_count"] = int(timer.metadata.get("input_count", 0)) + len(tokens)
+                timer.metadata["output_count"] = int(timer.metadata.get("output_count", 0)) + max(
+                    0, generator.token_count() - len(tokens)
+                )
                 timer.metadata["engine"] = "onnxruntime_genai"
                 timer.metadata["max_length"] = max_length
                 timer.metadata["num_predict"] = max_new_tokens
@@ -282,6 +286,7 @@ class ONNXLLMClient:
         schema: dict[str, Any],
         model_override: str | None = None,
         fallback_for: str | None = None,
+        invariant_validator: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         del fallback_for
         decision = self.router.decision_for_task(task)
@@ -295,21 +300,33 @@ class ONNXLLMClient:
             )
         retry_count = getattr(self.router.settings, f"json_retry_count_{task.value}", self.router.settings.structured_retry_count)
         total_attempts = retry_count + 1
-        attempt_plan = _structured_attempt_plan(total_attempts)
+        schema_first = task in _SCHEMA_FIRST_STRUCTURED_TASKS
+        attempt_plan = _structured_attempt_plan(
+            total_attempts,
+            schema_first=schema_first,
+        )
         attempt_errors: list[str] = []
         last_error: Exception | None = None
+        previous_invariant_failure = False
+        repair_hint = ""
 
         for attempt_index, attempt_mode in enumerate(attempt_plan, start=1):
+            if previous_invariant_failure and schema_first:
+                attempt_mode = "schema"
             try:
                 attempt_prompt = _structured_attempt_prompt(
                     user_prompt=user_prompt,
                     schema=schema,
                     mode=attempt_mode,
+                    is_retry=attempt_index > 1,
+                    repair_hint=repair_hint,
                 )
                 response = self._generate(task, system_prompt, attempt_prompt, decision)
                 payload = parse_json_object(response)
                 payload, normalized = normalize_structured_output(payload, schema)
                 validate_json_schema(payload, schema)
+                if invariant_validator is not None:
+                    invariant_validator(payload)
                 trace = current_trace()
                 if trace and trace._active_timers:
                     timer = trace._active_timers[-1]
@@ -321,10 +338,22 @@ class ONNXLLMClient:
                 self.last_error_by_task.pop(task, None)
                 return payload
             except Exception as exc:
-                GLOBAL_METRICS.increment("llm_json_parse_failures_total", task=task.value)
+                invariant_failure = isinstance(
+                    exc, StructuredOutputInvariantError
+                )
+                GLOBAL_METRICS.increment(
+                    (
+                        "llm_structured_invariant_failures_total"
+                        if invariant_failure
+                        else "llm_json_parse_failures_total"
+                    ),
+                    task=task.value,
+                )
                 last_error = exc
                 attempt_errors.append(f"attempt {attempt_index}/{len(attempt_plan)} [{attempt_mode}]: {type(exc).__name__}: {exc}")
                 self.last_error_by_task[task] = attempt_errors[-1]
+                previous_invariant_failure = invariant_failure
+                repair_hint = str(exc) if invariant_failure else ""
                 logger.debug(
                     "ONNX JSON generation failed on attempt %d/%d for task %s (mode: %s): %s",
                     attempt_index,

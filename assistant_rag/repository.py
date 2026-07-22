@@ -2,6 +2,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, Iterator, ContextManager
 from datetime import datetime
+import json
 import sqlite3
 from .contracts import *
 
@@ -20,6 +21,11 @@ class AssistantRepository(ABC):
 
     @abstractmethod
     def transaction(self) -> Iterator[sqlite3.Cursor]:
+        pass
+
+    @abstractmethod
+    def create_topic(self, cursor: sqlite3.Cursor, *, user_id: str, title: str, topic_summary: str='', state_summary: str='', entities: dict[str, Any] | None=None) -> str:
+        """Create a distinct active conversation topic without title reuse."""
         pass
 
     @abstractmethod
@@ -44,6 +50,114 @@ class AssistantRepository(ABC):
         keeps lightweight injected repositories usable outside durable SQL.
         """
         del cursor, user_id, hop_id, entities
+
+    @abstractmethod
+    def get_conversation_hop(self, *, user_id: str, hop_id: str) -> dict[str, Any]:
+        """Return one SQL-authoritative hop owned by ``user_id``."""
+        pass
+
+    def claim_conversation_scope(
+        self,
+        *,
+        user_id: str,
+        hop_id: str,
+        conversation_id: str,
+    ) -> bool:
+        """Bind a legacy unscoped hop/topic once, or validate its scope."""
+
+        del user_id, hop_id, conversation_id
+        return False
+
+    def list_conversations(
+        self,
+        *,
+        user_id: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """List durable UI conversation cursors owned by one user."""
+
+        del user_id, limit
+        return []
+
+    def load_conversation(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+    ) -> dict[str, Any]:
+        """Load the exact active branch transcript for one owned cursor."""
+
+        del user_id, conversation_id
+        return {}
+
+    def conversation_topic_for_write(
+        self,
+        cursor: Any,
+        *,
+        user_id: str,
+        title: str,
+        parent_hop_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> str:
+        """Resolve a write to its selected conversation, or create a fresh one."""
+
+        if parent_hop_id:
+            owned_loader = getattr(self, "_require_owned_conversation_hop", None)
+            if callable(owned_loader):
+                parent = owned_loader(
+                    cursor,
+                    user_id=user_id,
+                    hop_id=parent_hop_id,
+                    require_active_topic=True,
+                )
+                parent = dict(parent)
+            else:
+                parent = self.get_conversation_hop(
+                    user_id=user_id,
+                    hop_id=parent_hop_id,
+                )
+            if str(parent.get("topic_status") or "active") != "active":
+                raise ValueError("Active conversation hop not found for user and topic")
+            stored_entities = parent.get("entities_json")
+            try:
+                parsed_entities = (
+                    json.loads(str(stored_entities or "{}"))
+                    if not isinstance(stored_entities, dict)
+                    else stored_entities
+                )
+            except (TypeError, ValueError):
+                parsed_entities = {}
+            stored_conversation_id = str(
+                parsed_entities.get("conversation_id") or ""
+            ).strip() if isinstance(parsed_entities, dict) else ""
+            if not stored_conversation_id:
+                topic_entities = parent.get("topic_entities_json")
+                try:
+                    parsed_topic_entities = (
+                        json.loads(str(topic_entities or "{}"))
+                        if not isinstance(topic_entities, dict)
+                        else topic_entities
+                    )
+                except (TypeError, ValueError):
+                    parsed_topic_entities = {}
+                stored_conversation_id = str(
+                    parsed_topic_entities.get("conversation_id") or ""
+                ).strip() if isinstance(parsed_topic_entities, dict) else ""
+            if (
+                conversation_id
+                and stored_conversation_id
+                and stored_conversation_id != conversation_id
+            ):
+                raise ValueError("Conversation cursor does not match the selected hop")
+            return str(parent["topic_id"])
+        if conversation_id:
+            return self.create_topic(
+                cursor,
+                user_id=user_id,
+                title=title,
+                entities={"conversation_id": conversation_id},
+            )
+        return self.ensure_topic(cursor, user_id=user_id, title=title)
 
     @abstractmethod
     def scan_due_reminders(self, *, now_value: str, limit: int = 100) -> list[str]:
@@ -122,6 +236,18 @@ class AssistantRepository(ABC):
         pass
 
     @abstractmethod
+    def list_knowledge_recovery_candidates(
+        self,
+        *,
+        user_id: str,
+        limit: int,
+        before_created_at: str | None = None,
+        before_chunk_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read one bounded, active, owner-scoped authoritative SQL page."""
+        pass
+
+    @abstractmethod
     def restore_knowledge_chunk(self, *, user_id: str, chunk_id: str) -> str:
         pass
 
@@ -139,6 +265,17 @@ class AssistantRepository(ABC):
 
     @abstractmethod
     def get_generated_artifact(self, *, user_id: str, artifact_id: str, include_deleted: bool = False) -> dict[str, Any]:
+        pass
+
+    @abstractmethod
+    def list_generated_artifacts_for_hop(
+        self,
+        *,
+        user_id: str,
+        hop_id: str,
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
+        """List artifacts bound to one conversation hop owned by ``user_id``."""
         pass
 
     def bind_generated_artifacts(
@@ -168,6 +305,16 @@ class AssistantRepository(ABC):
         return {}
 
     @abstractmethod
+    def get_latest_platform_delivery_for_hop(
+        self,
+        *,
+        user_id: str,
+        hop_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the newest delivery bound to one owned conversation hop."""
+        pass
+
+    @abstractmethod
     def add_reminder(self, cursor: sqlite3.Cursor, *, user_id: str, source_topic_id: str | None, source_hop_id: str | None, reminder_time: str, raw_reminder: str, reminder_summary: str, subject: str, event_time: str | None=None, supporting_question: str | None=None, supporting_response: str | None=None, user_timezone: str = "UTC", original_time_text: str | None=None, recurrence_rule: str | None=None, recurrence_timezone: str | None=None, next_fire_time: str | None=None, parent_recurring_reminder_id: str | None=None) -> str:
         pass
 
@@ -184,7 +331,7 @@ class AssistantRepository(ABC):
         pass
 
     @abstractmethod
-    def record_action_audit_noop(self, *, user_id: str, topic_title: str, raw_user_query: str, rewritten_user_query: str, response_text: str, intent: str, response_type: str, parent_hop_id: str | None = None) -> RepositoryTransactionResult:
+    def record_action_audit_noop(self, *, user_id: str, topic_title: str, raw_user_query: str, rewritten_user_query: str, response_text: str, intent: str, response_type: str, parent_hop_id: str | None = None, conversation_id: str | None = None) -> RepositoryTransactionResult:
         pass
 
     def record_branch_outcome(
@@ -199,6 +346,7 @@ class AssistantRepository(ABC):
         response_type: str,
         supporting_questions: list[str | dict[str, Any]] | None = None,
         parent_hop_id: str | None = None,
+        conversation_id: str | None = None,
         entities: dict[str, Any] | None = None,
     ) -> RepositoryTransactionResult:
         """Persist a main-branch outcome that did not write its own audit hop.
@@ -210,11 +358,16 @@ class AssistantRepository(ABC):
 
         try:
             with self.transaction() as cursor:
-                topic_id = self.ensure_topic(
+                topic_id = self.conversation_topic_for_write(
                     cursor,
                     user_id=user_id,
                     title=topic_title,
+                    parent_hop_id=parent_hop_id,
+                    conversation_id=conversation_id,
                 )
+                hop_entities = dict(entities or {})
+                if conversation_id:
+                    hop_entities["conversation_id"] = conversation_id
                 hop = self.append_conversation_hop(
                     cursor,
                     topic_id=topic_id,
@@ -226,7 +379,7 @@ class AssistantRepository(ABC):
                     response_type=response_type,
                     supporting_questions=supporting_questions,
                     parent_hop_id=parent_hop_id,
-                    entities=entities,
+                    entities=hop_entities or None,
                 )
                 return RepositoryTransactionResult(
                     committed=True,
@@ -246,11 +399,11 @@ class AssistantRepository(ABC):
             )
 
     @abstractmethod
-    def transactional_knowledge_actions(self, *, user_id: str, topic_title: str, raw_user_query: str, rewritten_user_query: str, response_text: str, actions: list[ValidatedKnowledgeAction], parent_hop_id: str | None = None) -> RepositoryTransactionResult:
+    def transactional_knowledge_actions(self, *, user_id: str, topic_title: str, raw_user_query: str, rewritten_user_query: str, response_text: str, actions: list[ValidatedKnowledgeAction], parent_hop_id: str | None = None, conversation_id: str | None = None) -> RepositoryTransactionResult:
         pass
 
     @abstractmethod
-    def transactional_reminder_actions(self, *, user_id: str, topic_title: str, raw_user_query: str, rewritten_user_query: str, response_text: str, actions: list[ValidatedReminderAction], parent_hop_id: str | None = None) -> RepositoryTransactionResult:
+    def transactional_reminder_actions(self, *, user_id: str, topic_title: str, raw_user_query: str, rewritten_user_query: str, response_text: str, actions: list[ValidatedReminderAction], parent_hop_id: str | None = None, conversation_id: str | None = None) -> RepositoryTransactionResult:
         pass
 
     @abstractmethod

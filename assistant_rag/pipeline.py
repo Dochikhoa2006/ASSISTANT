@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import json
 from typing import Any, Literal
 from .bundler import ChatOutput, ResponseBundler
 from .classification import IntentClassifier, LastQAResolver, QueryRewriter
@@ -12,6 +13,8 @@ from .contracts import (
     ChatRequest,
     PipelineContext,
     ApprovedConversationContext,
+    ExpectedResponseType,
+    GeneratedQuestion,
     LastQAInteractionType,
     LastQAPath,
     LastQAResolution,
@@ -19,6 +22,7 @@ from .contracts import (
     OutboundMessageState,
     QuestionSource,
     RetrievalResult,
+    ResponseType,
 )
 from .last_qa import InMemoryLastQAStore
 from .platform import PlatformSelector
@@ -154,12 +158,25 @@ def _platform_response_for_supporting_answer(
     platform_action_query = (
         f"{prior_query}\nResolved required context: {current_answer}"
     )
+    platform_payload = dict(response.platform_payload)
+    # A semantic decision produced for the short answer alone cannot decide
+    # the now-resolved compound action. Force one fresh structured analysis of
+    # the resolver-approved prior request plus its bound answer.
+    platform_payload.pop("semantic_action_decision", None)
     return replace(
         response,
         last_qa_state=replace(
             response.last_qa_state,
             last_user_query=platform_action_query,
         ),
+        platform_payload={
+            **platform_payload,
+            # This field is created only after the authoritative Last-QA
+            # resolver binds the answer to one active supporting question.
+            # The platform parser may trust it without treating arbitrary
+            # addresses in message prose as delivery recipients.
+            "approved_resolved_recipients": [current_answer],
+        },
     )
 
 
@@ -169,6 +186,7 @@ def _rehydrate_outbound_artifacts(
     user_id: str,
     outbound_state: OutboundMessageState | None,
     current_artifacts: list[dict[str, Any]],
+    source_hop_id: str | None = None,
 ) -> list[dict[str, Any]]:
     by_id = {
         str(item.get("artifact_id") or ""): item
@@ -186,7 +204,450 @@ def _rehydrate_outbound_artifacts(
                 continue
             if isinstance(row, dict):
                 by_id[artifact_id] = dict(row)
+    hop_artifact_loader = getattr(
+        repository, "list_generated_artifacts_for_hop", None
+    )
+    if source_hop_id and callable(hop_artifact_loader):
+        try:
+            hop_artifacts = hop_artifact_loader(
+                user_id=user_id,
+                hop_id=source_hop_id,
+                include_deleted=False,
+            )
+        except TypeError:
+            hop_artifacts = hop_artifact_loader(
+                user_id=user_id,
+                hop_id=source_hop_id,
+            )
+        except Exception:
+            hop_artifacts = []
+        for item in _artifact_records(hop_artifacts):
+            artifact_id = str(item.get("artifact_id") or "")
+            if artifact_id:
+                by_id.setdefault(artifact_id, item)
     return list(by_id.values())
+
+
+def _last_qa_get(store: Any, request: ChatRequest) -> LastQAState | None:
+    """Read scoped state while retaining compatibility with injected stores."""
+
+    try:
+        return store.get(
+            request.user_id,
+            conversation_id=request.conversation_id,
+        )
+    except TypeError:
+        return store.get(request.user_id)
+
+
+def _last_qa_save(store: Any, request: ChatRequest, state: LastQAState) -> None:
+    """Persist scoped state while retaining compatibility with injected stores."""
+
+    try:
+        store.save(
+            request.user_id,
+            state,
+            conversation_id=request.conversation_id,
+        )
+    except TypeError:
+        store.save(request.user_id, state)
+
+
+def _json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return dict(decoded) if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+        return list(decoded) if isinstance(decoded, list) else []
+    return []
+
+
+def _outbound_state_from_mapping(
+    value: Any,
+    *,
+    source_topic_id: str | None,
+    source_hop_id: str | None,
+) -> OutboundMessageState | None:
+    payload = _json_mapping(value)
+    recipients_value = payload.get("recipients")
+    recipients = tuple(
+        dict.fromkeys(
+            str(item).strip()
+            for item in (
+                recipients_value
+                if isinstance(recipients_value, (list, tuple))
+                else [payload.get("recipient")]
+            )
+            if str(item or "").strip()
+        )
+    )
+    subject = str(payload.get("subject") or "").strip()
+    body = str(payload.get("body") or "").strip()
+    channel = str(payload.get("channel") or "").strip()
+    if not channel or not recipients or not subject or not body:
+        return None
+    raw_attachments = payload.get("attachments")
+    raw_attachments = (
+        list(raw_attachments)
+        if isinstance(raw_attachments, (list, tuple))
+        else []
+    )
+    attachments = _artifact_records(raw_attachments)
+    artifact_values = payload.get("artifact_ids")
+    artifact_ids = tuple(
+        dict.fromkeys(
+            [
+                str(item).strip()
+                for item in (
+                    artifact_values
+                    if isinstance(artifact_values, (list, tuple))
+                    else []
+                )
+                if str(item).strip()
+            ]
+            + [
+                str(item.get("artifact_id") or "").strip()
+                for item in attachments
+                if str(item.get("artifact_id") or "").strip()
+            ]
+            + [
+                str(item).strip()
+                for item in raw_attachments
+                if not isinstance(item, dict) and str(item).strip()
+            ]
+        )
+    )
+    filenames_value = payload.get("attachment_filenames")
+    filenames_by_id = {
+        str(item.get("artifact_id") or ""): str(item.get("filename") or "")
+        for item in attachments
+        if item.get("artifact_id")
+    }
+    explicit_filenames = [
+        str(item)
+        for item in (
+            filenames_value if isinstance(filenames_value, (list, tuple)) else []
+        )
+    ]
+    return OutboundMessageState(
+        channel=channel,
+        status=str(payload.get("status") or "draft_ready"),
+        recipients=recipients,
+        subject=subject,
+        body=body,
+        artifact_ids=artifact_ids,
+        attachment_filenames=tuple(
+            explicit_filenames[index]
+            if index < len(explicit_filenames)
+            else filenames_by_id.get(artifact_id, "")
+            for index, artifact_id in enumerate(artifact_ids)
+        ),
+        source_topic_id=(
+            str(payload.get("source_topic_id") or "").strip()
+            or source_topic_id
+        ),
+        source_hop_id=(
+            str(payload.get("source_hop_id") or "").strip()
+            or source_hop_id
+        ),
+        excluded_recipients=tuple(
+            str(item).strip()
+            for item in (
+                payload.get("excluded_recipients")
+                if isinstance(payload.get("excluded_recipients"), (list, tuple))
+                else []
+            )
+            if str(item).strip()
+        ),
+        delivered_recipients=tuple(
+            str(item).strip()
+            for item in (
+                payload.get("delivered_recipients")
+                if isinstance(payload.get("delivered_recipients"), (list, tuple))
+                else []
+            )
+            if str(item).strip()
+        ),
+        refused_recipients=tuple(
+            str(item).strip()
+            for item in (
+                payload.get("refused_recipients")
+                if isinstance(payload.get("refused_recipients"), (list, tuple))
+                else []
+            )
+            if str(item).strip()
+        ),
+    )
+
+
+def _generated_questions_from_hop(value: Any) -> list[GeneratedQuestion]:
+    questions: list[GeneratedQuestion] = []
+    for item in _json_list(value):
+        payload = item if isinstance(item, dict) else {"question_text": item}
+        text = str(
+            payload.get("text") or payload.get("question_text") or ""
+        ).strip()
+        if not text:
+            continue
+        try:
+            source = QuestionSource(
+                str(
+                    payload.get("source")
+                    or payload.get("question_source")
+                    or QuestionSource.HUMAN_SUPPORTING_QUESTION.value
+                )
+            )
+        except ValueError:
+            source = QuestionSource.HUMAN_SUPPORTING_QUESTION
+        try:
+            expected = ExpectedResponseType(
+                str(
+                    payload.get("expected_response_type")
+                    or ExpectedResponseType.UNKNOWN.value
+                )
+            )
+        except ValueError:
+            expected = ExpectedResponseType.UNKNOWN
+        questions.append(
+            GeneratedQuestion(
+                text=text,
+                source=source,
+                purpose=str(payload.get("purpose") or "continue_selected_conversation"),
+                confidence=float(payload.get("confidence", 1.0)),
+                should_ask=bool(payload.get("should_ask", True)),
+                expected_response_type=expected,
+            )
+        )
+    return questions
+
+
+def _outbound_state_from_owned_hop_lineage(
+    *, repository: AssistantRepository, user_id: str, hop: dict[str, Any]
+) -> OutboundMessageState | None:
+    """Restore the nearest durable envelope on the selected branch lineage."""
+
+    loader = getattr(repository, "get_conversation_hop", None)
+    delivery_loader = getattr(
+        repository, "get_latest_platform_delivery_for_hop", None
+    )
+    current = dict(hop)
+    selected_topic_id = str(current.get("topic_id") or "").strip()
+    seen: set[str] = set()
+    for _ in range(100):
+        hop_id = str(current.get("hop_id") or "").strip()
+        topic_id = str(current.get("topic_id") or "").strip()
+        if not hop_id or hop_id in seen or topic_id != selected_topic_id:
+            break
+        seen.add(hop_id)
+        entities = _json_mapping(current.get("entities_json"))
+        outbound_state = _outbound_state_from_mapping(
+            entities.get("outbound_state"),
+            source_topic_id=topic_id or None,
+            source_hop_id=hop_id or None,
+        )
+        if outbound_state is None and callable(delivery_loader):
+            try:
+                delivery = delivery_loader(user_id=user_id, hop_id=hop_id)
+            except Exception:
+                delivery = None
+            if isinstance(delivery, dict):
+                message = delivery.get("message")
+                if not isinstance(message, dict):
+                    message = _json_mapping(delivery.get("message_json"))
+                message = dict(message or {})
+                # Historical audit rows did not persist recipient polarity.
+                # Reinterpreting their source prose would reintroduce language
+                # hardcoding, while trusting an over-broad envelope could send
+                # to an excluded address. Only the structured envelope contract
+                # is eligible for restoration; legacy rows fail closed.
+                if "excluded_recipients" not in message:
+                    message = {}
+                message.setdefault("channel", delivery.get("channel"))
+                message.setdefault("status", delivery.get("status"))
+                if not message.get("recipients") and delivery.get("recipient"):
+                    message["recipients"] = [
+                        item.strip()
+                        for item in str(delivery.get("recipient") or "").split(",")
+                        if item.strip()
+                    ]
+                outbound_state = _outbound_state_from_mapping(
+                    message,
+                    source_topic_id=topic_id or None,
+                    source_hop_id=hop_id or None,
+                )
+        if outbound_state is not None:
+            return outbound_state
+        previous_hop_id = str(current.get("previous_hop_id") or "").strip()
+        if not previous_hop_id or not callable(loader):
+            break
+        try:
+            previous = loader(user_id=user_id, hop_id=previous_hop_id)
+        except Exception:
+            break
+        if not isinstance(previous, dict):
+            break
+        current = dict(previous)
+    return None
+
+
+def _last_qa_state_from_owned_hop(
+    *, repository: AssistantRepository, user_id: str, hop: dict[str, Any]
+) -> LastQAState:
+    hop_id = str(hop.get("hop_id") or "").strip()
+    topic_id = str(hop.get("topic_id") or "").strip()
+    entities = _json_mapping(hop.get("entities_json"))
+    outbound_state = _outbound_state_from_owned_hop_lineage(
+        repository=repository,
+        user_id=user_id,
+        hop=hop,
+    )
+    try:
+        response_type = ResponseType(str(hop.get("response_type") or "normal"))
+    except ValueError:
+        response_type = ResponseType.NORMAL
+    questions = _generated_questions_from_hop(
+        hop.get("supporting_questions_json")
+    )
+    clarification_question = next(
+        (
+            question
+            for question in questions
+            if question.source is QuestionSource.CLARIFICATION_QUESTION
+        ),
+        None,
+    )
+    reminder_question = next(
+        (
+            question
+            for question in questions
+            if question.source is QuestionSource.REMINDER_SUPPORTING_QUESTION
+        ),
+        None,
+    )
+    human_questions = [
+        question
+        for question in questions
+        if question.source is QuestionSource.HUMAN_SUPPORTING_QUESTION
+    ]
+    expected_response_type = next(
+        (
+            question.expected_response_type
+            for question in questions
+            if question.expected_response_type is not ExpectedResponseType.UNKNOWN
+        ),
+        None,
+    )
+    return LastQAState(
+        last_user_query=str(
+            hop.get("rewritten_user_query") or hop.get("summarized_user_query") or ""
+        ),
+        last_response=str(
+            entities.get("final_chat_text")
+            or hop.get("raw_response")
+            or hop.get("summarized_response")
+            or ""
+        ),
+        response_type=response_type,
+        supporting_questions=human_questions,
+        clarification_question=clarification_question,
+        reminder_supporting_question=reminder_question,
+        linked_topic_id=topic_id or None,
+        linked_hop_id=hop_id or None,
+        expected_response_type=expected_response_type,
+        outbound_state=outbound_state,
+    )
+
+
+def _merge_owned_hop_with_scoped_cache(
+    owned: LastQAState,
+    cached: LastQAState | None,
+) -> LastQAState:
+    """Restore volatile typed state only from the exact SQL-owned hop cache."""
+
+    if not (
+        cached is not None
+        and cached.linked_topic_id == owned.linked_topic_id
+        and cached.linked_hop_id == owned.linked_hop_id
+    ):
+        return owned
+    return replace(
+        owned,
+        supporting_questions=(
+            owned.supporting_questions or cached.supporting_questions
+        ),
+        clarification_question=(
+            owned.clarification_question or cached.clarification_question
+        ),
+        reminder_supporting_question=(
+            owned.reminder_supporting_question
+            or cached.reminder_supporting_question
+        ),
+        expected_response_type=(
+            owned.expected_response_type or cached.expected_response_type
+        ),
+        reminder_state=cached.reminder_state,
+        reminder_state_hash=cached.reminder_state_hash,
+        outbound_state=owned.outbound_state or cached.outbound_state,
+    )
+
+
+def _conversation_id_from_result(result: RetrievalResult) -> str:
+    entities = _json_mapping(result.payload.get("entities_json"))
+    return str(entities.get("conversation_id") or "").strip()
+
+
+def _outbound_state_payload(state: OutboundMessageState | None) -> dict[str, Any] | None:
+    if state is None:
+        return None
+    return {
+        "channel": state.channel,
+        "status": state.status,
+        "recipients": list(state.recipients),
+        "subject": state.subject,
+        "body": state.body,
+        "artifact_ids": list(state.artifact_ids),
+        "attachment_filenames": list(state.attachment_filenames),
+        "source_topic_id": state.source_topic_id,
+        "source_hop_id": state.source_hop_id,
+        "excluded_recipients": list(state.excluded_recipients),
+        "delivered_recipients": list(state.delivered_recipients),
+        "refused_recipients": list(state.refused_recipients),
+    }
+
+
+def _bundled_has_irreversible_effects(response: BundledResponse) -> bool:
+    payload = response.platform_payload or {}
+    delivery = payload.get("delivery")
+    status = str(
+        delivery.get("status") if isinstance(delivery, dict) else ""
+    ).strip()
+    return bool(
+        response.actions_committed
+        or response.conversation_hop_id
+        or payload.get("artifacts")
+        or status
+        in {
+            "sent",
+            "partial_failure",
+            "draft_saved",
+            "delivery_unknown",
+        }
+    )
 
 
 def _outbound_state_from_platform(
@@ -199,13 +660,18 @@ def _outbound_state_from_platform(
     delivery = platform_payload.get("delivery")
     delivery = delivery if isinstance(delivery, dict) else {}
     status = str(delivery.get("status") or "")
-    if status == "sent":
-        return None
     if status == "not_requested" or delivery.get("channel") in (None, "none"):
         return previous_state
 
     draft = platform_payload.get("draft")
     if not isinstance(draft, dict):
+        if status == "sent" and previous_state is not None:
+            return replace(
+                previous_state,
+                status="sent",
+                source_topic_id=source_topic_id or previous_state.source_topic_id,
+                source_hop_id=source_hop_id or previous_state.source_hop_id,
+            )
         return previous_state
     channel = str(delivery.get("channel") or draft.get("channel") or "").strip()
     recipients_value = draft.get("recipients")
@@ -225,6 +691,22 @@ def _outbound_state_from_platform(
         ]
         if refused_recipients:
             recipients = refused_recipients
+    delivered = delivery.get("delivered_recipients")
+    delivered_recipients = tuple(
+        str(value).strip()
+        for value in (
+            delivered if isinstance(delivered, (list, tuple)) else []
+        )
+        if str(value).strip()
+    )
+    refused = delivery.get("refused_recipients")
+    refused_recipients_state = tuple(
+        str(value).strip()
+        for value in (
+            refused if isinstance(refused, (list, tuple)) else []
+        )
+        if str(value).strip()
+    )
     subject = str(draft.get("subject") or "").strip()
     body = str(draft.get("body") or "").strip()
     if not channel or not recipients or not subject or not body:
@@ -255,6 +737,17 @@ def _outbound_state_from_platform(
         ),
         source_topic_id=source_topic_id,
         source_hop_id=source_hop_id,
+        excluded_recipients=tuple(
+            str(value).strip()
+            for value in (
+                draft.get("excluded_recipients")
+                if isinstance(draft.get("excluded_recipients"), (list, tuple))
+                else []
+            )
+            if str(value).strip()
+        ),
+        delivered_recipients=delivered_recipients,
+        refused_recipients=refused_recipients_state,
     )
 
 @dataclass
@@ -276,12 +769,138 @@ class AssistantPipeline:
         with StageTimer("rewrite"):
             rewritten = self.query_rewriter.rewrite(request.raw_query)
 
+        explicit_parent_state: LastQAState | None = None
+        explicit_parent_validated = False
+        if request.parent_hop_id:
+            owned_hop_loader = getattr(repository, "get_conversation_hop", None)
+            if callable(owned_hop_loader):
+                try:
+                    owned_hop = owned_hop_loader(
+                        user_id=request.user_id,
+                        hop_id=request.parent_hop_id,
+                    )
+                except Exception:
+                    owned_hop = None
+                if isinstance(owned_hop, dict):
+                    hop_entities = _json_mapping(owned_hop.get("entities_json"))
+                    stored_conversation_id = str(
+                        hop_entities.get("conversation_id") or ""
+                    ).strip()
+                    if not stored_conversation_id:
+                        topic_entities = _json_mapping(
+                            owned_hop.get("topic_entities_json")
+                        )
+                        stored_conversation_id = str(
+                            topic_entities.get("conversation_id") or ""
+                        ).strip()
+                    if str(owned_hop.get("topic_status") or "active") != "active":
+                        owned_hop = None
+                    elif (
+                        request.conversation_id
+                        and stored_conversation_id
+                        and stored_conversation_id != request.conversation_id
+                    ):
+                        owned_hop = None
+                    elif request.conversation_id and not stored_conversation_id:
+                        scope_claimer = getattr(
+                            repository, "claim_conversation_scope", None
+                        )
+                        try:
+                            claimed = bool(
+                                callable(scope_claimer)
+                                and scope_claimer(
+                                    user_id=request.user_id,
+                                    hop_id=request.parent_hop_id,
+                                    conversation_id=request.conversation_id,
+                                )
+                            )
+                        except Exception:
+                            claimed = False
+                        if claimed:
+                            stored_conversation_id = request.conversation_id
+                        else:
+                            owned_hop = None
+                if not isinstance(owned_hop, dict):
+                    response = BundledResponse(
+                        final_chat_text=(
+                            "The selected conversation could not be resumed because "
+                            "that conversation hop is unavailable for this user. No "
+                            "operation was executed."
+                        ),
+                        response_type=ResponseType.ERROR,
+                        last_qa_state=LastQAState(
+                            last_user_query=rewritten,
+                            last_response=(
+                                "The selected conversation hop is unavailable for this user."
+                            ),
+                            response_type=ResponseType.ERROR,
+                        ),
+                        conversation_id=request.conversation_id,
+                        warnings=["selected_conversation_hop_rejected"],
+                    )
+                    self.chat_output.emit(response)
+                    trace = current_trace()
+                    return replace(
+                        response,
+                        trace_summary=trace.summary() if trace else None,
+                    )
+                # Reminder replies and legacy clients may provide only the
+                # durable hop cursor.  Once ownership is proven, inherit that
+                # hop's stored conversation scope so cache, retrieval, writes,
+                # and the response all stay on the same UI conversation.
+                if not request.conversation_id and stored_conversation_id:
+                    request = replace(
+                        request,
+                        conversation_id=stored_conversation_id,
+                    )
+                explicit_parent_state = _last_qa_state_from_owned_hop(
+                    repository=repository,
+                    user_id=request.user_id,
+                    hop=owned_hop,
+                )
+                explicit_parent_validated = True
+
         # Last-QA is a compulsory stage for every request. Intent classification
         # happens only after the resolver has accepted, merged, or rejected the
         # latest state.
         with StageTimer("last_qa_resolution") as last_qa_stage:
-            last_state = self.last_qa_store.get(request.user_id)
+            cached_last_state = _last_qa_get(self.last_qa_store, request)
+            if explicit_parent_state is not None:
+                explicit_parent_state = _merge_owned_hop_with_scoped_cache(
+                    explicit_parent_state,
+                    cached_last_state,
+                )
+            last_state = explicit_parent_state or cached_last_state
             resolution = self.last_qa_resolver.resolve(request, rewritten, last_state)
+            if (
+                explicit_parent_validated
+                and explicit_parent_state is not None
+                and not resolution.is_authoritative_state
+                and resolution.interaction_type is None
+            ):
+                # Selecting a concrete, ownership-validated past hop is a
+                # stronger relationship signal than semantic similarity. It
+                # binds the turn to that hop without merging unrelated text.
+                resolution = LastQAResolution(
+                    path=LastQAPath.LATEST_CONTEXT_INTERACTION,
+                    rewritten_query=rewritten,
+                    state=explicit_parent_state,
+                    did_merge_query=False,
+                    skip_broad_retrieval=True,
+                    confidence=1.0,
+                    interaction_type=LastQAInteractionType.NORMAL_FOLLOW_UP,
+                    question_source=QuestionSource.NONE,
+                    linked_topic_id=explicit_parent_state.linked_topic_id,
+                    linked_hop_id=explicit_parent_state.linked_hop_id,
+                    source_topic_id=explicit_parent_state.linked_topic_id,
+                    source_hop_id=explicit_parent_state.linked_hop_id,
+                    is_authoritative_state=True,
+                    diagnostic_context={
+                        "relationship_source": "owned_explicit_parent_hop"
+                    },
+                    merge_reason="explicit_conversation_hop_selected",
+                    skip_reason="ownership_validated_explicit_parent",
+                )
             requires_active_link = bool(
                 resolution.skip_broad_retrieval
                 and resolution.interaction_type
@@ -290,7 +909,7 @@ class AssistantPipeline:
                     LastQAInteractionType.SUPPORTING_QUESTION_ANSWER,
                 }
             )
-            if requires_active_link:
+            if requires_active_link and not explicit_parent_validated:
                 active_link_validator = getattr(
                     repository, "is_active_conversation_link", None
                 )
@@ -391,6 +1010,13 @@ class AssistantPipeline:
                 )
             if not conversation_results:
                 GLOBAL_METRICS.increment("retrieval_empty_total", entity_type="conversation_hop")
+            if request.conversation_id:
+                conversation_results = [
+                    result
+                    for result in conversation_results
+                    if _conversation_id_from_result(result)
+                    == request.conversation_id
+                ]
             resolution = replace(resolution, state=None)
             if conversation_results:
                 approved_conversation_context = self.context_filter.filter_conversation_only(
@@ -523,6 +1149,9 @@ class AssistantPipeline:
                 chat_history=chat_history,
                 chat_history_source=chat_history_source,
                 previous_last_qa_state=last_state,
+                explicit_parent_hop_id=(
+                    request.parent_hop_id if explicit_parent_validated else None
+                ),
             )
 
     def _handle_with_chat_history(
@@ -540,6 +1169,7 @@ class AssistantPipeline:
         chat_history: list[dict[str, Any]],
         chat_history_source: Literal["conversation_retrieval", "last_qa"],
         previous_last_qa_state: LastQAState | None,
+        explicit_parent_hop_id: str | None = None,
     ) -> BundledResponse:
         with StageTimer("classification"):
             intent = self.classifier.classify(
@@ -596,13 +1226,33 @@ class AssistantPipeline:
             chroma = getattr(self.retriever, "chroma", None)
             outbox_config = getattr(self.config, "outbox", None)
             if outbox_job_ids and bm25 is not None and chroma is not None and outbox_config is not None:
-                processed_jobs = BackgroundIndexer(
-                    repository=repository,
-                    bm25=bm25,
-                    chroma=chroma,
-                    config=outbox_config,
-                ).process_job_ids(outbox_job_ids)
-                index_stage.metadata["sync_mode"] = "request_scoped"
+                try:
+                    processed_jobs = BackgroundIndexer(
+                        repository=repository,
+                        bm25=bm25,
+                        chroma=chroma,
+                        config=outbox_config,
+                    ).process_job_ids(outbox_job_ids)
+                    index_stage.metadata["sync_mode"] = "request_scoped"
+                except Exception as exc:
+                    # The branch transaction is already committed. Derived
+                    # cache failure must remain retryable/observable without
+                    # falsely reporting that the durable user operation failed.
+                    branch_result = replace(
+                        branch_result,
+                        warnings=list(
+                            dict.fromkeys(
+                                [
+                                    *branch_result.warnings,
+                                    "request_scoped_index_sync_failed",
+                                ]
+                            )
+                        ),
+                    )
+                    index_stage.metadata["sync_mode"] = (
+                        "request_scoped_degraded"
+                    )
+                    index_stage.metadata["sync_error"] = type(exc).__name__
             elif outbox_job_ids:
                 # Deterministic/unit-injected retrievers may intentionally have
                 # no derived stores. Keep the durable jobs pending for the
@@ -672,6 +1322,11 @@ class AssistantPipeline:
             user_id=request.user_id,
             outbound_state=active_outbound,
             current_artifacts=current_artifacts,
+            source_hop_id=(
+                active_outbound.source_hop_id
+                if active_outbound is not None
+                else explicit_parent_hop_id
+            ),
         )
         active_branch_question = _has_active_branch_question(bundled)
         platform_response = _platform_response_for_supporting_answer(
@@ -724,9 +1379,14 @@ class AssistantPipeline:
             else:
                 final_chat_text = bundled.final_chat_text
         previous_outbound_state = (
-            previous_last_qa_state.outbound_state
-            if previous_last_qa_state is not None
-            else None
+            resolution.state.outbound_state
+            if resolution.state is not None
+            and resolution.state.outbound_state is not None
+            else (
+                previous_last_qa_state.outbound_state
+                if previous_last_qa_state is not None
+                else None
+            )
         )
         outbound_state = _outbound_state_from_platform(
             platform_payload=platform_payload,
@@ -744,6 +1404,34 @@ class AssistantPipeline:
             ),
             platform_payload=platform_payload,
         )
+        # SQL remains the durable restoration source.  Cache the safe execution
+        # cursor on the owned hop so reopening a conversation survives Last-QA
+        # expiry or a process restart without storing credentials or file paths.
+        state_merger = getattr(repository, "merge_conversation_hop_entities", None)
+        if bundled.conversation_hop_id and callable(state_merger):
+            with StageTimer("conversation_execution_state_persistence"):
+                try:
+                    with repository.transaction() as cursor:
+                        state_merger(
+                            cursor,
+                            user_id=request.user_id,
+                            hop_id=bundled.conversation_hop_id,
+                            entities={
+                                **(
+                                    {"conversation_id": request.conversation_id}
+                                    if request.conversation_id
+                                    else {}
+                                ),
+                                "final_chat_text": final_chat_text,
+                                "outbound_state": _outbound_state_payload(
+                                    outbound_state
+                                ),
+                            },
+                        )
+                except Exception:
+                    GLOBAL_METRICS.increment(
+                        "conversation_execution_state_persistence_failures_total"
+                    )
         # Record delivery metadata separately from the conversation answer. The
         # record intentionally contains no credential, token, or attachment path.
         recorder = getattr(repository, "record_platform_delivery", None)
@@ -763,8 +1451,28 @@ class AssistantPipeline:
                     # Delivery history must not hide a completed send or response.
                     pass
         with StageTimer("last_qa_persistence"):
-            self.last_qa_store.save(request.user_id, bundled.last_qa_state)
+            try:
+                _last_qa_save(self.last_qa_store, request, bundled.last_qa_state)
+            except Exception:
+                if not _bundled_has_irreversible_effects(bundled):
+                    raise
+                bundled = replace(
+                    bundled,
+                    warnings=list(dict.fromkeys(
+                        [*bundled.warnings, "post_effect_last_qa_persistence_failed"]
+                    )),
+                )
         with StageTimer("chat_output"):
-            self.chat_output.emit(bundled)
+            try:
+                self.chat_output.emit(bundled)
+            except Exception:
+                if not _bundled_has_irreversible_effects(bundled):
+                    raise
+                bundled = replace(
+                    bundled,
+                    warnings=list(dict.fromkeys(
+                        [*bundled.warnings, "post_effect_chat_output_failed"]
+                    )),
+                )
         trace = current_trace()
         return replace(bundled, trace_summary=trace.summary() if trace else None)

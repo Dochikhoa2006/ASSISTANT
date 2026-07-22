@@ -82,13 +82,11 @@ def test_allow_missing_idempotency_key_true_keeps_compatibility_mode(
 
     assert response.status_code == 200
     assert len(pipeline.requests) == 1
-    assert pipeline.requests[0].metadata["warnings"] == [
-        "Mutation request had no idempotency_key; processed in compatibility mode."
-    ]
-    assert limiter.keys == ["chat:safety-user", "mutation:safety-user"]
+    assert "warnings" not in pipeline.requests[0].metadata
+    assert limiter.keys == ["chat:safety-user"]
 
 
-def test_allow_missing_idempotency_key_false_rejects_only_unkeyed_mutations(
+def test_allow_missing_idempotency_key_false_rejects_every_unkeyed_chat(
     monkeypatch,
 ) -> None:
     client, pipeline, limiter = _client(monkeypatch, allow_missing=False)
@@ -129,15 +127,12 @@ def test_allow_missing_idempotency_key_false_rejects_only_unkeyed_mutations(
     )
 
     assert rejected.status_code == 400
-    assert rejected.json()["detail"] == (
-        "idempotency_key is required for mutation requests"
-    )
+    assert rejected.json()["detail"] == "idempotency_key is required for chat requests"
     assert blank_key_rejected.status_code == 400
     assert blank_key_rejected.json() == rejected.json()
-    assert ordinary_chat.status_code == 200
+    assert ordinary_chat.status_code == 400
     assert keyed_mutation.status_code == 200
     assert [request.raw_query for request in pipeline.requests] == [
-        "What color is the daytime sky?",
         "Remember that Project Atlas uses PostgreSQL.",
     ]
     assert limiter.keys == [
@@ -145,5 +140,4 @@ def test_allow_missing_idempotency_key_false_rejects_only_unkeyed_mutations(
         "chat:safety-user",
         "chat:safety-user",
         "chat:safety-user",
-        "mutation:safety-user",
     ]

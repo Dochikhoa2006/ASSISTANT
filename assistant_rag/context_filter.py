@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from math import isfinite
 from typing import Any, Protocol, Literal
 
 from .contracts import (
@@ -27,6 +28,7 @@ class ApprovedContext:
     rejected_knowledge_ids: list[str]
     rejected_reminder_ids: list[str]
     rejected_conversation_ids: list[str]
+    knowledge_records: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ContextFilter(Protocol):
@@ -72,12 +74,24 @@ class HardRuleContextFilter:
         linked_topic_id: str | None = None,
     ) -> ApprovedContext:
         approved_knowledge: list[str] = []
+        approved_knowledge_records: list[dict[str, Any]] = []
         rejected_knowledge_ids: list[str] = []
         
         # Knowledge filtering
         seen_knowledge_ids: set[str] = set()
         for result in knowledge_results:
             payload = result.payload
+            if result.validation_status != "sql_validated":
+                rejected_knowledge_ids.append(result.entity_id)
+                continue
+            try:
+                rerank_score = float(result.rerank_score)
+            except (TypeError, ValueError):
+                rejected_knowledge_ids.append(result.entity_id)
+                continue
+            if not isfinite(rerank_score):
+                rejected_knowledge_ids.append(result.entity_id)
+                continue
             payload_user_id = payload.get("user_id")
             if payload_user_id != user_id:
                 rejected_knowledge_ids.append(result.entity_id)
@@ -91,7 +105,22 @@ class HardRuleContextFilter:
                 rejected_knowledge_ids.append(result.entity_id)
                 continue
             seen_knowledge_ids.add(result.entity_id)
-            approved_knowledge.append(str(payload.get("text", "")))
+            text = str(payload.get("text", "")).strip()
+            if not text:
+                rejected_knowledge_ids.append(result.entity_id)
+                continue
+            approved_knowledge.append(text)
+            approved_knowledge_records.append(
+                {
+                    "candidate_key": result.entity_id,
+                    "text": text,
+                    "version": payload.get("version"),
+                    "knowledge_topic_id": payload.get("knowledge_topic_id"),
+                    "source_id": payload.get("source_id"),
+                    "validation_status": result.validation_status,
+                    "rerank_score": rerank_score,
+                }
+            )
 
         # Reminder filtering
         approved_reminders: list[dict[str, Any]] = []
@@ -157,6 +186,7 @@ class HardRuleContextFilter:
             rejected_knowledge_ids=rejected_knowledge_ids,
             rejected_reminder_ids=rejected_reminder_ids,
             rejected_conversation_ids=rejected_conversation_ids,
+            knowledge_records=approved_knowledge_records,
         )
 
     def filter_conversation_only(

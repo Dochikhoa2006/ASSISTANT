@@ -18,7 +18,6 @@ from assistant_rag.contracts import (
 from assistant_rag.llm import OllamaIntentClassifier
 from assistant_rag.database import SQLiteRepository
 from assistant_rag.request_lifecycle import looks_destructive, looks_like_mutation
-from assistant_rag.request_policy import has_explicit_mutation_policy_signal
 
 
 READ_ONLY_CASES = (
@@ -65,19 +64,19 @@ def test_read_only_domain_queries_are_non_mutating_lifecycle_signals(
 ) -> None:
     request = ChatRequest(user_id="routing-user", raw_query=query)
 
-    assert not has_explicit_mutation_policy_signal(request, intent)
     assert not looks_like_mutation(request)
     assert not looks_destructive(request)
 
 
 @pytest.mark.parametrize(("intent", "query"), MUTATION_CASES)
-def test_explicit_mutation_requests_are_mutating_lifecycle_signals(
+def test_free_text_is_not_interpreted_by_the_request_lifecycle(
     intent: Intent,
     query: str,
 ) -> None:
     request = ChatRequest(user_id="routing-user", raw_query=query)
 
-    assert has_explicit_mutation_policy_signal(request, intent)
+    assert not looks_like_mutation(request)
+    assert not looks_destructive(request)
 
 
 class SelectedIntentLLM:
@@ -198,7 +197,8 @@ def test_verified_confirmation_remains_in_its_mutation_branch() -> None:
         metadata=metadata,
     )
 
-    assert has_explicit_mutation_policy_signal(request, Intent.KNOWLEDGE_FACTS)
+    assert looks_like_mutation(request)
+    assert looks_destructive(request)
 
 
 @pytest.mark.parametrize(
@@ -300,6 +300,5 @@ def test_injected_action_metadata_does_not_change_request_lifecycle_signals() ->
         },
     )
 
-    assert not has_explicit_mutation_policy_signal(request, Intent.KNOWLEDGE_FACTS)
     assert not looks_like_mutation(request)
     assert not looks_destructive(request)

@@ -43,6 +43,7 @@ from assistant_rag.pipeline import AssistantPipeline
 from assistant_rag.platform import PlatformSelector
 from assistant_rag.prompts import DEFAULT_PROMPT_REGISTRY
 from assistant_rag.reminder_reply import build_reminder_state, reminder_state_hash
+from assistant_rag.semantic_actions import grounded_semantic_action_from_payload
 
 
 def _last_qa_state() -> LastQAState:
@@ -626,6 +627,47 @@ def test_supporting_answer_resumes_deferred_platform_request() -> None:
         matched_question=question.text,
         is_authoritative_state=True,
     )
+    combined_query = (
+        "Send an email about release readiness.\n"
+        "Resolved required context: alex@example.com"
+    )
+    semantic = grounded_semantic_action_from_payload(
+        {
+            "message": {
+                "operation": "send",
+                "channel": "gmail",
+                "recipient_update": "replace",
+                "recipients": [
+                    {
+                        "value": "alex@example.com",
+                        "disposition": "include",
+                        "evidence": "alex@example.com",
+                    }
+                ],
+                "global_cancellation": False,
+                "authorization_evidence": ["Send an email"],
+                "cancellation_evidence": [],
+                "artifact_reference": "none",
+                "copy_revision": False,
+                "confidence": 0.99,
+            },
+            "file": {
+                "operation": "none",
+                "file_type": "none",
+                "authorization_evidence": [],
+                "type_evidence": [],
+                "confidence": 0.99,
+            },
+            "reason_summary": "resolved supporting answer",
+        },
+        canonical_query=combined_query,
+    )
+
+    class _SemanticAnalyzer:
+        def analyze(self, query: str, **_kwargs: Any):
+            assert query == combined_query
+            return semantic
+
     pipeline = AssistantPipeline(
         config=SimpleNamespace(
             context_filter=SimpleNamespace(
@@ -641,7 +683,10 @@ def test_supporting_answer_resumes_deferred_platform_request() -> None:
         classifier=_Classifier(Intent.GENERAL_RESPONSE),
         router=_Router(ResponseType.NORMAL),
         bundler=ResponseBundler(),
-        platform_selector=PlatformSelector(llm=None),
+        platform_selector=PlatformSelector(
+            llm=None,
+            semantic_analyzer=_SemanticAnalyzer(),  # type: ignore[arg-type]
+        ),
         chat_output=ChatOutput(),
     )
 

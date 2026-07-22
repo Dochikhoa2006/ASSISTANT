@@ -242,6 +242,28 @@ class ChatRequest:
     idempotency_key: Optional[str] = None
     confirmation_token: Optional[str] = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Appended for positional-call compatibility. It scopes volatile Last-QA
+    # state and semantic history so two tabs for the same authenticated user
+    # cannot borrow one another's pending action or recent exchange.
+    conversation_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        """Canonicalize cursor identifiers before hashing or repository use."""
+
+        object.__setattr__(self, "user_id", str(self.user_id or "").strip())
+        if not self.user_id:
+            raise ValueError("user_id must be a non-empty stable identity")
+        for field_name in (
+            "conversation_id",
+            "parent_hop_id",
+            "reminder_id",
+            "notification_id",
+            "idempotency_key",
+            "confirmation_token",
+        ):
+            value = getattr(self, field_name)
+            normalized = str(value).strip() if value is not None else ""
+            object.__setattr__(self, field_name, normalized or None)
 
 
 @dataclass(frozen=True)
@@ -261,6 +283,9 @@ class OutboundMessageState:
     attachment_filenames: tuple[str, ...] = field(default_factory=tuple)
     source_topic_id: Optional[str] = None
     source_hop_id: Optional[str] = None
+    excluded_recipients: tuple[str, ...] = field(default_factory=tuple)
+    delivered_recipients: tuple[str, ...] = field(default_factory=tuple)
+    refused_recipients: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass
@@ -726,6 +751,8 @@ class BundledResponse:
     actions_pending_confirmation: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     trace_summary: TraceSummary | None = None
+    # Appended for positional-call compatibility with earlier response fields.
+    conversation_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -885,6 +912,9 @@ class ContentComposerInput:
     sub_branch_supporting_prompt: str
     repository: Any | None = None
     merged_supporting_detail: str = ""
+    # SQL-hydrated, ownership-checked evidence with stable candidate identity.
+    # Kept alongside the legacy text list for injected-tool compatibility.
+    approved_knowledge_records: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -908,6 +938,12 @@ class ContentComposerResult:
     reason_summary: str
     content_warnings: tuple[str, ...]
     artifacts: tuple[dict[str, Any], ...] = ()
+    # Exact output of the mandatory answer model, kept separate from file-stage
+    # status text so outbound delivery never has to infer their boundary.
+    answer_response_text: str = ""
+    # Serialized, query-grounded semantic authorization shared with the
+    # post-bundling delivery enforcement boundary.
+    semantic_action_decision: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

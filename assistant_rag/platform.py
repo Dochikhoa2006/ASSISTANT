@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from email.message import EmailMessage
+from hashlib import sha256
 from pathlib import Path
 import imaplib
 import json
@@ -28,40 +29,19 @@ from .llm import (
     is_structured_fallback,
     validate_json_schema,
 )
-from .chat_history import CHAT_HISTORY_PROMPT_RULE, inject_chat_history
 from .prompts import DEFAULT_PROMPT_REGISTRY, PromptContext, PromptRegistry
+from .semantic_actions import (
+    SemanticActionAnalyzer,
+    SemanticActionDecision,
+    semantic_action_from_internal_payload,
+)
 
 
 logger = logging.getLogger(__name__)
 
 
-_CHANNELS = ("gmail", "zalo", "telegram")
-
-
-PLATFORM_CHANNEL_SELECTION_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["channel"],
-    "properties": {
-        "channel": {
-            "type": "string",
-            "enum": ["gmail", "zalo", "telegram", "none"],
-        },
-    },
-}
-
-
-PLATFORM_RECIPIENT_EXTRACTION_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["recipients"],
-    "properties": {
-        "recipients": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-    },
-}
+class DeliveryOutcomeUnknown(RuntimeError):
+    """A provider may have accepted an operation before transport failure."""
 
 
 OUTBOUND_REVISION_SCHEMA = {
@@ -79,46 +59,16 @@ OUTBOUND_REVISION_SCHEMA = {
 
 # A terminal period is ordinary sentence punctuation, not part of an address.
 # Do not reject otherwise-valid recipients written at the end of a sentence.
-_EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w+-])")
-_SEND_WORDS = re.compile(r"\b(send|deliver|email|mail|message|nhắn|gửi)\b", re.I)
-_DIRECT_SEND_WORDS = re.compile(r"\b(send|deliver|gửi)\b", re.I)
-_DO_NOT_SEND = re.compile(
-    r"\b(?:do\s+not|don't|not\s+to|without)\s+(?:send|deliver|email|mail|gửi)\b",
-    re.I,
-)
-_DRAFT_WORDS = re.compile(r"\b(compose|draft|write|prepare|soạn)\b", re.I)
-_EMAIL_MESSAGE_WORDS = re.compile(r"\b(?:gmail|email|mail|message)\b", re.I)
-_NON_EMAIL_CHANNEL_WORDS = re.compile(r"\b(?:zalo|telegram)\b", re.I)
-_DIRECT_EMAIL_VERB = re.compile(r"\b(?:email|mail)\s+(?:to\s+)?[\w.+-]+@", re.I)
-_EMAIL_OBJECT_DELIVERY = re.compile(
-    r"\b(?:email|mail)\b(?:"
-    r"\s+(?:it|this|that|them)\s+to\b"
-    r"|\s+(?:[\w'-]+\s+){0,6}\.?"
-    r"(?:update|answer|response|message|file|document|workbook|spreadsheet|worksheet|pdf|"
-    r"report|presentation|deck|slides|powerpoint|excel|xlsx|pptx|docx)"
-    r"\s+to\b)",
-    re.I,
-)
-_FILE_DELIVERY_WORDS = re.compile(
-    r"\b(?:file|attachment|document|report|excel|spreadsheet|workbook|worksheet|xlsx|"
-    r"pdf|powerpoint|presentation|deck|slides|pptx|docx)\b",
-    re.I,
+_EMAIL_ADDRESS_PATTERN = r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"
+_EMAIL = re.compile(
+    rf"(?<![\w.+-]){_EMAIL_ADDRESS_PATTERN}(?![\w+-])"
 )
 _SUBJECT_LINE = re.compile(r"^\s*subject\s*:\s*(.+?)\s*$", re.I | re.M)
-_BUNDLED_RECIPIENT_LINE = re.compile(
-    r"^\s*(?:to|cc|bcc|recipients?)\s*:\s*(.*?)\s*$",
-    re.I | re.M,
-)
 _BUNDLED_ENVELOPE_LINE = re.compile(
     r"^\s*(?:to|cc|bcc|from|recipients?|subject)\s*:\s*.*$",
     re.I,
 )
 _EMAIL_SALUTATION = re.compile(r"^\s*(?:dear|hello|hi)\b", re.I | re.M)
-_SAVE_GMAIL_DRAFT = re.compile(
-    r"\b(?:save|store|create|add|put)\b[\s\w'-]{0,48}\b(?:gmail(?:'s)?\s+)?drafts?\b"
-    r"|\b(?:gmail(?:'s)?\s+)?drafts?\b[\s\w'-]{0,32}\b(?:save|store|create|add|put)\b",
-    re.I,
-)
 
 
 class PlatformFormatter(Protocol):
@@ -174,28 +124,117 @@ def _channel_message_recipients(channel: str, payload: dict[str, Any]) -> list[s
     return _recipient_identifiers(payload.get("recipients") or payload.get("recipient"))
 
 
-def _gmail_recipient_candidates(text: str) -> list[str]:
-    """Extract addresses only from explicit recipient clauses in the request."""
-    recipients: list[str] = []
-    seen: set[str] = set()
-    clause_pattern = re.compile(
-        r"\b(?:to|cc|bcc|recipient(?:s)?\s*(?:are|:)?|email(?:s)?(?:\s+to|\s*:|\s+))\s+"
-        r"(.+?)(?=\b(?:to|cc|bcc|using|via|with|from|subject|body|username|app\s+password|credential)\b|\.(?:\s|$)|\n|$)",
-        re.I | re.S,
+def _answer_generation_failed(response: BundledResponse) -> bool:
+    payload = response.platform_payload
+    composition = payload.get("content_composition") if isinstance(payload, dict) else None
+    return bool(
+        isinstance(composition, dict)
+        and composition.get("answer_succeeded") is False
     )
-    for match in clause_pattern.finditer(text):
-        for email in _recipient_emails(match.group(1)):
-            key = email.casefold()
-            if key not in seen:
-                seen.add(key)
-                recipients.append(email)
-    if recipients:
-        return recipients
-    # With no credential language, email addresses in an explicit Gmail
-    # delivery request are safe fallback recipient candidates. The selector
-    # has already established that this is a delivery operation.
-    if not re.search(r"\b(?:username|app\s+password|credential)\b", text, re.I):
-        return _recipient_emails(text)
+
+
+def _composed_email_envelope(
+    response: BundledResponse,
+) -> tuple[str, str] | None:
+    """Return valid answer-stage email copy, excluding delivery meta prose."""
+    structured_subject = _clean(_bundled_message_value(response, "subject"))
+    structured_body = _clean(_bundled_message_value(response, "body"))
+    if (
+        structured_subject
+        and structured_body
+    ):
+        return structured_subject, structured_body
+
+    text = _answer_generation_text(response)
+    subject_match = _SUBJECT_LINE.search(text)
+    if not subject_match:
+        return None
+    subject = _clean(subject_match.group(1))
+    body = _body_from_bundled_response(text, response.platform_payload.get("artifacts"))
+    if not subject or not body:
+        return None
+    return subject, body
+
+
+def _artifact_type(item: dict[str, Any]) -> str:
+    explicit = _clean(item.get("file_type")).casefold().lstrip(".")
+    if explicit:
+        return explicit
+    return Path(_clean(item.get("filename"))).suffix.casefold().lstrip(".")
+
+
+def _dedupe_artifact_ids(
+    artifact_ids: list[str],
+    artifacts_by_id: dict[str, dict[str, Any]],
+) -> list[str]:
+    selected: list[str] = []
+    seen: set[str] = set()
+    for artifact_id in artifact_ids:
+        item = artifacts_by_id.get(artifact_id)
+        if item is None:
+            continue
+        identity = (
+            _clean(item.get("storage_path")).casefold()
+            or _clean(item.get("storage_url")).casefold()
+            or f"{_clean(item.get('filename')).casefold()}:{_artifact_type(item)}"
+            or artifact_id.casefold()
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        selected.append(artifact_id)
+    return selected
+
+
+def _referenced_artifact_ids(
+    *,
+    semantic_decision: SemanticActionDecision,
+    artifacts_by_id: dict[str, dict[str, Any]],
+    current_ids: list[str],
+    new_artifact_ids: list[str],
+) -> list[str] | None:
+    """Resolve a model-classified artifact reference against validated IDs."""
+    reference = semantic_decision.message.artifact_reference
+    if reference == "none":
+        return None
+    requested_type = semantic_decision.file.file_type
+
+    def relevant(artifact_id: str) -> bool:
+        item = artifacts_by_id.get(artifact_id)
+        return bool(
+            item is not None
+            and (
+                requested_type == "none"
+                or _artifact_type(item) == requested_type
+            )
+        )
+
+    generated = [artifact_id for artifact_id in new_artifact_ids if relevant(artifact_id)]
+    if reference == "newly_created":
+        return _dedupe_artifact_ids(generated[-1:], artifacts_by_id)
+
+    if reference == "current":
+        current = [artifact_id for artifact_id in current_ids if relevant(artifact_id)]
+        return _dedupe_artifact_ids(current, artifacts_by_id)
+
+    if generated and semantic_decision.file.operation == "create":
+        return _dedupe_artifact_ids([generated[-1]], artifacts_by_id)
+
+    current = [artifact_id for artifact_id in current_ids if relevant(artifact_id)]
+    if current:
+        return _dedupe_artifact_ids(current, artifacts_by_id)
+
+    new_keys = set(new_artifact_ids)
+    prior = [
+        artifact_id
+        for artifact_id in artifacts_by_id
+        if artifact_id not in new_keys and relevant(artifact_id)
+    ]
+    if prior:
+        return _dedupe_artifact_ids([prior[-1]], artifacts_by_id)
+
+    if generated:
+        return _dedupe_artifact_ids([generated[-1]], artifacts_by_id)
     return []
 
 
@@ -219,19 +258,22 @@ def _bundled_message_value(response: BundledResponse, field_name: str) -> Any:
     return None
 
 
+def _answer_generation_text(response: BundledResponse) -> str:
+    """Return the typed answer-stage output, with legacy bundle fallback."""
+    payload = response.platform_payload
+    if isinstance(payload, dict):
+        answer_text = _clean(payload.get("answer_generation_text"))
+        if answer_text:
+            return answer_text
+    return response.final_chat_text or ""
+
+
 def _bundled_gmail_recipient_candidates(response: BundledResponse) -> list[str]:
-    """Extract only composer-declared envelope recipients, never body mentions."""
-    recipients = _recipient_emails(
+    """Read only typed composer envelope fields, never prose body mentions."""
+    return _recipient_emails(
         _bundled_message_value(response, "recipients")
         or _bundled_message_value(response, "recipient")
     )
-    seen = {recipient.casefold() for recipient in recipients}
-    for match in _BUNDLED_RECIPIENT_LINE.finditer(response.final_chat_text or ""):
-        for recipient in _recipient_emails(match.group(1)):
-            if recipient.casefold() not in seen:
-                seen.add(recipient.casefold())
-                recipients.append(recipient)
-    return recipients
 
 
 def _prioritized_approved_recipients(
@@ -257,39 +299,6 @@ def _prioritized_approved_recipients(
     return recipients
 
 
-def is_explicit_email_message_request(text: str) -> bool:
-    """Recognize a request to prepare or send an email with stated recipients.
-
-    This deliberately requires both a real email address and message-writing
-    language. It does not route ordinary questions that merely mention an
-    address, and it never decides whether a message may be sent.
-    """
-    has_message_action = bool(
-        (_DRAFT_WORDS.search(text) or _DIRECT_SEND_WORDS.search(text))
-        and _EMAIL_MESSAGE_WORDS.search(text)
-    )
-    has_file_delivery_action = bool(_DIRECT_SEND_WORDS.search(text) and _FILE_DELIVERY_WORDS.search(text))
-    return bool(
-        _recipient_emails(text)
-        and (
-            has_message_action
-            or has_file_delivery_action
-            or _DIRECT_EMAIL_VERB.search(text)
-            or _EMAIL_OBJECT_DELIVERY.search(text)
-        )
-    )
-
-
-def _requests_gmail_draft_save(text: str) -> bool:
-    """Return whether the user explicitly authorized saving to Gmail Drafts.
-
-    Writing or drafting an email is local preparation. Persisting it to a
-    provider mailbox is a separate external action and must be requested
-    directly, even when Gmail credentials are available in the UI.
-    """
-    return bool(_SAVE_GMAIL_DRAFT.search(text))
-
-
 def _subject_from_bundled_response(text: str) -> str:
     match = _SUBJECT_LINE.search(text or "")
     if match:
@@ -312,24 +321,9 @@ def _body_from_bundled_response(
     text: str,
     artifacts: Any = None,
 ) -> str:
-    """Return authored message copy without composer-owned artifact notices."""
+    """Return all authored message copy while removing only envelope syntax."""
+    del artifacts
     response = _clean(text)
-    artifact_filenames = {
-        _clean(item.get("filename"))
-        for item in (artifacts or [])
-        if isinstance(item, dict) and _clean(item.get("filename"))
-    }
-    if artifact_filenames:
-        paragraphs = re.split(r"\n\s*\n", response)
-        while paragraphs:
-            trailing = _clean(paragraphs[-1])
-            if not (
-                trailing.casefold().startswith("created ")
-                and any(filename in trailing for filename in artifact_filenames)
-            ):
-                break
-            paragraphs.pop()
-        response = "\n\n".join(paragraphs).strip()
     subject = _SUBJECT_LINE.search(response)
     if subject:
         response = response[subject.end():].strip()
@@ -339,9 +333,6 @@ def _body_from_bundled_response(
         if not _BUNDLED_ENVELOPE_LINE.match(line)
     ).strip()
     response = re.sub(r"\n{3,}", "\n\n", response)
-    salutation = _EMAIL_SALUTATION.search(response)
-    if salutation:
-        return response[salutation.start():].strip()
     return response
 
 
@@ -425,7 +416,12 @@ class GmailSender:
         message = self._email_message(payload, username, recipients)
         with smtplib.SMTP_SSL(self.host, self.port, timeout=self.timeout_seconds) as client:
             client.login(username, app_password)
-            refused = client.send_message(message)
+            try:
+                refused = client.send_message(message)
+            except (TimeoutError, OSError, smtplib.SMTPServerDisconnected) as exc:
+                raise DeliveryOutcomeUnknown(
+                    "Gmail delivery acknowledgement was not received"
+                ) from exc
         if refused:
             refused_keys = {str(item).casefold() for item in refused}
             delivered = [item for item in recipients if item.casefold() not in refused_keys]
@@ -462,12 +458,17 @@ class GmailSender:
             )
             client.login(username, app_password)
             mailbox = self._resolve_draft_mailbox(client)
-            status, _ = client.append(
-                mailbox,
-                "(\\Draft)",
-                imaplib.Time2Internaldate(time.time()),
-                message.as_bytes(),
-            )
+            try:
+                status, _ = client.append(
+                    mailbox,
+                    "(\\Draft)",
+                    imaplib.Time2Internaldate(time.time()),
+                    message.as_bytes(),
+                )
+            except (TimeoutError, OSError) as exc:
+                raise DeliveryOutcomeUnknown(
+                    "Gmail draft acknowledgement was not received"
+                ) from exc
             if _clean(status).upper() != "OK":
                 raise RuntimeError("Gmail rejected the draft append operation.")
         finally:
@@ -493,6 +494,12 @@ class GmailSender:
         message["From"] = username
         message["To"] = ", ".join(recipients)
         message["Subject"] = payload["subject"]
+        dispatch_id = _clean(payload.get("dispatch_id"))
+        if dispatch_id:
+            domain = username.rsplit("@", 1)[-1] if "@" in username else "assistant.local"
+            message["Message-ID"] = (
+                f"<assistant-{sha256(dispatch_id.encode('utf-8')).hexdigest()[:32]}@{domain}>"
+            )
         message.set_content(payload["body"])
         for artifact in attachments:
             path = Path(artifact["storage_path"])
@@ -571,11 +578,29 @@ class PlatformSelector:
     """
 
     llm: LLMClient | None = None
+    semantic_analyzer: SemanticActionAnalyzer | None = None
     prompt_registry: PromptRegistry = field(default_factory=lambda: DEFAULT_PROMPT_REGISTRY)
     formatters: dict[str, PlatformFormatter] = field(default_factory=dict)
     senders: dict[str, DeliverySender] = field(default_factory=lambda: {
         "gmail": GmailSender(), "telegram": TelegramSender(), "zalo": ZaloSender(),
     })
+
+    def __post_init__(self) -> None:
+        if self.semantic_analyzer is None and self.llm is not None:
+            self.semantic_analyzer = SemanticActionAnalyzer(llm=self.llm)
+
+    def _semantic_decision(
+        self,
+        response: BundledResponse,
+        rewritten_query: str,
+    ) -> SemanticActionDecision:
+        decision = semantic_action_from_internal_payload(
+            (response.platform_payload or {}).get("semantic_action_decision"),
+            canonical_query=rewritten_query,
+        )
+        if not decision.grounded and self.semantic_analyzer is not None:
+            decision = self.semantic_analyzer.analyze(rewritten_query)
+        return decision
 
     def register(self, channel: str, formatter: PlatformFormatter) -> None:
         self.formatters[channel] = formatter
@@ -584,6 +609,18 @@ class PlatformSelector:
         base = dict(response.platform_payload)
         context = request.platform_context or {}
         rewritten_query = response.last_qa_state.last_user_query
+        if _answer_generation_failed(response):
+            base["platform_selection"] = {
+                "channel": "none",
+                "confidence": 1.0,
+                "source": "safe_fallback_answer_generation_failed",
+            }
+            return self._delivery_hold(
+                base,
+                "No message was sent or drafted because answer composition did not complete successfully.",
+                channel="none",
+                status="failed",
+            )
         if response.response_type is ResponseType.ERROR:
             base["platform_selection"] = {
                 "channel": "none",
@@ -591,7 +628,9 @@ class PlatformSelector:
                 "source": "safe_fallback_error_response",
             }
             return self._hitl_passthrough(base, response)
-        selection = self._choose_channel(rewritten_query)
+        semantic_decision = self._semantic_decision(response, rewritten_query)
+        base["semantic_action_decision"] = semantic_decision.to_payload()
+        selection = self._choose_channel(semantic_decision)
         channel = selection["channel"]
         base["platform_selection"] = selection
         if channel == "none":
@@ -616,12 +655,15 @@ class PlatformSelector:
             channel,
             response,
             rewritten_query,
+            semantic_decision=semantic_decision,
+            dispatch_id=request.idempotency_key,
         )
         return self._complete_delivery(
             base,
             message=message,
             context=context,
             rewritten_query=rewritten_query,
+            semantic_decision=semantic_decision,
         )
 
     def select_with_outbound_context(
@@ -639,11 +681,41 @@ class PlatformSelector:
             return self.select(response, request)
 
         base = dict(response.platform_payload)
+        if _answer_generation_failed(response):
+            base["platform_selection"] = {
+                "channel": outbound_state.channel,
+                "confidence": 1.0,
+                "source": "safe_fallback_answer_generation_failed",
+            }
+            return self._delivery_hold(
+                base,
+                "No message was sent or drafted because answer composition did not complete successfully.",
+                channel=outbound_state.channel,
+                status="failed",
+            )
         base["platform_selection"] = {
             "channel": outbound_state.channel,
             "confidence": 1.0,
             "source": "authoritative_outbound_last_qa",
         }
+        rewritten_query = response.last_qa_state.last_user_query
+        semantic_decision = self._semantic_decision(response, rewritten_query)
+        base["semantic_action_decision"] = semantic_decision.to_payload()
+        if outbound_action in {
+            OutboundFollowUpAction.SEND,
+            OutboundFollowUpAction.REVISE_AND_SEND,
+        } and not semantic_decision.message.authorizes_send:
+            return self._delivery_hold(
+                base,
+                "The active message was not sent because this turn did not contain a current, explicit send instruction.",
+                channel=outbound_state.channel,
+                draft=self._message_from_outbound_state(
+                    outbound_state,
+                    artifacts=list(available_artifacts or []),
+                    mode="draft",
+                ),
+                status="pending_review",
+            )
         artifacts = list(available_artifacts or [])
         message = self._message_from_outbound_state(
             outbound_state,
@@ -658,15 +730,25 @@ class PlatformSelector:
                 else "draft"
             ),
         )
+        message["dispatch_id"] = request.idempotency_key
         if outbound_action in {
             OutboundFollowUpAction.REVISE,
             OutboundFollowUpAction.REVISE_AND_SEND,
         }:
             message = self._revise_outbound_message(
                 message,
-                rewritten_query=response.last_qa_state.last_user_query,
+                rewritten_query=rewritten_query,
                 artifacts=artifacts,
                 new_artifact_ids=list(new_artifact_ids or []),
+                authoritative_envelope=(
+                    _composed_email_envelope(response)
+                    if (
+                        outbound_state.channel == "gmail"
+                        and semantic_decision.message.copy_revision
+                    )
+                    else None
+                ),
+                semantic_decision=semantic_decision,
             )
             if bool(message.pop("_revision_failed", False)):
                 return self._delivery_hold(
@@ -681,6 +763,7 @@ class PlatformSelector:
             message=message,
             context=request.platform_context or {},
             rewritten_query=response.last_qa_state.last_user_query,
+            semantic_decision=semantic_decision,
         )
 
     def _message_from_outbound_state(
@@ -717,7 +800,14 @@ class PlatformSelector:
             )
             if filename not in unavailable:
                 unavailable.append(filename)
-        recipients = list(state.recipients)
+        excluded_keys = {
+            recipient.casefold() for recipient in state.excluded_recipients
+        }
+        recipients = [
+            recipient
+            for recipient in state.recipients
+            if recipient.casefold() not in excluded_keys
+        ]
         return {
             "channel": state.channel,
             "recipient": ", ".join(recipients),
@@ -727,6 +817,7 @@ class PlatformSelector:
             "mode": mode,
             "attachments": attachments,
             "unavailable_attachments": list(dict.fromkeys(unavailable)),
+            "excluded_recipients": list(state.excluded_recipients),
         }
 
     def _revise_outbound_message(
@@ -736,6 +827,8 @@ class PlatformSelector:
         rewritten_query: str,
         artifacts: list[dict[str, Any]],
         new_artifact_ids: list[str],
+        authoritative_envelope: tuple[str, str] | None,
+        semantic_decision: SemanticActionDecision,
     ) -> dict[str, Any]:
         artifacts_by_id = {
             str(item.get("artifact_id") or ""): item
@@ -747,9 +840,30 @@ class PlatformSelector:
             for item in message.get("attachments", [])
             if isinstance(item, dict) and item.get("artifact_id")
         ]
-        selected_ids = list(dict.fromkeys([*current_ids, *new_artifact_ids]))
+        referenced_ids = _referenced_artifact_ids(
+            semantic_decision=semantic_decision,
+            artifacts_by_id=artifacts_by_id,
+            current_ids=current_ids,
+            new_artifact_ids=new_artifact_ids,
+        )
+        selected_ids = (
+            referenced_ids
+            if referenced_ids is not None
+            else _dedupe_artifact_ids(
+                list(dict.fromkeys([*current_ids, *new_artifact_ids])),
+                artifacts_by_id,
+            )
+        )
+        channel = str(message.get("channel") or "gmail")
+        preserve_existing_copy = bool(
+            not semantic_decision.message.copy_revision
+            and authoritative_envelope is None
+        )
         revised: dict[str, Any] = {}
-        if self.llm is not None:
+        # Attaching a referenced file is a deterministic envelope mutation. It
+        # must retain the already-approved subject/body and does not need a
+        # writing model to paraphrase or manufacture replacement copy.
+        if not preserve_existing_copy and self.llm is not None:
             try:
                 revised = self.llm.generate_json(
                     task=LLMTask.WRITING,
@@ -783,44 +897,94 @@ class PlatformSelector:
                     revised = {}
                 elif revised:
                     validate_json_schema(revised, OUTBOUND_REVISION_SCHEMA)
+                    if not (
+                        _clean(revised.get("subject"))
+                        and _clean(revised.get("body"))
+                        and isinstance(revised.get("recipients"), list)
+                        and isinstance(revised.get("artifact_ids"), list)
+                    ):
+                        revised = {}
             except Exception as exc:
                 logger.warning("Outbound draft revision failed: %s", type(exc).__name__)
                 revised = {}
 
-        allowed_recipients = _recipient_emails(
-            [*list(message.get("recipients") or []), rewritten_query]
+        recipient_parser = (
+            _recipient_emails if channel == "gmail" else _recipient_identifiers
         )
-        proposed_recipients = _recipient_emails(revised.get("recipients"))
-        recipients = [
-            recipient
-            for recipient in proposed_recipients
-            if recipient.casefold()
-            in {value.casefold() for value in allowed_recipients}
-        ] or list(message.get("recipients") or [])
+        existing_recipients = recipient_parser(message.get("recipients") or [])
+        proposed_recipients = recipient_parser(revised.get("recipients"))
+        if channel == "gmail":
+            included = list(semantic_decision.message.included_recipients)
+            excluded = list(semantic_decision.message.excluded_recipients)
+            excluded_keys = {
+                recipient.casefold() for recipient in excluded
+            }
+            if semantic_decision.message.recipient_update == "replace" and included:
+                recipients = _recipient_emails(included)
+            elif semantic_decision.message.recipient_update == "add" and included:
+                recipients = _recipient_emails([*existing_recipients, *included])
+            elif semantic_decision.message.recipient_update == "remove":
+                recipients = [
+                    recipient
+                    for recipient in existing_recipients
+                    if recipient.casefold() not in excluded_keys
+                ]
+            else:
+                allowed_keys = {
+                    recipient.casefold() for recipient in existing_recipients
+                }
+                recipients = [
+                    recipient
+                    for recipient in proposed_recipients
+                    if recipient.casefold() in allowed_keys
+                ] or existing_recipients
+            recipients = [
+                recipient
+                for recipient in recipients
+                if recipient.casefold() not in excluded_keys
+            ]
+        else:
+            recipients = proposed_recipients or existing_recipients
+
         proposed_ids = [
             str(value)
             for value in revised.get("artifact_ids", [])
             if str(value) in artifacts_by_id
         ] if isinstance(revised.get("artifact_ids"), list) else []
-        selected_ids = list(
-            dict.fromkeys([*(proposed_ids or selected_ids), *new_artifact_ids])
-        )
+        if referenced_ids is None and not preserve_existing_copy:
+            selected_ids = _dedupe_artifact_ids(
+                list(
+                    dict.fromkeys(
+                        [*(proposed_ids or selected_ids), *new_artifact_ids]
+                    )
+                ),
+                artifacts_by_id,
+            )
         declared = [
             artifacts_by_id[artifact_id]
             for artifact_id in selected_ids
             if artifact_id in artifacts_by_id
         ]
         attachments, unavailable = resolve_generated_artifacts(declared)
+        if authoritative_envelope is not None:
+            subject, body = authoritative_envelope
+        else:
+            subject = _clean(revised.get("subject")) or _clean(message.get("subject"))
+            body = _clean(revised.get("body")) or _clean(message.get("body"))
+        revision_failed = bool(not recipients) or bool(
+            not preserve_existing_copy
+            and not revised
+            and authoritative_envelope is None
+        )
         return {
             **message,
             "recipient": ", ".join(recipients),
             "recipients": recipients,
-            "subject": _clean(revised.get("subject"))
-            or _clean(message.get("subject")),
-            "body": _clean(revised.get("body")) or _clean(message.get("body")),
+            "subject": subject,
+            "body": body,
             "attachments": attachments,
             "unavailable_attachments": unavailable,
-            "_revision_failed": not bool(revised),
+            "_revision_failed": revision_failed,
         }
 
     def _complete_delivery(
@@ -830,6 +994,7 @@ class PlatformSelector:
         message: dict[str, Any],
         context: dict[str, Any],
         rewritten_query: str,
+        semantic_decision: SemanticActionDecision,
     ) -> dict[str, Any]:
         channel = str(message.get("channel") or "none")
         unavailable_attachments = list(message.get("unavailable_attachments") or [])
@@ -864,12 +1029,23 @@ class PlatformSelector:
             )
             if (
                 channel == "gmail"
-                and _requests_gmail_draft_save(rewritten_query)
+                and semantic_decision.message.operation == "save_draft"
                 and callable(creator)
                 and has_credentials
             ):
                 try:
                     draft_dispatch = creator(message, context)
+                except DeliveryOutcomeUnknown:
+                    return self._delivery_result(
+                        base,
+                        channel=channel,
+                        status="delivery_unknown",
+                        message=message,
+                        notice=(
+                            "Gmail may have saved the draft, but its acknowledgement was lost. "
+                            "Check Gmail Drafts before attempting the operation again."
+                        ),
+                    )
                 except Exception as exc:
                     logger.warning("Gmail draft save failed: %s", type(exc).__name__)
                     return self._delivery_result(
@@ -904,6 +1080,17 @@ class PlatformSelector:
         # delivery payload, drafts, history, or audit message.
         try:
             dispatch = self._send(channel, message, context)
+        except DeliveryOutcomeUnknown:
+            return self._delivery_result(
+                base,
+                channel=channel,
+                status="delivery_unknown",
+                message=message,
+                notice=(
+                    f"The {channel.title()} provider may have accepted the message, "
+                    "but its acknowledgement was lost. Check sent messages before any manual retry."
+                ),
+            )
         except Exception:
             return self._delivery_result(
                 base,
@@ -942,94 +1129,61 @@ class PlatformSelector:
 
     def _choose_channel(
         self,
-        rewritten_query: str,
+        semantic_decision: SemanticActionDecision,
     ) -> dict[str, Any]:
-        """Choose Gmail deterministically for explicit email messages, else use the LLM."""
-        if is_explicit_email_message_request(rewritten_query):
-            return {
-                "channel": "gmail",
-                "confidence": 1.0,
-                "source": "deterministic_explicit_email_request",
-            }
-        if self.llm is None:
-            return {"channel": "none", "confidence": 0.0, "source": "safe_fallback_no_llm"}
-        if not _NON_EMAIL_CHANNEL_WORDS.search(rewritten_query):
+        """Choose a channel only from the already-grounded semantic contract."""
+        message = semantic_decision.message
+        if not semantic_decision.grounded or not message.requests_message:
             return {
                 "channel": "none",
-                "confidence": 1.0,
-                "source": "deterministic_no_platform_request",
+                "confidence": message.confidence,
+                "source": "safe_fallback_no_grounded_message_action",
             }
-        try:
-            plan = self.llm.generate_json(
-                task=LLMTask.ACTION_PLANNING,
-                system_prompt=(
-                    "You are the platform selector in an assistant pipeline. "
-                    "For every turn choose exactly one channel: gmail, zalo, telegram, or none. "
-                    "Choose a messaging channel only when the user explicitly asks the assistant "
-                    "to prepare or send the bundled answer to a recipient through that channel. "
-                    "Choose none for ordinary questions, explanations, drafts without a delivery channel, "
-                    "or questions about how a platform works. Never choose a channel only because the "
-                    f"answer mentions it.\n\n{CHAT_HISTORY_PROMPT_RULE}"
-                ),
-                user_prompt=json.dumps({
-                    "rewritten_query": rewritten_query,
-                    "available_platforms": list(_CHANNELS),
-                }),
-                schema=PLATFORM_CHANNEL_SELECTION_SCHEMA,
-            )
-            if is_structured_fallback(plan):
-                return {
-                    "channel": "none",
-                    "confidence": 0.0,
-                    "source": "safe_fallback_structured_output",
-                }
-            candidate = _clean(plan.get("channel")).casefold()
-            if candidate in (*_CHANNELS, "none"):
-                return {"channel": candidate, "confidence": 1.0, "source": "llm"}
-        except Exception:
-            pass
-        # Selection failures are safe: continue to the non-delivery pass-through path
-        # rather than accidentally preparing or sending a message.
-        return {"channel": "none", "confidence": 0.0, "source": "safe_fallback_llm_error"}
+        return {
+            "channel": message.channel,
+            "confidence": message.confidence,
+            "source": "grounded_semantic_contract",
+        }
 
     def _extract(
         self,
         channel: str,
         response: BundledResponse,
         rewritten_query: str,
+        *,
+        semantic_decision: SemanticActionDecision,
+        dispatch_id: str | None = None,
     ) -> dict[str, Any]:
-        text = rewritten_query
-        extracted: dict[str, Any] = {}
-        # No second model call is needed for Gmail. The response bundle is the
-        # primary authored-envelope source; rewritten user evidence validates
-        # recipients, fills composer omissions, and retains side-effect authority.
-        # Non-email channels still need the model only for opaque recipient IDs.
-        if self.llm is not None and channel != "gmail":
-            try:
-                extracted = self.llm.generate_json(
-                    task=LLMTask.ACTION_PLANNING,
-                    system_prompt=(
-                        f"You extract {channel} recipient IDs only from explicit user-provided facts. "
-                        "Return every explicitly requested recipient in recipients and no message content. "
-                        f"Never invent an ID.\n\n{CHAT_HISTORY_PROMPT_RULE}"
+        del rewritten_query
+        included = list(semantic_decision.message.included_recipients)
+        excluded = list(semantic_decision.message.excluded_recipients)
+        allowed_gmail_recipients = included if channel == "gmail" else []
+        if channel == "gmail":
+            allowed_gmail_recipients = _recipient_emails(
+                [
+                    *allowed_gmail_recipients,
+                    *(
+                        response.platform_payload.get(
+                            "approved_resolved_recipients", []
+                        )
+                        if isinstance(
+                            response.platform_payload.get(
+                                "approved_resolved_recipients", []
+                            ),
+                            list,
+                        )
+                        else []
                     ),
-                    user_prompt=json.dumps(
-                        inject_chat_history({
-                            "rewritten_query": text,
-                        })
-                    ),
-                    schema=PLATFORM_RECIPIENT_EXTRACTION_SCHEMA,
-                )
-                if is_structured_fallback(extracted):
-                    extracted = {}
-            except Exception:
-                extracted = {}
-        allowed_gmail_recipients = _gmail_recipient_candidates(text) if channel == "gmail" else []
+                ]
+            )
+            excluded_keys = {item.casefold() for item in excluded}
+            allowed_gmail_recipients = [
+                item
+                for item in allowed_gmail_recipients
+                if item.casefold() not in excluded_keys
+            ]
         recipient_parser = _recipient_emails if channel == "gmail" else _recipient_identifiers
-        recipients = recipient_parser(extracted.get("recipients"))
-        for recipient in recipient_parser(extracted.get("recipient")):
-            if recipient.casefold() not in {item.casefold() for item in recipients}:
-                recipients.append(recipient)
+        recipients = recipient_parser(included)
         if channel == "gmail":
             recipients = _prioritized_approved_recipients(
                 _bundled_gmail_recipient_candidates(response),
@@ -1039,23 +1193,20 @@ class PlatformSelector:
         # win over supporting inputs. This keeps composition authoritative and
         # avoids latency plus corruption from a redundant extraction LLM.
         bundled_artifacts = response.platform_payload.get("artifacts")
+        answer_text = _answer_generation_text(response)
         body = _clean(_bundled_message_value(response, "body")) or (
             _body_from_bundled_response(
-                response.final_chat_text,
+                answer_text,
                 bundled_artifacts,
             )
         )
         bundled_subject = _clean(_bundled_message_value(response, "subject"))
-        subject_line = _SUBJECT_LINE.search(response.final_chat_text or "")
+        subject_line = _SUBJECT_LINE.search(answer_text)
         if not bundled_subject and subject_line:
             bundled_subject = _clean(subject_line.group(1))
-        subject_match = re.search(r"\bsubject\s*[:=-]\s*([^\n.;]+)", text, re.I)
-        supporting_subject = (
-            subject_match.group(1).strip(" '\"") if subject_match else ""
-        )
-        subject = bundled_subject or supporting_subject
+        subject = bundled_subject
         if not subject:
-            subject = _subject_from_bundled_response(response.final_chat_text)
+            subject = _subject_from_bundled_response(answer_text)
         attachments: list[dict[str, str]] = []
         unavailable_attachments: list[str] = []
         if channel == "gmail":
@@ -1064,17 +1215,7 @@ class PlatformSelector:
             )
         if not subject and attachments:
             subject = "Requested file"
-        mode = "draft"
-        if _DO_NOT_SEND.search(text):
-            mode = "draft"
-        elif _DIRECT_SEND_WORDS.search(text):
-            mode = "send"
-        elif _DRAFT_WORDS.search(text):
-            mode = "draft"
-        elif _DIRECT_EMAIL_VERB.search(text) or _EMAIL_OBJECT_DELIVERY.search(text):
-            mode = "send"
-        else:
-            mode = "send" if _SEND_WORDS.search(text) and not _DRAFT_WORDS.search(text) else "draft"
+        mode = "send" if semantic_decision.message.authorizes_send else "draft"
         return {
             "channel": channel,
             "recipient": ", ".join(recipients),
@@ -1084,6 +1225,10 @@ class PlatformSelector:
             "mode": mode,
             "attachments": attachments,
             "unavailable_attachments": unavailable_attachments,
+            "excluded_recipients": (
+                excluded if channel == "gmail" else []
+            ),
+            "dispatch_id": dispatch_id,
         }
 
     @staticmethod
@@ -1115,11 +1260,31 @@ class PlatformSelector:
             return sender.send(message, context)
 
         # Non-email channels conventionally accept one recipient per request.
-        # Keep the selector contract uniform by dispatching each extracted
-        # recipient in order and failing the operation if any dispatch fails.
+        # Track each outcome so a later retry targets only failures instead of
+        # duplicating already delivered messages.
+        delivered: list[str] = []
+        refused: list[str] = []
         for recipient in recipients:
-            sender.send({**message, "recipient": recipient, "recipients": [recipient]}, context)
-        return {"status": "sent", "provider": channel, "recipient": ", ".join(recipients), "recipients": recipients}
+            try:
+                result = sender.send(
+                    {**message, "recipient": recipient, "recipients": [recipient]},
+                    context,
+                )
+            except Exception:
+                refused.append(recipient)
+                continue
+            if isinstance(result, dict) and result.get("status") not in (None, "sent"):
+                refused.append(recipient)
+            else:
+                delivered.append(recipient)
+        return {
+            "status": "sent" if not refused else "partial_failure",
+            "provider": channel,
+            "recipient": ", ".join(recipients),
+            "recipients": recipients,
+            "delivered_recipients": delivered,
+            "refused_recipients": refused,
+        }
 
     def _delivery_result(
         self,
@@ -1142,7 +1307,9 @@ class PlatformSelector:
             base["delivery"]["provider"] = provider
         if notice:
             base["delivery"]["notice"] = notice
-        if dispatch:
+        if dispatch and (
+            status != "sent" or dispatch.get("refused_recipients")
+        ):
             for key in ("delivered_recipients", "refused_recipients"):
                 if key in dispatch:
                     base["delivery"][key] = list(dispatch[key])
@@ -1151,7 +1318,11 @@ class PlatformSelector:
 
     @staticmethod
     def _public_message(message: dict[str, Any]) -> dict[str, Any]:
-        public = {key: value for key, value in message.items() if key != "storage_path"}
+        public = {
+            key: value
+            for key, value in message.items()
+            if key not in {"storage_path", "dispatch_id"}
+        }
         public["attachments"] = [
             {key: value for key, value in attachment.items() if key != "storage_path"}
             for attachment in message.get("attachments", [])

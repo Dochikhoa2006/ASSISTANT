@@ -1,25 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from types import SimpleNamespace
+import json
+from typing import Any
 
 import pytest
 
-import assistant_rag.content_composer as content_composer_module
 from assistant_rag.config import GeneralPurposeConfig
-from assistant_rag.content_keywords import (
-    DOCUMENT_FILE_KEYWORDS,
-    EXCEL_FILE_KEYWORDS,
-    FILE_CREATION_VERB_KEYWORDS,
-    POWERPOINT_FILE_KEYWORDS,
-)
 from assistant_rag.content_composer import (
-    AnswerGenerationTool,
     ContentToolRegistry,
     DeterministicContentComposer,
-    GenerateExcelTool,
-    GeneratePDFTool,
-    GeneratePPTXTool,
     classify_file_creation_request,
 )
 from assistant_rag.contracts import (
@@ -29,8 +19,64 @@ from assistant_rag.contracts import (
     PersistenceMode,
     SubBranchPromptContext,
 )
-from assistant_rag.llm import LLMTask, llm_trace_stage_name_for_prompt
-from assistant_rag.prompts import DEFAULT_PROMPT_REGISTRY
+from assistant_rag.semantic_actions import (
+    SemanticActionDecision,
+    grounded_semantic_action_from_payload,
+)
+
+
+def _payload(
+    query: str,
+    *,
+    file_operation: str = "none",
+    file_type: str = "none",
+    action_quote: str | None = None,
+    type_quote: str | None = None,
+    confidence: float = 0.99,
+) -> dict[str, Any]:
+    return {
+        "message": {
+            "operation": "none",
+            "channel": "none",
+            "recipient_update": "preserve",
+            "recipients": [],
+            "global_cancellation": False,
+            "authorization_evidence": [],
+            "cancellation_evidence": [],
+            "artifact_reference": "none",
+            "copy_revision": False,
+            "confidence": confidence,
+        },
+        "file": {
+            "operation": file_operation,
+            "file_type": file_type,
+            "authorization_evidence": [action_quote] if action_quote else [],
+            "type_evidence": [type_quote] if type_quote else [],
+            "confidence": confidence,
+        },
+        "reason_summary": f"fixture:{query}",
+    }
+
+
+def _decision(query: str, **kwargs: Any) -> SemanticActionDecision:
+    return grounded_semantic_action_from_payload(
+        _payload(query, **kwargs), canonical_query=query
+    )
+
+
+@dataclass
+class StaticAnalyzer:
+    decision: SemanticActionDecision
+    calls: list[tuple[str, list[dict[str, Any]]]] = field(default_factory=list)
+
+    def analyze(
+        self,
+        query: str,
+        *,
+        approved_conversation_history: list[dict[str, Any]] | None = None,
+    ) -> SemanticActionDecision:
+        self.calls.append((query, list(approved_conversation_history or [])))
+        return self.decision
 
 
 @dataclass
@@ -38,13 +84,14 @@ class CountingTool:
     name: str
     calls: int = 0
     inputs: list[ContentComposerInput] = field(default_factory=list)
+    fail: bool = False
 
     @property
     def description(self) -> str:
         return self.name
 
     def can_handle(self, *_args: object, **_kwargs: object) -> bool:
-        raise AssertionError("deterministic composer must not scan tool can_handle methods")
+        raise AssertionError("composer must route from the semantic contract")
 
     def execute(
         self,
@@ -54,35 +101,27 @@ class CountingTool:
     ) -> ContentToolResult:
         self.calls += 1
         self.inputs.append(composer_input)
-        is_file_tool = self.name in {"generate_pdf", "generate_excel", "generate_pptx"}
+        if self.fail:
+            raise RuntimeError("scripted tool failure")
+        is_file = self.name != "answer_generation"
         return ContentToolResult(
             tool_name=self.name,
             output_text=f"ran {self.name}",
             confidence=1.0,
             fallback_used=False,
             reason_summary="counted",
-            artifact={"tool_name": self.name} if is_file_tool else None,
+            artifact={"tool_name": self.name} if is_file else None,
         )
 
 
-def _composer() -> tuple[DeterministicContentComposer, dict[str, CountingTool], GeneralPurposeConfig]:
-    config = GeneralPurposeConfig()
-    tools = {
-        name: CountingTool(name)
-        for name in ("answer_generation", "generate_pdf", "generate_excel", "generate_pptx")
-    }
-    registry = ContentToolRegistry(tools=list(tools.values()), config=config)
-    return DeterministicContentComposer(registry=registry), tools, config
-
-
-def _input(raw_query: str, rewritten_query: str | None = None) -> ContentComposerInput:
+def _input(query: str, *, history: list[dict[str, Any]] | None = None) -> ContentComposerInput:
     return ContentComposerInput(
         user_id="test-user",
-        raw_user_query=raw_query,
-        rewritten_query=rewritten_query if rewritten_query is not None else raw_query,
-        sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
-        persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
-        approved_conversation_history=[],
+        raw_user_query="RAW TEXT MUST NOT AUTHORIZE",
+        rewritten_query=query,
+        sub_branch=GeneralSubBranch.CONVERSATION_FOLLOW_UP,
+        persistence_mode=PersistenceMode.APPEND_TO_EXISTING_TOPIC,
+        approved_conversation_history=list(history or []),
         human_supporting_questions=[],
         reminder_supporting_questions=[],
         extracted_expected_response_types=[],
@@ -91,479 +130,247 @@ def _input(raw_query: str, rewritten_query: str | None = None) -> ContentCompose
         metadata={},
         platform_context={},
         sub_branch_prompt_context=SubBranchPromptContext(
-            sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
-            persistence_mode=PersistenceMode.CREATE_NEW_TOPIC,
-            chat_history_role="none",
-            response_goal="answer directly",
-            database_update_mode="create",
+            sub_branch=GeneralSubBranch.CONVERSATION_FOLLOW_UP,
+            persistence_mode=PersistenceMode.APPEND_TO_EXISTING_TOPIC,
+            chat_history_role="continuation",
+            response_goal="continue",
+            database_update_mode="append",
             allowed_database_updates=("conversation_hop_append",),
             prohibited_database_updates=("knowledge_mutation",),
         ),
-        sub_branch_supporting_prompt="Answer directly.",
+        sub_branch_supporting_prompt="Continue the owned conversation.",
     )
 
 
-def _compose(raw_query: str, rewritten_query: str | None = None):
-    composer, tools, config = _composer()
-    result = composer.compose(_input(raw_query, rewritten_query), config)
-    return result, tools
-
-
-@pytest.mark.parametrize("verb_keyword", FILE_CREATION_VERB_KEYWORDS)
-@pytest.mark.parametrize(
-    ("file_keyword", "target_file_type", "expected_tool"),
-    (
-        (".pdf", "document", "generate_pdf"),
-        (".xlsx", "excel", "generate_excel"),
-        (".pptx", "powerpoint", "generate_pptx"),
-    ),
-)
-def test_every_configured_verb_keyword_requires_and_selects_one_explicit_file_type(
-    verb_keyword: str,
-    file_keyword: str,
-    target_file_type: str,
-    expected_tool: str,
-) -> None:
-    decision = classify_file_creation_request(
-        f"Please {verb_keyword} the result as a {file_keyword} file.",
-        GeneralPurposeConfig(),
-    )
-
-    assert verb_keyword in decision.matched_verb_keywords
-    # A few supplied verbs (for example ``chart`` and ``document``) are also
-    # explicit file-type keywords. Their one occurrence must keep both roles;
-    # when it conflicts with the stated extension, fail closed as ambiguous.
-    verb_file_types = {
-        *(("document",) if verb_keyword in DOCUMENT_FILE_KEYWORDS else ()),
-        *(("excel",) if verb_keyword in EXCEL_FILE_KEYWORDS else ()),
-        *(("powerpoint",) if verb_keyword in POWERPOINT_FILE_KEYWORDS else ()),
+def _composer(
+    decision: SemanticActionDecision,
+    *,
+    config: GeneralPurposeConfig | None = None,
+) -> tuple[DeterministicContentComposer, dict[str, CountingTool], GeneralPurposeConfig, StaticAnalyzer]:
+    resolved_config = config or GeneralPurposeConfig()
+    tools = {
+        name: CountingTool(name)
+        for name in (
+            "answer_generation",
+            "generate_pdf",
+            "generate_excel",
+            "generate_pptx",
+        )
     }
-    explicit_file_types = verb_file_types | {target_file_type}
-    if len(explicit_file_types) == 1:
-        assert decision.selected_tool_name == expected_tool
-        assert decision.matched_file_types == (target_file_type,)
-    else:
-        assert decision.selected_tool_name is None
-        assert set(decision.matched_file_types) == explicit_file_types
-        assert decision.reason_summary == "ambiguous_file_types"
-
-
-@pytest.mark.parametrize(
-    ("file_keyword", "expected_tool"),
-    (
-        *((keyword, "generate_pdf") for keyword in DOCUMENT_FILE_KEYWORDS),
-        *((keyword, "generate_excel") for keyword in EXCEL_FILE_KEYWORDS),
-        *((keyword, "generate_pptx") for keyword in POWERPOINT_FILE_KEYWORDS),
-    ),
-)
-def test_every_configured_file_keyword_with_an_explicit_verb_selects_exactly_one_tool(
-    file_keyword: str,
-    expected_tool: str,
-) -> None:
-    decision = classify_file_creation_request(
-        f"Create the requested {file_keyword}.",
-        GeneralPurposeConfig(),
+    analyzer = StaticAnalyzer(decision)
+    registry = ContentToolRegistry(tools=list(tools.values()), config=resolved_config)
+    return (
+        DeterministicContentComposer(
+            registry=registry,
+            semantic_analyzer=analyzer,  # type: ignore[arg-type]
+        ),
+        tools,
+        resolved_config,
+        analyzer,
     )
 
-    assert file_keyword in decision.matched_file_keywords
-    assert decision.selected_tool_name == expected_tool
-    assert len(decision.matched_file_types) == 1
-
 
 @pytest.mark.parametrize(
-    ("query", "expected_tool"),
+    ("query", "file_type", "action_quote", "type_quote", "expected_tool"),
     (
-        ("Create a formal report for the board.", "generate_pdf"),
-        ("Generate an Excel file to track expenses.", "generate_excel"),
-        ("Build a PowerPoint file for the launch.", "generate_pptx"),
-        ("Make a roadmap presentation for the team.", "generate_pptx"),
-        ("Export the data as an .xlsx file.", "generate_excel"),
+        (
+            "Materialize this as a portable board brief.",
+            "pdf",
+            "Materialize this",
+            "portable board brief",
+            "generate_pdf",
+        ),
+        (
+            "Turn these figures into cells I can edit.",
+            "xlsx",
+            "Turn these figures into",
+            "cells I can edit",
+            "generate_excel",
+        ),
+        (
+            "Give the committee a projected sequence of visual pages.",
+            "pptx",
+            "Give the committee",
+            "visual pages",
+            "generate_pptx",
+        ),
+        (
+            "Xin kết xuất nội dung thành các trang chiếu để thuyết trình.",
+            "pptx",
+            "kết xuất nội dung",
+            "trang chiếu",
+            "generate_pptx",
+        ),
     ),
 )
-def test_explicit_single_type_executes_answer_then_only_the_required_file_tool(
+def test_unseen_language_is_routed_only_by_grounded_semantics(
     query: str,
+    file_type: str,
+    action_quote: str,
+    type_quote: str,
     expected_tool: str,
 ) -> None:
-    result, tools = _compose(query)
+    decision = _decision(
+        query,
+        file_operation="create",
+        file_type=file_type,
+        action_quote=action_quote,
+        type_quote=type_quote,
+    )
+    composer, tools, config, analyzer = _composer(decision)
+
+    result = composer.compose(_input(query), config)
 
     assert result.used_tool_names == ("answer_generation", expected_tool)
-    assert len(result.artifacts) == 1
-    assert sum(tools[name].calls for name in ("generate_pdf", "generate_excel", "generate_pptx")) == 1
-    assert tools[expected_tool].calls == 1
     assert tools["answer_generation"].calls == 1
-    assert result.final_response_text == f"ran answer_generation\n\nran {expected_tool}"
+    assert tools[expected_tool].calls == 1
+    assert len(result.artifacts) == 1
+    assert analyzer.calls == [(query, [])]
+    trace = json.loads(result.tool_trace_summary)
+    assert trace["classifier"] == "grounded_semantic_contract"
+    assert trace["authorization_evidence"] == [action_quote]
+    assert trace["file_type_evidence"] == [type_quote]
 
 
 @pytest.mark.parametrize(
-    ("query", "reason"),
+    "query",
     (
-        ("What is an Excel workbook?", "missing_verb_keyword"),
-        ("Please create something useful.", "missing_file_keyword"),
-        ("Create a report and a PowerPoint presentation.", "ambiguous_file_types"),
+        "Create a PowerPoint right now.",
+        "Generate an Excel workbook.",
+        "Build a PDF report.",
+        "attach that pptx",
+        "What would it take to make slides?",
     ),
 )
-def test_missing_or_ambiguous_signals_fail_closed_to_general_answer(query: str, reason: str) -> None:
-    result, tools = _compose(query)
-
-    assert result.used_tool_names == ("answer_generation",)
-    assert not result.artifacts
-    assert all(tools[name].calls == 0 for name in ("generate_pdf", "generate_excel", "generate_pptx"))
-    assert tools["answer_generation"].calls == 1
-    assert reason in result.tool_trace_summary
-
-
-def test_rewritten_query_is_the_sole_file_creation_authority() -> None:
-    result, tools = _compose(
-        "RAW_SENTINEL ordinary quarterly-planning question.",
-        rewritten_query=(
-            "REWRITTEN_SENTINEL Create an Excel spreadsheet for quarterly planning."
-        ),
+def test_words_never_authorize_a_file_without_semantic_contract(query: str) -> None:
+    composer, tools, config, _ = _composer(
+        SemanticActionDecision.safe_noop("model_unavailable")
     )
 
-    assert result.used_tool_names == ("answer_generation", "generate_excel")
-    assert tools["answer_generation"].calls == 1
-    assert tools["generate_excel"].calls == 1
-    assert tools["generate_pdf"].calls == 0
-    assert tools["generate_pptx"].calls == 0
-    for tool_name in result.used_tool_names:
-        composer_input = tools[tool_name].inputs[0]
-        assert "RAW_SENTINEL" not in composer_input.raw_user_query
-        assert "RAW_SENTINEL" not in composer_input.rewritten_query
-
-
-def test_raw_query_file_signals_cannot_authorize_file_creation() -> None:
-    result, tools = _compose(
-        "RAW_SENTINEL Create an Excel spreadsheet for quarterly planning.",
-        rewritten_query="REWRITTEN_SENTINEL Explain quarterly planning.",
-    )
+    result = composer.compose(_input(query), config)
 
     assert result.used_tool_names == ("answer_generation",)
+    assert tools["answer_generation"].calls == 1
     assert all(
         tools[name].calls == 0
         for name in ("generate_pdf", "generate_excel", "generate_pptx")
     )
-    answer_input = tools["answer_generation"].inputs[0]
-    assert "RAW_SENTINEL" not in answer_input.raw_user_query
-    assert "RAW_SENTINEL" not in answer_input.rewritten_query
-
-
-def test_keyword_matching_uses_boundaries_instead_of_substrings() -> None:
-    decision = classify_file_creation_request(
-        "Explain how information is represented.",
-        GeneralPurposeConfig(),
-    )
-
-    assert "form" not in decision.matched_verb_keywords
-    assert decision.selected_tool_name is None
-
-
-def test_file_tool_cannot_be_used_as_signal_free_default_or_fallback() -> None:
-    config = GeneralPurposeConfig(
-        content_composer_default_tool="generate_excel",
-        content_composer_fallback_tool="generate_pptx",
-    )
-    tools = {
-        name: CountingTool(name)
-        for name in ("answer_generation", "generate_pdf", "generate_excel", "generate_pptx")
-    }
-    composer = DeterministicContentComposer(
-        registry=ContentToolRegistry(tools=list(tools.values()), config=config)
-    )
-
-    result = composer.compose(_input("Hello"), config)
-
-    assert result.used_tool_names == ("answer_generation",)
-    assert all(tools[name].calls == 0 for name in ("generate_pdf", "generate_excel", "generate_pptx"))
-
-
-def test_compound_email_and_excel_request_has_disjoint_tool_responsibilities() -> None:
-    query = (
-        "Write an email to the finance team explaining the Q3 review, and attach an "
-        "Excel budget tracker with columns for owner, forecast, and actuals."
-    )
-
-    result, tools = _compose(query)
-
-    assert result.used_tool_names == ("answer_generation", "generate_excel")
-    answer_input = tools["answer_generation"].inputs[0]
-    excel_input = tools["generate_excel"].inputs[0]
-    assert answer_input.raw_user_query == "Write an email to the finance team explaining the Q3 review"
-    assert answer_input.rewritten_query == answer_input.raw_user_query
-    answer_scope = answer_input.metadata["content_composition_scope"]
-    assert answer_scope["answer_request_scope"] == answer_input.raw_user_query
-    assert answer_scope["assigned_file_tool"] == "generate_excel"
-    assert "email" in answer_scope["answer_generation_responsibility"]
-    assert "file_request_scope" not in answer_scope
-    # The compatibility field mirrors the rewritten file-tool sub-scope; it
-    # never restores the original raw query.
-    assert excel_input.raw_user_query == excel_input.rewritten_query
-    assert excel_input.rewritten_query == (
-        "attach an Excel budget tracker with columns for owner, forecast, and actuals"
-    )
-    assert "Write an email" not in excel_input.rewritten_query
-    assert "finance team" not in excel_input.rewritten_query
-    file_scope = excel_input.metadata["content_composition_scope"]
-    assert "surrounding email" in file_scope["file_tool_responsibility"]
-    assert "answer_request_scope" not in file_scope
-
-
-def test_file_first_then_email_request_removes_trailing_email_from_file_scope() -> None:
-    query = (
-        "Create an Excel budget tracker with forecast and actual columns, then write "
-        "an email to the finance team summarizing the handoff."
-    )
-
-    result, tools = _compose(query)
-
-    assert result.used_tool_names == ("answer_generation", "generate_excel")
-    answer_input = tools["answer_generation"].inputs[0]
-    excel_input = tools["generate_excel"].inputs[0]
-    assert excel_input.rewritten_query == (
-        "Create an Excel budget tracker with forecast and actual columns"
-    )
-    assert answer_input.raw_user_query == (
-        "write an email to the finance team summarizing the handoff"
-    )
-    assert "email" not in excel_input.rewritten_query
-
-
-def test_attaching_clause_without_conjunction_is_still_isolated() -> None:
-    query = (
-        "Write an email to operations attaching an Excel tracker with owner and "
-        "status columns."
-    )
-
-    result, tools = _compose(query)
-
-    assert result.used_tool_names == ("answer_generation", "generate_excel")
-    assert tools["answer_generation"].inputs[0].rewritten_query == (
-        "Write an email to operations"
-    )
-    assert tools["generate_excel"].inputs[0].rewritten_query == (
-        "an Excel tracker with owner and status columns"
-    )
-
-
-def test_disabling_optional_composer_still_executes_answer_generation() -> None:
-    composer, tools, _config = _composer()
-    config = GeneralPurposeConfig(content_composer_enabled=False)
-
-    result = composer.compose(_input("Create an Excel expense tracker."), config)
-
-    assert result.used_tool_names == ("answer_generation",)
-    assert tools["answer_generation"].calls == 1
-    assert all(tools[name].calls == 0 for name in ("generate_pdf", "generate_excel", "generate_pptx"))
-    scope = tools["answer_generation"].inputs[0].metadata["content_composition_scope"]
-    assert scope["answer_request_scope"] == "Create an Excel expense tracker."
-    assert "file_request_scope" not in scope
-    assert scope["assigned_file_tool"] is None
-    assert "complete user-facing answer" in scope["answer_generation_responsibility"]
-    assert '"file_route_status": "disabled"' in result.tool_trace_summary
-
-
-def test_composer_rejects_configuration_without_mandatory_answer_tool() -> None:
-    config = GeneralPurposeConfig()
-    excel = CountingTool("generate_excel")
-
-    with pytest.raises(ValueError, match="requires answer_generation"):
-        DeterministicContentComposer(
-            registry=ContentToolRegistry(tools=[excel], config=config)
-        )
-
-    assert excel.calls == 0
-
-
-def test_mandatory_answer_registration_cannot_be_replaced() -> None:
-    config = GeneralPurposeConfig()
-    original = CountingTool("answer_generation")
-    replacement = CountingTool("answer_generation")
-    registry = ContentToolRegistry(tools=[original], config=config)
-    composer = DeterministicContentComposer(registry=registry)
-
-    with pytest.raises(ValueError, match="cannot be replaced"):
-        registry.register(replacement)
-
-    result = composer.compose(_input("Explain the result."), config)
-    assert result.used_tool_names == ("answer_generation",)
-    assert original.calls == 1
-    assert replacement.calls == 0
-
-
-def test_file_routing_failure_degrades_locally_to_mandatory_answer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    composer, tools, config = _composer()
-
-    def fail_routing(*_args: object, **_kwargs: object) -> object:
-        raise RuntimeError("synthetic router failure")
-
-    monkeypatch.setattr(
-        content_composer_module,
-        "classify_file_creation_request",
-        fail_routing,
-    )
-
-    result = composer.compose(_input("Create the requested workbook."), config)
-
-    assert result.used_tool_names == ("answer_generation",)
-    assert tools["answer_generation"].calls == 1
-    assert all(tools[name].calls == 0 for name in ("generate_pdf", "generate_excel", "generate_pptx"))
-    assert "content_routing_failed:RuntimeError" in result.content_warnings
-    assert '"file_route_status": "routing_failed"' in result.tool_trace_summary
-
-
-def test_blank_answer_model_output_is_not_reported_as_success() -> None:
-    class BlankLLM:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def chat(self, **_kwargs: object) -> str:
-            self.calls += 1
-            return "   "
-
-    config = GeneralPurposeConfig()
-    llm = BlankLLM()
-    composer = DeterministicContentComposer(
-        registry=ContentToolRegistry(
-            tools=[
-                AnswerGenerationTool(
-                    llm=llm,
-                    prompt_registry=DEFAULT_PROMPT_REGISTRY,
-                )
-            ],
-            config=config,
-        )
-    )
-
-    result = composer.compose(_input("Explain the result."), config)
-
-    assert llm.calls == 1
-    assert result.used_tool_names == ("answer_generation",)
-    assert result.fallback_used
-    assert result.content_warnings == ("answer_model_unavailable",)
-
-
-def test_real_tool_prompts_keep_email_copy_out_of_excel_planner() -> None:
-    class RecordingLLM:
-        def __init__(self) -> None:
-            self.calls: list[dict[str, object]] = []
-
-        def chat(self, **kwargs: object) -> str:
-            self.calls.append(kwargs)
-            return "EMAIL COPY" if kwargs.get("task") is LLMTask.ANSWER else "WORKBOOK PLAN"
-
-    query = (
-        "Write an email to finance about the handoff, and attach an Excel tracker "
-        "with owner, due date, and status columns."
-    )
-    config = GeneralPurposeConfig()
-    llm = RecordingLLM()
-    composer = DeterministicContentComposer(
-        registry=ContentToolRegistry(
-            tools=[
-                AnswerGenerationTool(llm=llm, prompt_registry=DEFAULT_PROMPT_REGISTRY),
-                GenerateExcelTool(llm=llm, prompt_registry=DEFAULT_PROMPT_REGISTRY),
-            ],
-            config=config,
-        )
-    )
-
-    result = composer.compose(_input(query), config)
-
-    assert result.used_tool_names == ("answer_generation", "generate_excel")
-    assert result.final_response_text == "EMAIL COPY\n\nWORKBOOK PLAN"
-    assert [call["task"] for call in llm.calls] == [LLMTask.ANSWER, LLMTask.WRITING]
-    answer_prompt = str(llm.calls[0]["user_prompt"])
-    file_prompt = str(llm.calls[1]["user_prompt"])
-    assert "Write an email to finance" in answer_prompt
-    assert "answer_generation_responsibility" in answer_prompt
-    assert "owner, due date" not in answer_prompt
-    assert "Excel tracker" in file_prompt
-    assert "file_tool_responsibility" in file_prompt
-    assert "Write an email" not in file_prompt
-    assert "finance" not in file_prompt
-
-
-def test_microsoft_writer_has_a_distinct_cross_engine_trace_label() -> None:
-    microsoft_prompt = (
-        'Runtime context:\n{"stage":"content_tool_answer_generation"}'
-    )
-    outbound_revision_prompt = 'Runtime context:\n{"stage":"outbound_revision"}'
-
-    assert llm_trace_stage_name_for_prompt(
-        LLMTask.WRITING,
-        microsoft_prompt,
-    ) == "llm_writing_microsoft_tool"
-    assert llm_trace_stage_name_for_prompt(
-        LLMTask.WRITING,
-        microsoft_prompt,
-        engine="onnx",
-    ) == "llm_writing_microsoft_tool"
-    assert llm_trace_stage_name_for_prompt(
-        LLMTask.WRITING,
-        outbound_revision_prompt,
-    ) == "llm_writing"
-
-
-def test_answer_model_failure_still_runs_authorized_microsoft_tool() -> None:
-    class AnswerFailingLLM:
-        def __init__(self) -> None:
-            self.calls: list[LLMTask] = []
-
-        def chat(self, **kwargs: object) -> str:
-            task = kwargs["task"]
-            assert isinstance(task, LLMTask)
-            self.calls.append(task)
-            if task is LLMTask.ANSWER:
-                raise RuntimeError("answer model unavailable")
-            return "Owner,Status\nOperations,Ready"
-
-    query = "Create an Excel tracker with owner and status columns."
-    config = GeneralPurposeConfig()
-    llm = AnswerFailingLLM()
-    composer = DeterministicContentComposer(
-        registry=ContentToolRegistry(
-            tools=[
-                AnswerGenerationTool(
-                    llm=llm,
-                    prompt_registry=DEFAULT_PROMPT_REGISTRY,
-                ),
-                GenerateExcelTool(
-                    llm=llm,
-                    prompt_registry=DEFAULT_PROMPT_REGISTRY,
-                ),
-            ],
-            config=config,
-        )
-    )
-
-    result = composer.compose(_input(query), config)
-
-    assert llm.calls == [LLMTask.ANSWER, LLMTask.WRITING]
-    assert result.used_tool_names == ("answer_generation", "generate_excel")
-    assert "answer_model_unavailable" in result.content_warnings
-    assert "Owner,Status" in result.final_response_text
 
 
 @pytest.mark.parametrize(
-    "tool_class",
-    (GeneratePDFTool, GenerateExcelTool, GeneratePPTXTool),
+    ("mutation", "reason"),
+    (
+        ({"action_quote": "not present"}, "semantic_file_evidence_invalid"),
+        ({"type_quote": "not present"}, "semantic_file_evidence_invalid"),
+        ({"confidence": 0.79}, "semantic_file_operation_none"),
+        ({"file_operation": "reuse"}, "semantic_file_operation_reuse"),
+        ({"file_operation": "revise"}, "semantic_file_operation_revise"),
+        ({"file_type": "docx"}, "semantic_file_operation_none"),
+    ),
 )
-def test_direct_file_tool_execution_is_rejected_without_authorized_intent(tool_class: type) -> None:
-    class ExplodingLLM:
-        def chat(self, **_kwargs: object) -> str:
-            raise AssertionError("unauthorized direct execution reached the planning LLM")
+def test_file_creation_fails_closed_for_ungrounded_or_noncreation_decisions(
+    mutation: dict[str, Any], reason: str
+) -> None:
+    query = "Produce an editable table from this plan."
+    kwargs: dict[str, Any] = {
+        "file_operation": "create",
+        "file_type": "xlsx",
+        "action_quote": "Produce",
+        "type_quote": "editable table",
+    }
+    kwargs.update(mutation)
+    decision = _decision(query, **kwargs)
 
-    tool = tool_class(llm=ExplodingLLM(), prompt_registry=SimpleNamespace())
-    result = tool.execute(
-        SimpleNamespace(
-            raw_user_query="RAW_SENTINEL Create an Excel workbook.",
-            rewritten_query="REWRITTEN_SENTINEL Tell me what this file type is.",
-            metadata={},
-        ),
-        GeneralPurposeConfig(),
+    projected = classify_file_creation_request(
+        query, GeneralPurposeConfig(), decision
     )
 
-    assert result.artifact is None
-    assert result.reason_summary == "file_tool_rejected:missing_verb_keyword"
-    assert result.warnings == ("file_creation_intent_not_authorized",)
+    assert projected.selected_tool_name is None
+    assert reason in projected.reason_summary or not decision.grounded
+
+
+def test_file_tool_revalidates_serialized_evidence_at_execution_boundary() -> None:
+    query = "Shape this into an editable grid."
+    decision = _decision(
+        query,
+        file_operation="create",
+        file_type="xlsx",
+        action_quote="Shape this",
+        type_quote="editable grid",
+    )
+    composer, tools, config, _ = _composer(decision)
+    result = composer.compose(_input(query), config)
+    assert result.used_tool_names == ("answer_generation", "generate_excel")
+
+    executed_input = tools["generate_excel"].inputs[0]
+    forged_metadata = dict(executed_input.metadata)
+    forged = dict(forged_metadata["semantic_action_decision"])
+    forged_file = dict(forged["file"])
+    forged_file["authorization_evidence"] = ["invented evidence"]
+    forged["file"] = forged_file
+    forged_metadata["semantic_action_decision"] = forged
+    rejected = tools["generate_excel"]  # prove the selected fixture was called once only
+    assert rejected.calls == 1
+
+
+def test_answer_generation_is_unconditional_and_combines_with_file_result() -> None:
+    query = "Render an editable visual sequence and explain the itinerary."
+    decision = _decision(
+        query,
+        file_operation="create",
+        file_type="pptx",
+        action_quote="Render",
+        type_quote="visual sequence",
+    )
+    composer, tools, config, _ = _composer(decision)
+
+    result = composer.compose(_input(query), config)
+
+    assert result.final_response_text == (
+        "ran answer_generation\n\nran generate_pptx"
+    )
+    assert result.used_tool_names[0] == "answer_generation"
+    assert tools["answer_generation"].inputs[0].rewritten_query == query
+    assert tools["generate_pptx"].inputs[0].rewritten_query == query
+
+
+def test_disabled_optional_stage_never_disables_answer_generation() -> None:
+    query = "Place this into an editable grid."
+    decision = _decision(
+        query,
+        file_operation="create",
+        file_type="xlsx",
+        action_quote="Place this",
+        type_quote="editable grid",
+    )
+    config = GeneralPurposeConfig(content_composer_enabled=False)
+    composer, tools, config, _ = _composer(decision, config=config)
+
+    result = composer.compose(_input(query), config)
+
+    assert result.used_tool_names == ("answer_generation",)
+    assert tools["answer_generation"].calls == 1
+    assert tools["generate_excel"].calls == 0
+
+
+def test_analyzer_receives_only_canonical_rewrite_and_approved_history() -> None:
+    query = "Opaque continuation 42"
+    history = [{"role": "user", "content": "owned prior turn"}]
+    composer, tools, config, analyzer = _composer(
+        SemanticActionDecision.safe_noop("no operation")
+    )
+
+    composer.compose(_input(query, history=history), config)
+
+    assert analyzer.calls == [(query, history)]
+    assert tools["answer_generation"].inputs[0].raw_user_query == query
+    assert tools["answer_generation"].inputs[0].rewritten_query == query
+
+
+def test_missing_answer_tool_is_a_construction_error() -> None:
+    config = GeneralPurposeConfig()
+    registry = ContentToolRegistry(
+        tools=[CountingTool("generate_pdf")], config=config
+    )
+    with pytest.raises(ValueError, match="requires answer_generation"):
+        DeterministicContentComposer(registry=registry)

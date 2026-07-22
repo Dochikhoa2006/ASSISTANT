@@ -9,7 +9,6 @@ from typing import Any, Protocol
 from .config import GeneralPurposeConfig, QuestionGenerationConfig
 from .contracts import ContentComposerResult, GeneratedQuestion, HumanSupportingDecision, LastQAInteractionType, PipelineContext, QuestionSource, ExpectedResponseType
 from .llm import LLMClient, LLMTask, is_structured_fallback
-from .platform import is_explicit_email_message_request
 from .prompts import PromptContext, PromptRegistry
 
 logger = logging.getLogger(__name__)
@@ -135,13 +134,6 @@ class LLMHumanInTheLoopStrategy:
     config: QuestionGenerationConfig
 
     def evaluate(self, context: PipelineContext, response_text: str, confidence: float) -> tuple[list[GeneratedQuestion], dict[str, Any] | None]:
-        if is_explicit_email_message_request(context.rewritten_query):
-            return [], {
-                "triggered": False,
-                "confidence": 1.0,
-                "question_count": 0,
-                "reason": "explicit_delivery_request_is_actionable",
-            }
         if confidence >= self.config.question_generation_confidence_threshold:
             return [], None
             
@@ -240,19 +232,6 @@ class LLMGeneralHITLStrategy:
                 risk_flags=(),
             )
 
-        if is_explicit_email_message_request(context.rewritten_query):
-            return HumanSupportingDecision(
-                should_ask=False,
-                question="",
-                confidence=1.0,
-                question_source=QuestionSource.HUMAN_SUPPORTING_QUESTION,
-                expected_response_type=ExpectedResponseType.UNKNOWN,
-                reason_summary=(
-                    "The explicit delivery request already supplies an actionable recipient."
-                ),
-                risk_flags=(),
-            )
-            
         # General HITL is contractually limited to one required-context question, so an
         # array wrapper adds output tokens and invalid-shape opportunities.
         schema = _question_item_schema()

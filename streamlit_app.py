@@ -19,6 +19,8 @@ from assistant_rag.reminder_reply import (
     build_reminder_reply_last_qa,
     build_reminder_reply_metadata,
     reminder_notification_key,
+    reminder_reply_conversation_id,
+    save_reminder_reply_last_qa,
 )
 from assistant_rag.production_factory import (
     build_production_runtime,
@@ -43,6 +45,77 @@ def _initialise_chat_state(st: object) -> None:
         session_state.chat_session_summaries = []
     if "chat_view_id" not in session_state:
         session_state.chat_view_id = uuid4().hex
+
+
+def _refresh_durable_conversation_summaries(
+    st: object,
+    *,
+    repository: object,
+    user_id: str,
+) -> None:
+    """Hydrate the sidebar from SQL without crossing the authenticated user."""
+
+    loader = getattr(repository, "list_conversations", None)
+    if not callable(loader):
+        return
+    try:
+        durable = loader(user_id=user_id, limit=20)
+    except Exception:
+        logger.exception("durable conversation listing failed")
+        return
+    existing = {
+        str(item.get("view_id") or ""): item
+        for item in st.session_state.get("chat_session_summaries", [])
+        if isinstance(item, dict)
+    }
+    summaries: list[dict[str, object]] = []
+    for item in durable:
+        if not isinstance(item, dict):
+            continue
+        conversation_id = str(item.get("conversation_id") or "").strip()
+        if not conversation_id:
+            continue
+        cached = existing.get(conversation_id, {})
+        summaries.append(
+            {
+                "view_id": conversation_id,
+                "created_at": str(
+                    item.get("updated_at") or item.get("created_at") or ""
+                ),
+                "summary": str(
+                    item.get("summary") or item.get("title") or "Conversation"
+                ),
+                "messages": list(cached.get("messages") or []),
+                "latest_hop_id": item.get("latest_hop_id"),
+            }
+        )
+    st.session_state.chat_session_summaries = summaries
+
+
+def _load_durable_chat_messages(
+    *,
+    repository: object,
+    user_id: str,
+    conversation_id: str,
+) -> list[dict[str, object]]:
+    loader = getattr(repository, "load_conversation", None)
+    if not callable(loader):
+        return []
+    try:
+        conversation = loader(
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+    except Exception:
+        logger.exception("durable conversation loading failed")
+        return []
+    if not isinstance(conversation, dict):
+        return []
+    return [
+        dict(message)
+        for message in conversation.get("messages", [])
+        if isinstance(message, dict)
+    ]
 
 
 def _render_gmail_credential_check(st: object) -> None:
@@ -184,6 +257,8 @@ def _chat_message_from_execution(execution: ChatRequestExecution) -> dict[str, o
             "artifacts": list(platform_payload.get("artifacts") or []),
             "pending_confirmations": list(response.actions_pending_confirmation),
             "response_type": response.response_type.value,
+            "conversation_topic_id": response.conversation_topic_id,
+            "conversation_hop_id": response.conversation_hop_id,
         }
     platform_payload = payload.get("platform_payload") or {}
     return {
@@ -194,7 +269,17 @@ def _chat_message_from_execution(execution: ChatRequestExecution) -> dict[str, o
             payload.get("actions_pending_confirmation") or []
         ),
         "response_type": str(payload.get("response_type") or "normal"),
+        "conversation_topic_id": payload.get("conversation_topic_id"),
+        "conversation_hop_id": payload.get("conversation_hop_id"),
     }
+
+
+def _latest_visible_hop_id(messages: list[dict[str, object]]) -> str | None:
+    for message in reversed(messages):
+        hop_id = str(message.get("conversation_hop_id") or "").strip()
+        if message.get("role") == "assistant" and hop_id:
+            return hop_id
+    return None
 
 
 def _render_confirmation_controls(
@@ -235,6 +320,11 @@ def _render_confirmation_controls(
                             message.get("request_query")
                             or "Confirm the pending action."
                         ),
+                        conversation_id=st.session_state.get("chat_view_id"),
+                        parent_hop_id=str(
+                            message.get("conversation_hop_id") or ""
+                        ).strip()
+                        or None,
                         confirmation_token=token,
                         idempotency_key=f"streamlit-confirm:{token}",
                         platform_context={
@@ -502,6 +592,9 @@ def _render_reminder_notifications(
                             reminder_id=str(notification["reminder_id"]),
                             notification_id=str(notification["notification_id"]),
                         )
+                        source_conversation_id = reminder_reply_conversation_id(
+                            context
+                        )
                         reply_fingerprint = sha256(
                             (
                                 f"{notification['notification_id']}\0{reply}"
@@ -513,6 +606,7 @@ def _render_reminder_notifications(
                             request=ChatRequest(
                                 user_id=user_id,
                                 raw_query=reply,
+                                conversation_id=source_conversation_id,
                                 reminder_id=str(notification["reminder_id"]),
                                 notification_id=str(notification["notification_id"]),
                                 reply_text=reply,
@@ -531,9 +625,11 @@ def _render_reminder_notifications(
                             # Hydrate the reminder's source Last-QA only after a
                             # fresh/failed-retry idempotency claim. Replays and
                             # conflicts must never rewind the user's latest state.
-                            before_pipeline=lambda _request: pipeline.last_qa_store.save(
-                                user_id,
-                                reply_last_qa,
+                            before_pipeline=lambda _request: save_reminder_reply_last_qa(
+                                pipeline.last_qa_store,
+                                user_id=user_id,
+                                state=reply_last_qa,
+                                conversation_id=source_conversation_id,
                             ),
                         )
                         if execution is None:
@@ -549,10 +645,22 @@ def _render_reminder_notifications(
                             continue
                         response_message = _chat_message_from_execution(execution)
                         response_message["request_query"] = reply
-                        st.session_state.chat_messages.extend([
-                            {"role": "user", "content": reply},
-                            response_message,
-                        ])
+                        if source_conversation_id:
+                            st.session_state.chat_view_id = source_conversation_id
+                            restored_messages = _load_durable_chat_messages(
+                                repository=repository,
+                                user_id=user_id,
+                                conversation_id=source_conversation_id,
+                            )
+                        else:
+                            restored_messages = []
+                        if restored_messages:
+                            st.session_state.chat_messages = restored_messages
+                        else:
+                            st.session_state.chat_messages.extend([
+                                {"role": "user", "content": reply},
+                                response_message,
+                            ])
                         if (
                             response_message.get("response_type")
                             == ResponseType.ERROR.value
@@ -633,6 +741,25 @@ def main() -> None:
             help="Leave empty to use default_user.",
         )
         user_id = entered_user_id.strip() or "default_user"
+        active_chat_user_id = st.session_state.get("chat_user_id")
+        if active_chat_user_id is None:
+            st.session_state.chat_user_id = user_id
+        elif active_chat_user_id != user_id:
+            # Never retain visible messages, confirmations, conversation
+            # cursors, or Gmail credentials across a user identity change.
+            st.session_state.chat_user_id = user_id
+            st.session_state.chat_messages = []
+            st.session_state.chat_session_summaries = []
+            st.session_state.chat_view_id = uuid4().hex
+            st.session_state.gmail_username = ""
+            st.session_state.gmail_app_password = ""
+            st.session_state.pop("gmail_credential_check_result", None)
+
+        _refresh_durable_conversation_summaries(
+            st,
+            repository=st.session_state.repository,
+            user_id=user_id,
+        )
 
         if st.button("Refresh reminder notifications"):
             _catch_up_reminders(st)
@@ -695,7 +822,7 @@ def main() -> None:
         _render_gmail_credential_check(st)
 
         st.divider()
-        if st.button("New chat", type="primary", help="Summarize and clear this visible chat. Your database conversation history is unchanged."):
+        if st.button("New chat", type="primary", help="Save this conversation and start a separate conversation cursor."):
             with st.spinner("Summarizing this chat session…"):
                 summary = _summarize_chat_session(
                     st.session_state.pipeline,
@@ -705,20 +832,72 @@ def main() -> None:
                 "view_id": st.session_state.chat_view_id,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "summary": summary,
+                "messages": [dict(message) for message in st.session_state.chat_messages],
+                "latest_hop_id": _latest_visible_hop_id(
+                    st.session_state.chat_messages
+                ),
             })
-            # This is only a new visual Streamlit session. The user_id and every
-            # database conversation/topic/hop identifier remain exactly as-is.
             st.session_state.chat_messages = []
             st.session_state.chat_view_id = uuid4().hex
-            st.session_state.new_chat_notice = "Started a new chat view. The previous view was summarized locally."
+            st.session_state.new_chat_notice = (
+                "Started a separate conversation. The previous conversation "
+                "can be continued from its saved summary."
+            )
             st.rerun()
 
         summaries = st.session_state.chat_session_summaries
         if summaries:
             with st.expander("Previous chat summaries", expanded=False):
-                for item in reversed(summaries[-5:]):
+                visible_summaries = [
+                    item
+                    for item in summaries
+                    if item.get("view_id") != st.session_state.chat_view_id
+                ]
+                for item in reversed(visible_summaries[-5:]):
                     st.caption(item["created_at"])
                     st.write(item["summary"])
+                    if st.button(
+                        "Continue this conversation",
+                        key=f"continue-chat-{item['view_id']}",
+                    ):
+                        current_messages = [
+                            dict(message)
+                            for message in st.session_state.chat_messages
+                        ]
+                        if current_messages:
+                            st.session_state.chat_session_summaries.append(
+                                {
+                                    "view_id": st.session_state.chat_view_id,
+                                    "created_at": datetime.now(
+                                        timezone.utc
+                                    ).isoformat(),
+                                    "summary": "Paused conversation.",
+                                    "messages": current_messages,
+                                    "latest_hop_id": _latest_visible_hop_id(
+                                        current_messages
+                                    ),
+                                }
+                            )
+                        st.session_state.chat_session_summaries = [
+                            saved
+                            for saved in st.session_state.chat_session_summaries
+                            if saved is not item
+                        ]
+                        st.session_state.chat_view_id = item["view_id"]
+                        durable_messages = _load_durable_chat_messages(
+                            repository=st.session_state.repository,
+                            user_id=user_id,
+                            conversation_id=str(item["view_id"]),
+                        )
+                        st.session_state.chat_messages = durable_messages or [
+                            dict(message)
+                            for message in item.get("messages", [])
+                        ]
+                        st.session_state.new_chat_notice = (
+                            "Restored the selected conversation and its exact "
+                            "execution cursor."
+                        )
+                        st.rerun()
 
     notice = st.session_state.pop("new_chat_notice", None)
     if notice:
@@ -767,13 +946,14 @@ def main() -> None:
                 request = ChatRequest(
                     user_id=user_id,
                     raw_query=query,
+                    conversation_id=st.session_state.chat_view_id,
+                    parent_hop_id=_latest_visible_hop_id(
+                        st.session_state.chat_messages
+                    ),
                     idempotency_key=(
                         f"streamlit-chat:{st.session_state.chat_view_id}:"
                         f"{uuid4().hex}"
                     ),
-                    # Do not pass the UI-only chat_view_id or its summary.
-                    # Every visual chat deliberately shares the same
-                    # application-level user/conversation history.
                     platform_context={
                         "gmail_username": gmail_username,
                         "gmail_app_password": gmail_app_password,

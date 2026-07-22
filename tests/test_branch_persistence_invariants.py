@@ -225,7 +225,7 @@ def test_every_reached_main_branch_outcome_persists_and_indexes_one_hop(
     assert status == "completed"
 
 
-def test_top_level_clarification_branch_remains_exempt_from_hop_persistence() -> None:
+def test_top_level_clarification_branch_is_durably_persisted() -> None:
     repository = _repository()
     router = BranchRouter(
         {
@@ -245,9 +245,9 @@ def test_top_level_clarification_branch_remains_exempt_from_hop_persistence() ->
 
     result = router.route(_context(Intent.CLARIFICATION), repository)
 
-    assert result.linked_hop_id is None
-    assert repository.table_count("conversation_hops") == 0
-    assert repository.table_count("indexing_outbox") == 0
+    assert result.linked_hop_id is not None
+    assert repository.table_count("conversation_hops") == 1
+    assert repository.table_count("indexing_outbox") == 1
 
 
 class _Store:

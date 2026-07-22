@@ -319,9 +319,7 @@ def test_strict_idempotency_policy_rejects_unkeyed_reminder_reply_without_side_e
     result = client.post("/reminders/reminder-1/reply", json=_payload())
 
     assert result.status_code == 400
-    assert result.json()["detail"] == (
-        "idempotency_key is required for mutation requests"
-    )
+    assert result.json()["detail"] == "idempotency_key is required for chat requests"
     assert pipeline.requests == []
     assert pipeline.last_qa_store.saved == []
     assert repository.notification_status == "unread"

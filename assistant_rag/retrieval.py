@@ -63,6 +63,8 @@ class HybridRetriever:
     chroma_top_k: int = RETRIEVAL_PIPELINE_POLICY.source_top_k
     rerank_min_score: float = DEFAULT_CROSS_ENCODER_MIN_SCORE
     conversation_min_confidence_score: float = 0.50
+    # Strict total active-row budget for an authoritative SQL recovery snapshot.
+    sql_fallback_candidate_limit: int = 200
 
     def __post_init__(self) -> None:
         RetrievalPipelinePolicy(
@@ -78,6 +80,8 @@ class HybridRetriever:
             raise ValueError(
                 "Conversation minimum confidence must be between 0 and 1"
             )
+        if self.sql_fallback_candidate_limit <= 0:
+            raise ValueError("SQL fallback candidate budget must be positive")
 
     def retrieve_conversation(
         self, *, user_id: str, query: str

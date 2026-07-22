@@ -66,12 +66,34 @@ def new_id() -> str:
     return uuid4().hex
 
 
+def require_stable_user_id(user_id: Any) -> str:
+    normalized = str(user_id or "").strip()
+    if not normalized:
+        raise RepositoryValidationError(
+            "user_id must be a non-empty stable identity"
+        )
+    return normalized
+
+
 def content_hash(user_id: str, text: str) -> str:
     digest = sha256()
     digest.update(user_id.encode("utf-8"))
     digest.update(b"\0")
     digest.update(text.encode("utf-8"))
     return digest.hexdigest()
+
+
+def knowledge_chunk_content_hash(
+    user_id: str,
+    text: str,
+    *,
+    source_id: str | None,
+) -> str:
+    """Keep durable deduplication inside one immutable provenance scope."""
+
+    if source_id is None:
+        return content_hash(user_id, text)
+    return content_hash(user_id, f"{len(source_id)}:{source_id}\0{text}")
 
 
 def _optional_datetime(value: Any) -> datetime | None:
@@ -336,6 +358,11 @@ class SQLiteRepository(AssistantRepository):
             CREATE INDEX IF NOT EXISTS idx_sources_user_status ON knowledge_sources(user_id, processing_status);
             CREATE INDEX IF NOT EXISTS idx_sources_user_hash ON knowledge_sources(user_id, content_hash);
             CREATE INDEX IF NOT EXISTS idx_chunks_user_source ON knowledge_chunks(user_id, source_id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_user_active_created ON knowledge_chunks(user_id, is_deleted, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_chunks_user_active_created_id ON knowledge_chunks(user_id, is_deleted, created_at DESC, chunk_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_outbox_status_updated ON indexing_outbox(status, updated_at, retry_count);
+            CREATE INDEX IF NOT EXISTS idx_outbox_entity_status ON indexing_outbox(entity_type, entity_id, status);
+            CREATE INDEX IF NOT EXISTS idx_outbox_entity_operation_created ON indexing_outbox(entity_type, entity_id, operation, created_at DESC, job_id DESC);
             CREATE INDEX IF NOT EXISTS idx_artifacts_user_status ON generated_artifacts(user_id, status);
             CREATE INDEX IF NOT EXISTS idx_platform_deliveries_user_created ON platform_deliveries(user_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_reminders_user_status_time ON reminders(user_id, status, reminder_time);
@@ -656,6 +683,27 @@ class SQLiteRepository(AssistantRepository):
         if topic:
             return str(topic["topic_id"])
 
+        return self.create_topic(
+            cursor,
+            user_id=user_id,
+            title=title,
+            topic_summary=topic_summary,
+            state_summary=state_summary,
+            entities=entities,
+        )
+
+    def create_topic(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        user_id: str,
+        title: str,
+        topic_summary: str = "",
+        state_summary: str = "",
+        entities: dict[str, Any] | None = None,
+    ) -> str:
+        """Create a fresh active topic even when another title matches."""
+
         topic_id = new_id()
         timestamp = now_iso()
         cursor.execute(
@@ -706,12 +754,86 @@ class SQLiteRepository(AssistantRepository):
         if not topic:
             raise ValueError("Active conversation topic not found for user")
 
-        previous_hop_id = topic["last_hop_id"]
-        root_hop_id = self._resolve_root_hop(cursor, previous_hop_id, parent_hop_id)
-        depth_from_root = self._resolve_depth(cursor, previous_hop_id, parent_hop_id)
         hop_id = hop_id or new_id()
+        topic_head_id = (
+            str(topic["last_hop_id"]) if topic["last_hop_id"] is not None else None
+        )
+        explicit_parent = parent_hop_id is not None
+        reference_hop_id = parent_hop_id if explicit_parent else topic_head_id
+        reference_hop: sqlite3.Row | None = None
+        if reference_hop_id:
+            reference_hop = self._require_owned_conversation_hop(
+                cursor,
+                user_id=user_id,
+                hop_id=reference_hop_id,
+                topic_id=topic_id,
+                require_active_topic=True,
+            )
+
+        # ``previous_hop_id`` is branch-local.  On an explicit resume it must
+        # point at the selected parent, not at an unrelated topic-global head.
+        previous_hop_id = reference_hop_id
+        root_hop_id = self._resolve_root_hop(
+            cursor,
+            reference_hop_id=reference_hop_id,
+            user_id=user_id,
+            topic_id=topic_id,
+        )
+        depth_from_root = self._resolve_depth(
+            cursor,
+            reference_hop_id=reference_hop_id,
+            user_id=user_id,
+            topic_id=topic_id,
+        )
+
+        reference_branch_id = (
+            str(reference_hop["branch_id"] or "")
+            if reference_hop is not None
+            else ""
+        ) or root_hop_id or reference_hop_id or hop_id
+        parent_has_branch_child = False
+        if explicit_parent and reference_hop is not None:
+            parent_has_branch_child = bool(
+                cursor.execute(
+                    """
+                    SELECT 1 FROM conversation_hops
+                    WHERE user_id = ?
+                      AND topic_id = ?
+                      AND COALESCE(branch_id, root_hop_id, hop_id) = ?
+                      AND previous_hop_id = ?
+                    LIMIT 1
+                    """,
+                    (
+                        user_id,
+                        topic_id,
+                        reference_branch_id,
+                        reference_hop_id,
+                    ),
+                ).fetchone()
+            )
+        if not reference_hop:
+            effective_branch_id = branch_id or hop_id
+        elif parent_has_branch_child:
+            if branch_id:
+                reused_branch = cursor.execute(
+                    """
+                    SELECT 1 FROM conversation_hops
+                    WHERE user_id = ? AND topic_id = ? AND branch_id = ?
+                    LIMIT 1
+                    """,
+                    (user_id, topic_id, branch_id),
+                ).fetchone()
+                if reused_branch:
+                    raise ValueError(
+                        "Resuming an older conversation hop requires a new branch"
+                    )
+            effective_branch_id = branch_id or hop_id
+        else:
+            if branch_id and branch_id != reference_branch_id:
+                raise ValueError("Conversation branch does not match selected hop")
+            effective_branch_id = reference_branch_id
+
         timestamp = now_iso()
-        effective_branch_id = branch_id or root_hop_id or hop_id
         questions_json = json.dumps(supporting_questions or [])
         entities_json = json.dumps(entities or {})
         cursor.execute(
@@ -751,10 +873,12 @@ class SQLiteRepository(AssistantRepository):
             """
             UPDATE conversation_topics
             SET last_hop_id = ?, updated_at = ?, version = version + 1
-            WHERE topic_id = ? AND user_id = ?
+            WHERE topic_id = ? AND user_id = ? AND status = 'active'
             """,
             (hop_id, timestamp, topic_id, user_id),
         )
+        if cursor.rowcount != 1:
+            raise ValueError("Active conversation topic could not be updated")
         outbox_job_id = self.insert_outbox_job(
             cursor,
             entity_type=OutboxEntityType.CONVERSATION_HOP,
@@ -794,6 +918,236 @@ class SQLiteRepository(AssistantRepository):
         )
         if cursor.rowcount != 1:
             raise ValueError("Conversation hop entities could not be updated")
+
+    def get_conversation_hop(self, *, user_id: str, hop_id: str) -> dict[str, Any]:
+        cursor = self.connection.cursor()
+        try:
+            return dict(
+                self._require_owned_conversation_hop(
+                    cursor,
+                    user_id=user_id,
+                    hop_id=hop_id,
+                )
+            )
+        finally:
+            cursor.close()
+
+    def claim_conversation_scope(
+        self,
+        *,
+        user_id: str,
+        hop_id: str,
+        conversation_id: str,
+    ) -> bool:
+        """Atomically bind an unscoped legacy hop and its active topic."""
+
+        def entities(value: Any) -> dict[str, Any]:
+            try:
+                parsed = value if isinstance(value, dict) else json.loads(str(value or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = {}
+            return dict(parsed) if isinstance(parsed, dict) else {}
+
+        with self.transaction() as cursor:
+            row = self._require_owned_conversation_hop(
+                cursor,
+                user_id=user_id,
+                hop_id=hop_id,
+                require_active_topic=True,
+            )
+            hop_entities = entities(row["entities_json"])
+            topic_entities = entities(row["topic_entities_json"])
+            existing = str(
+                hop_entities.get("conversation_id")
+                or topic_entities.get("conversation_id")
+                or ""
+            ).strip()
+            if existing and existing != conversation_id:
+                return False
+            hop_entities["conversation_id"] = conversation_id
+            topic_entities["conversation_id"] = conversation_id
+            timestamp = now_iso()
+            cursor.execute(
+                """
+                UPDATE conversation_hops
+                SET entities_json = ?, updated_at = ?, version = version + 1
+                WHERE hop_id = ? AND user_id = ?
+                """,
+                (json.dumps(hop_entities), timestamp, hop_id, user_id),
+            )
+            cursor.execute(
+                """
+                UPDATE conversation_topics
+                SET entities_json = ?, updated_at = ?, version = version + 1
+                WHERE topic_id = ? AND user_id = ? AND status = 'active'
+                """,
+                (json.dumps(topic_entities), timestamp, row["topic_id"], user_id),
+            )
+            return cursor.rowcount == 1
+
+    def list_conversations(
+        self,
+        *,
+        user_id: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """List user-owned durable UI conversation cursors."""
+
+        rows = self.connection.execute(
+            """
+            SELECT topic_id, title, topic_summary, entities_json, last_hop_id,
+                   created_at, updated_at
+            FROM conversation_topics
+            WHERE user_id = ? AND status = 'active'
+            ORDER BY updated_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+        conversations: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in rows:
+            try:
+                entities = json.loads(str(row["entities_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                entities = {}
+            conversation_id = str(
+                entities.get("conversation_id") if isinstance(entities, dict) else ""
+            ).strip()
+            if not conversation_id:
+                hop_rows = self.connection.execute(
+                    """
+                    SELECT entities_json FROM conversation_hops
+                    WHERE user_id = ? AND topic_id = ?
+                    ORDER BY created_at DESC
+                    """,
+                    (user_id, row["topic_id"]),
+                ).fetchall()
+                for hop_row in hop_rows:
+                    try:
+                        hop_entities = json.loads(
+                            str(hop_row["entities_json"] or "{}")
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    conversation_id = str(
+                        hop_entities.get("conversation_id")
+                        if isinstance(hop_entities, dict)
+                        else ""
+                    ).strip()
+                    if conversation_id:
+                        break
+            if not conversation_id or conversation_id in seen:
+                continue
+            seen.add(conversation_id)
+            latest = None
+            if row["last_hop_id"]:
+                latest = self.connection.execute(
+                    """
+                    SELECT raw_user_query, raw_response, entities_json
+                    FROM conversation_hops
+                    WHERE user_id = ? AND topic_id = ? AND hop_id = ?
+                    """,
+                    (user_id, row["topic_id"], row["last_hop_id"]),
+                ).fetchone()
+            latest_query = str(latest["raw_user_query"] or "") if latest else ""
+            latest_response = str(latest["raw_response"] or "") if latest else ""
+            if latest:
+                try:
+                    latest_entities = json.loads(str(latest["entities_json"] or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    latest_entities = {}
+                if isinstance(latest_entities, dict):
+                    latest_response = str(
+                        latest_entities.get("final_chat_text") or latest_response
+                    )
+            conversations.append(
+                {
+                    "conversation_id": conversation_id,
+                    "topic_id": str(row["topic_id"]),
+                    "title": str(row["title"] or latest_query or "Conversation"),
+                    "summary": str(
+                        row["topic_summary"] or latest_response or latest_query
+                    )[:240],
+                    "created_at": str(row["created_at"] or ""),
+                    "updated_at": str(row["updated_at"] or ""),
+                    "latest_hop_id": (
+                        str(row["last_hop_id"]) if row["last_hop_id"] else None
+                    ),
+                }
+            )
+            if len(conversations) >= max(1, int(limit)):
+                break
+        return conversations
+
+    def load_conversation(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+    ) -> dict[str, Any]:
+        """Load the latest branch lineage and exact stored transcript."""
+
+        summary = next(
+            (
+                item
+                for item in self.list_conversations(user_id=user_id, limit=1000)
+                if item["conversation_id"] == conversation_id
+            ),
+            None,
+        )
+        if summary is None:
+            return {}
+        rows = self.connection.execute(
+            """
+            SELECT * FROM conversation_hops
+            WHERE user_id = ? AND topic_id = ?
+            """,
+            (user_id, summary["topic_id"]),
+        ).fetchall()
+        by_id = {str(row["hop_id"]): dict(row) for row in rows}
+        lineage: list[dict[str, Any]] = []
+        current_id = str(summary.get("latest_hop_id") or "")
+        seen: set[str] = set()
+        while current_id and current_id not in seen and len(lineage) < 1000:
+            seen.add(current_id)
+            hop = by_id.get(current_id)
+            if hop is None:
+                break
+            lineage.append(hop)
+            current_id = str(hop.get("previous_hop_id") or "")
+        lineage.reverse()
+        messages: list[dict[str, Any]] = []
+        for hop in lineage:
+            raw_query = str(hop.get("raw_user_query") or "").strip()
+            if raw_query:
+                messages.append({"role": "user", "content": raw_query})
+            try:
+                entities = json.loads(str(hop.get("entities_json") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                entities = {}
+            response = str(
+                (entities.get("final_chat_text") if isinstance(entities, dict) else "")
+                or hop.get("raw_response")
+                or hop.get("summarized_response")
+                or ""
+            ).strip()
+            artifacts = self.list_generated_artifacts_for_hop(
+                user_id=user_id,
+                hop_id=str(hop["hop_id"]),
+                include_deleted=False,
+            )
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": response,
+                    "artifacts": artifacts,
+                    "pending_confirmations": [],
+                    "response_type": str(hop.get("response_type") or "normal"),
+                    "conversation_topic_id": str(hop["topic_id"]),
+                    "conversation_hop_id": str(hop["hop_id"]),
+                }
+            )
+        return {**summary, "messages": messages}
 
     def scan_due_reminders(self, *, now_value: str, limit: int = 100) -> list[str]:
         notified: list[str] = []
@@ -1122,7 +1476,8 @@ class SQLiteRepository(AssistantRepository):
                 h.rewritten_user_query AS source_rewritten_user_query,
                 h.raw_response AS source_raw_response,
                 h.supporting_questions_json,
-                h.response_type AS source_response_type
+                h.response_type AS source_response_type,
+                h.entities_json AS source_entities_json
             FROM reminders r
             JOIN reminder_notifications n ON r.reminder_id = n.reminder_id
             LEFT JOIN conversation_hops h
@@ -1389,7 +1744,7 @@ class SQLiteRepository(AssistantRepository):
         topic_id: str,
         hop_id: str,
     ) -> bool:
-        """Validate a cached Last-QA link as the user's active latest SQL hop."""
+        """Validate a cached Last-QA link as an active branch head."""
 
         row = self.connection.execute(
             """
@@ -1402,7 +1757,15 @@ class SQLiteRepository(AssistantRepository):
               AND h.topic_id = ?
               AND h.hop_id = ?
               AND t.status = 'active'
-              AND t.last_hop_id = h.hop_id
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM conversation_hops child
+                  WHERE child.user_id = h.user_id
+                    AND child.topic_id = h.topic_id
+                    AND COALESCE(child.branch_id, child.root_hop_id, child.hop_id)
+                        = COALESCE(h.branch_id, h.root_hop_id, h.hop_id)
+                    AND child.previous_hop_id = h.hop_id
+              )
             LIMIT 1
             """,
             (user_id, topic_id, hop_id),
@@ -1440,6 +1803,25 @@ class SQLiteRepository(AssistantRepository):
         modified_by_user_query: str | None = None,
         knowledge_topic_id: str | None = None,
     ) -> tuple[str, str, str | None]:
+        user_id = require_stable_user_id(user_id)
+        normalized = " ".join(str(text or "").split())
+        if not normalized:
+            raise RepositoryValidationError(
+                "Knowledge chunk text must contain non-whitespace content"
+            )
+        if source_id is not None:
+            source = cursor.execute(
+                """
+                SELECT source_id FROM knowledge_sources
+                WHERE source_id = ? AND user_id = ? AND is_deleted = 0
+                  AND processing_status != 'deleted'
+                """,
+                (source_id, user_id),
+            ).fetchone()
+            if not source:
+                raise KnowledgeConflictError(
+                    "Knowledge source not found for user"
+                )
         if knowledge_topic_id is not None:
             topic = cursor.execute(
                 """
@@ -1459,8 +1841,11 @@ class SQLiteRepository(AssistantRepository):
                 user_id=user_id,
                 title=title,
             )
-        normalized = " ".join(text.split())
-        c_hash = content_hash(user_id, normalized)
+        c_hash = knowledge_chunk_content_hash(
+            user_id,
+            normalized,
+            source_id=source_id,
+        )
         
         existing = cursor.execute(
             """
@@ -1469,11 +1854,34 @@ class SQLiteRepository(AssistantRepository):
             """,
             (user_id, topic_id, c_hash)
         ).fetchone()
+        if existing is None and source_id is not None:
+            # Adopt pre-provenance-hash rows in place so an upgrade does not
+            # duplicate chunks already owned by this exact source.
+            legacy_hash = content_hash(user_id, normalized)
+            existing = cursor.execute(
+                """
+                SELECT chunk_id, is_deleted FROM knowledge_chunks
+                WHERE user_id = ? AND knowledge_topic_id = ?
+                  AND source_id = ? AND content_hash = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (user_id, topic_id, source_id, legacy_hash),
+            ).fetchone()
+            if existing is not None:
+                cursor.execute(
+                    """
+                    UPDATE knowledge_chunks SET content_hash = ?
+                    WHERE user_id = ? AND chunk_id = ?
+                    """,
+                    (c_hash, user_id, existing["chunk_id"]),
+                )
         
         if existing:
             existing_chunk_id = existing["chunk_id"]
             if existing["is_deleted"] == 0:
-                # Already active, no-op
+                # Preserve the low-level idempotency signal. The mutation
+                # transaction turns this signal into a repair UPSERT without
+                # misreporting the duplicate as newly-created knowledge.
                 return topic_id, existing_chunk_id, None
             else:
                 # Reactivate deleted chunk
@@ -1606,9 +2014,8 @@ class SQLiteRepository(AssistantRepository):
         params.extend(chunk_ids)
         if not include_deleted:
             query += " AND is_deleted = 0"
-        with self.transaction() as cursor:
-            rows = cursor.execute(query, params).fetchall()
-            return [dict(r) for r in rows]
+        rows = self.connection.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
 
     def soft_delete_knowledge_chunk(
         self,
@@ -1657,6 +2064,7 @@ class SQLiteRepository(AssistantRepository):
         metadata: dict[str, Any] | None = None,
         processing_status: str = KnowledgeSourceStatus.PENDING.value,
     ) -> str:
+        user_id = require_stable_user_id(user_id)
         source_id = new_id()
         timestamp = now_iso()
         cursor.execute(
@@ -1800,6 +2208,7 @@ class SQLiteRepository(AssistantRepository):
     def list_knowledge_facts(
         self, *, user_id: str, include_deleted: bool = False, source_id: str | None = None
     ) -> list[dict[str, Any]]:
+        user_id = require_stable_user_id(user_id)
         query = "SELECT * FROM knowledge_chunks WHERE user_id = ?"
         params: list[Any] = [user_id]
         if not include_deleted:
@@ -1809,6 +2218,42 @@ class SQLiteRepository(AssistantRepository):
             params.append(source_id)
         query += " ORDER BY created_at DESC"
         return [dict(row) for row in self.connection.execute(query, params).fetchall()]
+
+    def list_knowledge_recovery_candidates(
+        self,
+        *,
+        user_id: str,
+        limit: int,
+        before_created_at: str | None = None,
+        before_chunk_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        user_id = require_stable_user_id(user_id)
+        page_size = int(limit)
+        if page_size <= 0:
+            raise ValueError("Knowledge recovery page size must be positive")
+        if (before_created_at is None) != (before_chunk_id is None):
+            raise ValueError("Knowledge recovery cursor must be complete")
+        query = """
+            SELECT c.* FROM knowledge_chunks c
+            WHERE c.user_id = ? AND c.is_deleted = 0
+        """
+        params: list[Any] = [user_id]
+        if before_created_at is not None and before_chunk_id is not None:
+            query += """
+                AND (
+                    c.created_at < ?
+                    OR (c.created_at = ? AND c.chunk_id < ?)
+                )
+            """
+            params.extend(
+                [before_created_at, before_created_at, before_chunk_id]
+            )
+        query += " ORDER BY c.created_at DESC, c.chunk_id DESC LIMIT ?"
+        params.append(page_size)
+        return [
+            dict(row)
+            for row in self.connection.execute(query, params).fetchall()
+        ]
 
     def restore_knowledge_chunk(self, *, user_id: str, chunk_id: str) -> str:
         with self.transaction() as cursor:
@@ -1906,6 +2351,12 @@ class SQLiteRepository(AssistantRepository):
         artifact_id = new_id()
         timestamp = now_iso()
         with self.transaction() as cursor:
+            if conversation_hop_id is not None:
+                self._require_owned_conversation_hop(
+                    cursor,
+                    user_id=user_id,
+                    hop_id=conversation_hop_id,
+                )
             cursor.execute(
                 """
                 INSERT INTO generated_artifacts (
@@ -1953,6 +2404,36 @@ class SQLiteRepository(AssistantRepository):
             raise ValueError("Artifact not found for user")
         return dict(row)
 
+    def list_generated_artifacts_for_hop(
+        self,
+        *,
+        user_id: str,
+        hop_id: str,
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
+        cursor = self.connection.cursor()
+        try:
+            self._require_owned_conversation_hop(
+                cursor,
+                user_id=user_id,
+                hop_id=hop_id,
+            )
+            query = """
+                SELECT a.*
+                FROM generated_artifacts a
+                WHERE a.user_id = ? AND a.conversation_hop_id = ?
+            """
+            params: list[Any] = [user_id, hop_id]
+            if not include_deleted:
+                query += " AND a.status = 'created'"
+            query += " ORDER BY a.created_at DESC, a.artifact_id DESC"
+            payloads = [dict(row) for row in cursor.execute(query, params).fetchall()]
+            if not include_deleted:
+                payloads = [row for row in payloads if is_artifact_downloadable(row)]
+            return payloads
+        finally:
+            cursor.close()
+
     def bind_generated_artifacts(
         self,
         *,
@@ -1961,16 +2442,17 @@ class SQLiteRepository(AssistantRepository):
         conversation_hop_id: str,
     ) -> list[str]:
         unique_ids = list(dict.fromkeys(str(value) for value in artifact_ids if value))
-        if not unique_ids or not conversation_hop_id:
+        if not unique_ids:
             return []
+        if not conversation_hop_id:
+            raise ValueError("Conversation hop not found for user and topic")
         placeholders = ", ".join("?" for _ in unique_ids)
         with self.transaction() as cursor:
-            owner = cursor.execute(
-                "SELECT 1 FROM conversation_hops WHERE user_id = ? AND hop_id = ?",
-                (user_id, conversation_hop_id),
-            ).fetchone()
-            if not owner:
-                raise ValueError("Conversation hop not found for user")
+            self._require_owned_conversation_hop(
+                cursor,
+                user_id=user_id,
+                hop_id=conversation_hop_id,
+            )
             cursor.execute(
                 f"""
                 UPDATE generated_artifacts
@@ -2012,12 +2494,52 @@ class SQLiteRepository(AssistantRepository):
     def record_platform_delivery(self, *, user_id: str, conversation_hop_id: str | None, channel: str, status: str, recipient: str, message: dict[str, Any], error_message: str | None = None) -> dict[str, Any]:
         delivery_id = new_id()
         with self.transaction() as cursor:
+            if conversation_hop_id is not None:
+                self._require_owned_conversation_hop(
+                    cursor,
+                    user_id=user_id,
+                    hop_id=conversation_hop_id,
+                )
             cursor.execute(
                 """INSERT INTO platform_deliveries (delivery_id, user_id, conversation_hop_id, channel, status, recipient, message_json, error_message, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (delivery_id, user_id, conversation_hop_id, channel, status, recipient, json.dumps(message), error_message, now_iso()),
             )
         return {"delivery_id": delivery_id, "channel": channel, "status": status}
+
+    def get_latest_platform_delivery_for_hop(
+        self,
+        *,
+        user_id: str,
+        hop_id: str,
+    ) -> dict[str, Any] | None:
+        cursor = self.connection.cursor()
+        try:
+            self._require_owned_conversation_hop(
+                cursor,
+                user_id=user_id,
+                hop_id=hop_id,
+            )
+            row = cursor.execute(
+                """
+                SELECT * FROM platform_deliveries
+                WHERE user_id = ? AND conversation_hop_id = ?
+                ORDER BY created_at DESC, delivery_id DESC
+                LIMIT 1
+                """,
+                (user_id, hop_id),
+            ).fetchone()
+            if not row:
+                return None
+            payload = dict(row)
+            try:
+                parsed_message = json.loads(str(payload.get("message_json") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed_message = {}
+            payload["message"] = parsed_message if isinstance(parsed_message, dict) else {}
+            return payload
+        finally:
+            cursor.close()
 
     def add_reminder(
         self,
@@ -2231,10 +2753,17 @@ class SQLiteRepository(AssistantRepository):
         intent: str,
         response_type: str,
         parent_hop_id: str | None = None,
+        conversation_id: str | None = None,
     ) -> RepositoryTransactionResult:
         try:
             with self.transaction() as cursor:
-                topic_id = self.ensure_topic(cursor, user_id=user_id, title=topic_title)
+                topic_id = self.conversation_topic_for_write(
+                    cursor,
+                    user_id=user_id,
+                    title=topic_title,
+                    parent_hop_id=parent_hop_id,
+                    conversation_id=conversation_id,
+                )
                 hop = self.append_conversation_hop(
                     cursor,
                     topic_id=topic_id,
@@ -2245,6 +2774,11 @@ class SQLiteRepository(AssistantRepository):
                     raw_response=response_text,
                     response_type=response_type,
                     parent_hop_id=parent_hop_id,
+                    entities=(
+                        {"conversation_id": conversation_id}
+                        if conversation_id
+                        else None
+                    ),
                 )
                 result = RepositoryActionResult(
                     action_id=new_id(),
@@ -2281,13 +2815,20 @@ class SQLiteRepository(AssistantRepository):
         response_text: str,
         actions: list[ValidatedKnowledgeAction],
         parent_hop_id: str | None = None,
+        conversation_id: str | None = None,
     ) -> RepositoryTransactionResult:
         for action in actions:
             if action.validation_result != ActionValidationResult.EXECUTE:
                 raise ValueError("Repository methods must receive only executable actions.")
         try:
             with self.transaction() as cursor:
-                topic_id = self.ensure_topic(cursor, user_id=user_id, title=topic_title)
+                topic_id = self.conversation_topic_for_write(
+                    cursor,
+                    user_id=user_id,
+                    title=topic_title,
+                    parent_hop_id=parent_hop_id,
+                    conversation_id=conversation_id,
+                )
                 results: list[RepositoryActionResult] = []
                 outbox_jobs: list[str] = []
                 knowledge_entities: list[dict[str, Any]] = []
@@ -2332,7 +2873,14 @@ class SQLiteRepository(AssistantRepository):
                     raw_response=response_text,
                     response_type="knowledge_action",
                     parent_hop_id=parent_hop_id,
-                    entities={"knowledge": knowledge_entities},
+                    entities={
+                        "knowledge": knowledge_entities,
+                        **(
+                            {"conversation_id": conversation_id}
+                            if conversation_id
+                            else {}
+                        ),
+                    },
                 )
                 outbox_jobs.append(hop.outbox_job_id)
                 updated_results = []
@@ -2383,13 +2931,20 @@ class SQLiteRepository(AssistantRepository):
         response_text: str,
         actions: list[ValidatedReminderAction],
         parent_hop_id: str | None = None,
+        conversation_id: str | None = None,
     ) -> RepositoryTransactionResult:
         for action in actions:
             if action.validation_result != ActionValidationResult.EXECUTE:
                 raise ValueError("Repository methods must receive only executable actions.")
         try:
             with self.transaction() as cursor:
-                topic_id = self.ensure_topic(cursor, user_id=user_id, title=topic_title)
+                topic_id = self.conversation_topic_for_write(
+                    cursor,
+                    user_id=user_id,
+                    title=topic_title,
+                    parent_hop_id=parent_hop_id,
+                    conversation_id=conversation_id,
+                )
                 results: list[RepositoryActionResult] = []
                 reminder_entities: list[dict[str, str]] = []
                 audit_hop_id = new_id()
@@ -2402,7 +2957,14 @@ class SQLiteRepository(AssistantRepository):
                     rewritten_user_query=rewritten_user_query,
                     raw_response=response_text,
                     response_type="reminder_action",
-                    entities={"reminders": reminder_entities},
+                    entities={
+                        "reminders": reminder_entities,
+                        **(
+                            {"conversation_id": conversation_id}
+                            if conversation_id
+                            else {}
+                        ),
+                    },
                     hop_id=audit_hop_id,
                     parent_hop_id=parent_hop_id,
                 )
@@ -2421,7 +2983,21 @@ class SQLiteRepository(AssistantRepository):
                         )
                 cursor.execute(
                     "UPDATE conversation_hops SET entities_json = ?, updated_at = ? WHERE hop_id = ? AND user_id = ?",
-                    (json.dumps({"reminders": reminder_entities}), now_iso(), hop.hop_id, user_id),
+                    (
+                        json.dumps(
+                            {
+                                "reminders": reminder_entities,
+                                **(
+                                    {"conversation_id": conversation_id}
+                                    if conversation_id
+                                    else {}
+                                ),
+                            }
+                        ),
+                        now_iso(),
+                        hop.hop_id,
+                        user_id,
+                    ),
                 )
                 updated_results = []
                 for r in results:
@@ -2474,6 +3050,17 @@ class SQLiteRepository(AssistantRepository):
                 source_id=None,
                 metadata=None,
             )
+            was_already_known = outbox_job_id is None
+            if was_already_known:
+                # A repeated durable write is also an opportunity to repair a
+                # stale or failed derived index. This job is idempotent, while
+                # the user-facing mutation result remains a semantic no-op.
+                outbox_job_id = self.insert_outbox_job(
+                    cursor,
+                    entity_type=OutboxEntityType.KNOWLEDGE_CHUNK,
+                    entity_id=chunk_id,
+                    operation=OutboxOperation.UPSERT,
+                )
             self._touch_knowledge_topic(
                 cursor,
                 user_id=user_id,
@@ -2486,7 +3073,11 @@ class SQLiteRepository(AssistantRepository):
                 domain_entity_type="knowledge_chunk",
                 domain_entity_id=chunk_id,
                 indexing_outbox_ids=(outbox_job_id,) if outbox_job_id else (),
-                user_safe_summary="Added new knowledge." if outbox_job_id else "Knowledge was already known.",
+                user_safe_summary=(
+                    "Knowledge was already known."
+                    if was_already_known
+                    else "Added new knowledge."
+                ),
             )
         if action_type in {KnowledgeAction.DELETE, KnowledgeAction.MODIFY}:
             chunk_id = action.target_chunk_ids[0]
@@ -2857,28 +3448,99 @@ class SQLiteRepository(AssistantRepository):
             )
 
     def _resolve_root_hop(
-        self, cursor: sqlite3.Cursor, previous_hop_id: str | None, parent_hop_id: str | None
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        reference_hop_id: str | None,
+        user_id: str,
+        topic_id: str,
     ) -> str | None:
-        reference = parent_hop_id or previous_hop_id
-        if not reference:
+        if not reference_hop_id:
             return None
         row = cursor.execute(
-            "SELECT COALESCE(root_hop_id, hop_id) AS root_hop_id FROM conversation_hops WHERE hop_id = ?",
-            (reference,),
+            """
+            SELECT COALESCE(h.root_hop_id, h.hop_id) AS root_hop_id
+            FROM conversation_hops h
+            JOIN conversation_topics t
+              ON t.topic_id = h.topic_id AND t.user_id = h.user_id
+            WHERE h.hop_id = ?
+              AND h.user_id = ?
+              AND h.topic_id = ?
+              AND t.status = 'active'
+            """,
+            (reference_hop_id, user_id, topic_id),
         ).fetchone()
-        return str(row["root_hop_id"]) if row else None
+        if not row:
+            raise ValueError("Active conversation hop not found for user and topic")
+        root_hop_id = str(row["root_hop_id"])
+        self._require_owned_conversation_hop(
+            cursor,
+            user_id=user_id,
+            hop_id=root_hop_id,
+            topic_id=topic_id,
+            require_active_topic=True,
+        )
+        return root_hop_id
 
     def _resolve_depth(
-        self, cursor: sqlite3.Cursor, previous_hop_id: str | None, parent_hop_id: str | None
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        reference_hop_id: str | None,
+        user_id: str,
+        topic_id: str,
     ) -> int:
-        reference = parent_hop_id or previous_hop_id
-        if not reference:
+        if not reference_hop_id:
             return 0
         row = cursor.execute(
-            "SELECT depth_from_root FROM conversation_hops WHERE hop_id = ?",
-            (reference,),
+            """
+            SELECT h.depth_from_root
+            FROM conversation_hops h
+            JOIN conversation_topics t
+              ON t.topic_id = h.topic_id AND t.user_id = h.user_id
+            WHERE h.hop_id = ?
+              AND h.user_id = ?
+              AND h.topic_id = ?
+              AND t.status = 'active'
+            """,
+            (reference_hop_id, user_id, topic_id),
         ).fetchone()
-        return int(row["depth_from_root"]) + 1 if row else 0
+        if not row:
+            raise ValueError("Active conversation hop not found for user and topic")
+        return int(row["depth_from_root"]) + 1
+
+    def _require_owned_conversation_hop(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        user_id: str,
+        hop_id: str,
+        topic_id: str | None = None,
+        require_active_topic: bool = False,
+    ) -> sqlite3.Row:
+        conditions = ["h.user_id = ?", "h.hop_id = ?"]
+        params: list[Any] = [user_id, hop_id]
+        if topic_id is not None:
+            conditions.append("h.topic_id = ?")
+            params.append(topic_id)
+        if require_active_topic:
+            conditions.append("t.status = 'active'")
+        row = cursor.execute(
+            f"""
+            SELECT h.*, t.status AS topic_status,
+                   t.entities_json AS topic_entities_json
+            FROM conversation_hops h
+            JOIN conversation_topics t
+              ON t.topic_id = h.topic_id AND t.user_id = h.user_id
+            WHERE {' AND '.join(conditions)}
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        if not row:
+            qualifier = "Active conversation hop" if require_active_topic else "Conversation hop"
+            raise ValueError(f"{qualifier} not found for user and topic")
+        return row
 
     def table_count(self, table_name: str) -> int:
         if table_name not in {
@@ -3042,37 +3704,57 @@ class SQLiteRepository(AssistantRepository):
         self, *, user_id: str, idempotency_key: str, payload_hash: str
     ) -> IdempotencyClaimResult:
         timestamp = now_iso()
-        existing = self.connection.execute(
-            """
-            SELECT request_id, payload_hash, status, stored_response_json
-            FROM mutation_requests
-            WHERE user_id = ? AND idempotency_key = ?
-            """,
-            (user_id, idempotency_key),
-        ).fetchone()
-        if existing:
-            if existing["payload_hash"] != payload_hash:
-                return IdempotencyClaimResult(
-                    status="conflict",
-                    request_id=existing["request_id"],
-                    reason="idempotency_conflict",
-                )
-            if existing["status"] == MutationRequestStatus.COMPLETED.value:
-                return IdempotencyClaimResult(
-                    status="replay",
-                    request_id=existing["request_id"],
-                    stored_response_json=existing["stored_response_json"],
-                )
-            if existing["status"] == MutationRequestStatus.IN_PROGRESS.value:
-                return IdempotencyClaimResult(
-                    status="in_progress",
-                    request_id=existing["request_id"],
-                    reason="request_in_progress",
-                )
-            return IdempotencyClaimResult(status="failed_retry", request_id=existing["request_id"])
-
-        request_id = new_id()
+        # BEGIN IMMEDIATE covers the first read and insert. Two SQLite
+        # connections can therefore never both observe an absent key and both
+        # execute the protected operation.
         with self.transaction() as cursor:
+            existing = cursor.execute(
+                """
+                SELECT request_id, payload_hash, status, stored_response_json
+                FROM mutation_requests
+                WHERE user_id = ? AND idempotency_key = ?
+                """,
+                (user_id, idempotency_key),
+            ).fetchone()
+            if existing:
+                if existing["payload_hash"] != payload_hash:
+                    return IdempotencyClaimResult(
+                        status="conflict",
+                        request_id=existing["request_id"],
+                        reason="idempotency_conflict",
+                    )
+                if existing["status"] == MutationRequestStatus.COMPLETED.value:
+                    return IdempotencyClaimResult(
+                        status="replay",
+                        request_id=existing["request_id"],
+                        stored_response_json=existing["stored_response_json"],
+                    )
+                if existing["status"] == MutationRequestStatus.IN_PROGRESS.value:
+                    return IdempotencyClaimResult(
+                        status="in_progress",
+                        request_id=existing["request_id"],
+                        reason="request_in_progress",
+                    )
+                cursor.execute(
+                    """
+                    UPDATE mutation_requests
+                    SET status = 'in_progress', updated_at = ?
+                    WHERE request_id = ? AND status = 'failed'
+                    """,
+                    (timestamp, existing["request_id"]),
+                )
+                if cursor.rowcount != 1:
+                    return IdempotencyClaimResult(
+                        status="in_progress",
+                        request_id=existing["request_id"],
+                        reason="request_in_progress",
+                    )
+                return IdempotencyClaimResult(
+                    status="failed_retry",
+                    request_id=existing["request_id"],
+                )
+
+            request_id = new_id()
             cursor.execute(
                 """
                 INSERT INTO mutation_requests (
@@ -3082,7 +3764,7 @@ class SQLiteRepository(AssistantRepository):
                 """,
                 (request_id, user_id, idempotency_key, payload_hash, timestamp, timestamp),
             )
-        return IdempotencyClaimResult(status="started", request_id=request_id)
+            return IdempotencyClaimResult(status="started", request_id=request_id)
 
     def complete_idempotency_request(self, *, request_id: str, stored_response_json: str) -> None:
         with self.transaction() as cursor:
@@ -3101,7 +3783,7 @@ class SQLiteRepository(AssistantRepository):
                 """
                 UPDATE mutation_requests
                 SET status = 'failed', updated_at = ?
-                WHERE request_id = ?
+                WHERE request_id = ? AND status != 'completed'
                 """,
                 (now_iso(), request_id),
             )

@@ -26,7 +26,12 @@ from .contracts import (
     ValidatedReminderAction,
 )
 from .database import AssistantRepository
-from .llm import LLMClient, LLMTask, is_structured_fallback
+from .llm import (
+    LLMClient,
+    LLMTask,
+    StructuredOutputInvariantError,
+    is_structured_fallback,
+)
 from .prompts import (
     PromptContext,
     PromptRegistry,
@@ -123,6 +128,53 @@ def _is_normalized_utc_timestamp(value: str) -> bool:
     )
 
 
+def _canonical_utc_from_model_time(
+    value: str,
+    *,
+    trusted_timezone: str,
+) -> str | None:
+    """Canonicalize a declared local wall clock without guessing language.
+
+    Model 1 may copy an already-normalized UTC instant, but natural-language
+    times are represented as a naive local ISO-8601 wall clock. ZoneInfo owns
+    offset arithmetic. Ambiguous and nonexistent DST wall clocks fail closed.
+    """
+
+    parsed = _parse_datetime(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is not None:
+        if parsed.utcoffset() == timedelta(0):
+            return parsed.astimezone(timezone.utc).isoformat()
+        try:
+            zone = ZoneInfo(trusted_timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            return None
+        candidate = parsed.astimezone(timezone.utc)
+        trusted_local = candidate.astimezone(zone)
+        if (
+            trusted_local.replace(tzinfo=None) != parsed.replace(tzinfo=None)
+            or trusted_local.utcoffset() != parsed.utcoffset()
+        ):
+            return None
+        return candidate.isoformat()
+    try:
+        zone = ZoneInfo(trusted_timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+
+    candidates: set[datetime] = set()
+    for fold in (0, 1):
+        localized = parsed.replace(tzinfo=zone, fold=fold)
+        candidate = localized.astimezone(timezone.utc)
+        round_trip = candidate.astimezone(zone).replace(tzinfo=None)
+        if round_trip == parsed:
+            candidates.add(candidate)
+    if len(candidates) != 1:
+        return None
+    return next(iter(candidates)).isoformat()
+
+
 def _is_valid_iana_timezone(value: str) -> bool:
     try:
         ZoneInfo(value)
@@ -134,21 +186,50 @@ def _is_valid_iana_timezone(value: str) -> bool:
 def _decode_field_values(
     raw_values: Any,
 ) -> tuple[list[str], dict[str, str]] | None:
-    """Parse the compact model-1 field list into one deterministic flat record."""
-    if not isinstance(raw_values, list):
-        return None
+    """Parse the model-facing field map or canonical pair list into one record."""
     field_order: list[str] = []
     values = {field: "" for field in REMINDER_EDITABLE_FIELDS}
+    if isinstance(raw_values, dict):
+        if any(
+            field not in _REMINDER_MODEL_MUTATION_FIELDS
+            or not isinstance(value, str)
+            for field, value in raw_values.items()
+        ):
+            return None
+        has_time_value = any(
+            bool(_text(raw_values.get(field))) for field in _TIME_FIELDS
+        )
+        field_order = [
+            field
+            for field in _REMINDER_MODEL_MUTATION_FIELDS
+            if field in raw_values
+            and (
+                bool(_text(raw_values[field]))
+                or field not in {"user_timezone", "original_time_text"}
+            )
+            and (
+                field not in {"user_timezone", "original_time_text"}
+                or has_time_value
+            )
+        ]
+        for field in field_order:
+            values[field] = _text(raw_values[field])
+        return field_order, values
+
+    # Canonical pair lists remain accepted behind the model boundary for
+    # persisted rolling-upgrade state and deterministic test doubles. The
+    # model-facing JSON Schema accepts only the flat object above, so malformed
+    # legacy arrays can never pass structured generation.
+    if not isinstance(raw_values, list):
+        return None
     for item in raw_values:
         if not isinstance(item, dict) or set(item) != {"field", "value"}:
             return None
         field = _text(item["field"])
         value = item["value"]
-        if (
-            field not in _REMINDER_MODEL_MUTATION_FIELDS
-            or field in field_order
-            or not isinstance(value, str)
-        ):
+        if field not in _REMINDER_MODEL_MUTATION_FIELDS or field in field_order:
+            return None
+        if not isinstance(value, str):
             return None
         field_order.append(field)
         values[field] = _text(value)
@@ -171,6 +252,34 @@ def _time_semantics_for(
     if relevant:
         return next(iter(relevant))
     return "unchanged"
+
+
+def _canonicalize_add_content(
+    *,
+    action_name: str,
+    retrieval_text: str,
+    supplied_fields: list[str],
+    values: dict[str, str],
+) -> tuple[list[str], dict[str, str]]:
+    """Derive required ADD display fields from one grounded model value.
+
+    This is a declared, lossless canonicalization of schema-valid data, not a
+    repair of malformed JSON: retrieval_text is already provenance-checked
+    against the current turn before it can become reminder content.
+    """
+
+    if action_name != ReminderAction.ADD.value or not retrieval_text:
+        return list(supplied_fields), dict(values)
+    canonical_values = dict(values)
+    canonical_fields = list(supplied_fields)
+    for field in ("subject", "raw_reminder"):
+        if canonical_values[field]:
+            continue
+        canonical_values[field] = retrieval_text
+        if field not in canonical_fields:
+            canonical_fields.append(field)
+    canonical_fields.sort(key=REMINDER_EDITABLE_FIELDS.index)
+    return canonical_fields, canonical_values
 
 
 @dataclass(frozen=True)
@@ -209,6 +318,8 @@ class LLMReminderActionDetector:
     ) -> None:
         if not 0.0 <= min_confidence <= 1.0:
             raise ValueError("Reminder action extraction confidence must be in [0, 1]")
+        if not _is_valid_iana_timezone(default_timezone):
+            raise ValueError("Reminder action extraction requires a valid default timezone")
         self.llm = llm
         self.prompts = prompts
         self.min_confidence = min_confidence
@@ -220,7 +331,8 @@ class LLMReminderActionDetector:
         rewritten_query: str,
         intent: Intent,
     ) -> ActionDetectionResult:
-        runtime_now_utc = datetime.now(timezone.utc).isoformat()
+        runtime_now = datetime.now(timezone.utc)
+        runtime_now_utc = runtime_now.isoformat()
         extraction_metadata = {
             key: value
             for key, value in request.metadata.items()
@@ -235,6 +347,15 @@ class LLMReminderActionDetector:
             }
         }
         chat_history = current_chat_history()
+        requested_timezone = _text(request.platform_context.get("timezone"))
+        trusted_timezone = (
+            requested_timezone
+            if requested_timezone and _is_valid_iana_timezone(requested_timezone)
+            else self.default_timezone
+        )
+        runtime_now_local = runtime_now.astimezone(
+            ZoneInfo(trusted_timezone)
+        ).isoformat()
         try:
             payload = self.llm.generate_json(
                 task=LLMTask.REMINDER_ACTION_EXTRACTION,
@@ -249,71 +370,26 @@ class LLMReminderActionDetector:
                         platform_context=request.platform_context,
                         chat_history=chat_history,
                         extra={
-                            "allowed_actions": [
-                                "add",
-                                "delete",
-                                "modify",
-                                "turn_on",
-                                "turn_off",
-                            ],
-                            "cardinality": "exactly_one",
-                            "editable_fields": list(_REMINDER_MODEL_MUTATION_FIELDS),
-                            "action_content_contract": {
-                                "add": {
-                                    "target": "retrieval_text",
-                                    "field_values": "all explicitly supplied new reminder fields",
-                                },
-                                "delete": {
-                                    "target": "retrieval_text",
-                                    "field_values": "empty",
-                                },
-                                "modify": {
-                                    "target": "retrieval_text",
-                                    "field_values": "only replacements or explicit clearings on the same reminder",
-                                },
-                                "turn_on": {
-                                    "target": "retrieval_text",
-                                    "field_values": "empty",
-                                },
-                                "turn_off": {
-                                    "target": "retrieval_text",
-                                    "field_values": "empty",
-                                },
-                            },
-                            "field_semantics": {
-                                "subject": "title or name",
-                                "reminder_summary": "concise summary",
-                                "raw_reminder": "body, content, instructions, or note",
-                                "notification_time": "normalized UTC ISO-8601 instant when to notify the user",
-                                "event_time": "normalized UTC ISO-8601 instant when the event or deadline occurs",
-                                "user_timezone": "trusted IANA time zone used to interpret and normalize time",
-                                "original_time_text": "verbatim current-turn time expression",
-                                "recurrence_rule": "repeat schedule",
-                                "recurrence_timezone": "time zone governing recurrence",
-                            },
-                            "context_policy": {
-                                "current_turn_defines_action_and_new_values": True,
-                                "history_resolves_existing_target_only": True,
-                                "platform_context_resolves_trusted_timezone": True,
-                                "runtime_now_resolves_relative_time": True,
-                                "metadata_cannot_supply_action_payload": True,
-                            },
-                            "runtime_now_utc": runtime_now_utc,
-                            "default_timezone": self.default_timezone,
-                            "time_normalization_contract": {
-                                "owner": "reminder_action_extraction_model",
-                                "output_timezone": "UTC",
-                                "output_format": "ISO-8601 with explicit +00:00 offset",
-                                "required_companion_fields": [
-                                    "user_timezone",
-                                    "original_time_text",
-                                ],
-                                "omit_unresolvable_time_instead_of_guessing": True,
+                            "contract_version": 2,
+                            "time_context": {
+                                "runtime_now_utc": runtime_now_utc,
+                                "runtime_now_local": runtime_now_local,
+                                "trusted_user_timezone": trusted_timezone,
+                                "model_time_format": (
+                                    "local ISO-8601 wall clock without an offset"
+                                ),
+                                "canonical_output_timezone": "UTC",
                             },
                         },
                     )
                 ),
                 schema=REMINDER_ACTION_EXTRACTION_SCHEMA,
+                invariant_validator=lambda candidate: self._validate_model_invariants(
+                    candidate,
+                    rewritten_query=rewritten_query,
+                    chat_history=chat_history,
+                    trusted_timezone=trusted_timezone,
+                ),
             )
             if is_structured_fallback(payload):
                 return self._failed(
@@ -345,6 +421,27 @@ class LLMReminderActionDetector:
         if decoded is None:
             return self._failed("invalid_reminder_action_extraction", ["action"])
         supplied_fields, values = decoded
+
+        supplied_fields, values = _canonicalize_add_content(
+            action_name=extracted_action_name,
+            retrieval_text=retrieval_text,
+            supplied_fields=supplied_fields,
+            values=values,
+        )
+
+        for field in _TIME_FIELDS:
+            if not values[field]:
+                continue
+            canonical_time = _canonical_utc_from_model_time(
+                values[field],
+                trusted_timezone=trusted_timezone,
+            )
+            if canonical_time is None:
+                return self._failed(
+                    "invalid_reminder_local_time",
+                    ["reminder_time"],
+                )
+            values[field] = canonical_time
 
         if (
             extracted_action_name not in _EXTERNAL_REMINDER_ACTIONS
@@ -423,6 +520,7 @@ class LLMReminderActionDetector:
             "changed_fields": changed_fields,
             "time_semantics": time_semantics,
             "runtime_now_utc": runtime_now_utc,
+            "trusted_timezone": trusted_timezone,
             "confidence": confidence,
             **values,
         }
@@ -450,6 +548,81 @@ class LLMReminderActionDetector:
                 },
             },
         )
+
+    @staticmethod
+    def _validate_model_invariants(
+        payload: dict[str, Any],
+        *,
+        rewritten_query: str,
+        chat_history: list[dict[str, Any]],
+        trusted_timezone: str,
+    ) -> None:
+        """Reject schema-valid but internally unsafe model state for retry."""
+
+        errors: list[str] = []
+        action_name = _text(payload.get("action")).casefold()
+        retrieval_text = _text(payload.get("retrieval_text"))
+        raw_field_values = payload.get("field_values")
+        raw_original_time_text = (
+            _text(raw_field_values.get("original_time_text"))
+            if isinstance(raw_field_values, dict)
+            else ""
+        )
+        decoded = _decode_field_values(raw_field_values)
+        if decoded is None:
+            raise StructuredOutputInvariantError("field_values_contract_invalid")
+        supplied_fields, values = decoded
+        current_sources = [rewritten_query]
+        history_source = json.dumps(chat_history, ensure_ascii=False, default=str)
+        retrieval_sources = (
+            current_sources
+            if action_name == ReminderAction.ADD.value
+            else [*current_sources, history_source]
+        )
+        if not retrieval_text:
+            errors.append("retrieval_text_required")
+        elif not _is_grounded(retrieval_text, retrieval_sources):
+            errors.append("retrieval_text_not_grounded")
+        for field in set(supplied_fields) & _TEXT_FIELDS:
+            if values[field] and not _is_grounded(values[field], current_sources):
+                errors.append(f"{field}_not_grounded")
+
+        populated_times = [field for field in _TIME_FIELDS if values[field]]
+        if populated_times:
+            if values["user_timezone"] != trusted_timezone:
+                errors.append("time_requires_trusted_user_timezone")
+            if not values["original_time_text"]:
+                errors.append("time_requires_original_time_text")
+            for field in populated_times:
+                if _canonical_utc_from_model_time(
+                    values[field],
+                    trusted_timezone=trusted_timezone,
+                ) is None:
+                    errors.append(f"{field}_must_be_unambiguous_local_or_utc")
+                elif (
+                    _is_normalized_utc_timestamp(values[field])
+                    and trusted_timezone != "UTC"
+                    and not _is_normalized_utc_timestamp(
+                        values["original_time_text"]
+                    )
+                ):
+                    errors.append(f"{field}_must_use_trusted_local_wall_clock")
+        elif raw_original_time_text or values["original_time_text"]:
+            errors.append("time_source_requires_normalized_time")
+
+        for field in ("user_timezone", "recurrence_timezone"):
+            if values[field] and not _is_valid_iana_timezone(values[field]):
+                errors.append(f"{field}_must_be_iana_timezone")
+
+        if action_name in {
+            ReminderAction.DELETE.value,
+            ReminderAction.TURN_ON.value,
+            ReminderAction.TURN_OFF.value,
+        } and supplied_fields:
+            errors.append("target_only_action_must_not_have_field_values")
+
+        if errors:
+            raise StructuredOutputInvariantError(",".join(dict.fromkeys(errors)))
 
     @staticmethod
     def _validate_shape(
@@ -633,6 +806,29 @@ class ReminderActionValidationStrategy:
             }
             for candidate in candidates
         ]
+        time_context = {
+            "runtime_now_utc": _text(action_payload.get("runtime_now_utc")),
+            "trusted_user_timezone": _text(
+                action_payload.get("trusted_timezone")
+            ),
+            "output_timezone": "UTC",
+        }
+        validation_policy = {
+            "minimum_execution_confidence": (
+                self.config.retrieval_validation.reminder_llm_validation_min_confidence
+            ),
+        }
+        if (
+            not _is_normalized_utc_timestamp(time_context["runtime_now_utc"])
+            or not _is_valid_iana_timezone(
+                time_context["trusted_user_timezone"]
+            )
+        ):
+            return self._rejection(
+                operation,
+                "Reminder validation received invalid trusted time context.",
+                "invalid_time_context",
+            )
         try:
             raw = self.llm.generate_json(
                 task=LLMTask.REMINDER_ACTION_VALIDATION,
@@ -643,6 +839,8 @@ class ReminderActionValidationStrategy:
                         extra={
                             "first_model_response": isolated_first_response,
                             "reminder_retrieval": reminder_retrieval,
+                            "time_context": time_context,
+                            "validation_policy": validation_policy,
                         },
                     )
                 ),

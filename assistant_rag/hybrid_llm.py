@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Callable
 from .llm import (
     LLMTask,
     OllamaLLMClient,
@@ -40,6 +40,7 @@ class HybridLLMClient:
         schema: dict[str, Any],
         model_override: str | None = None,
         fallback_for: str | None = None,
+        invariant_validator: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         model_name = model_override or self.ollama_client.router.model_for_task(task)
         if uses_onnx_runtime(model_name):
@@ -50,6 +51,7 @@ class HybridLLMClient:
                 schema=schema,
                 model_override=model_override,
                 fallback_for=fallback_for,
+                invariant_validator=invariant_validator,
             )
             onnx_error = self.onnx_client.last_error_by_task.get(task)
             if not onnx_error and not is_structured_fallback(payload):
@@ -72,6 +74,7 @@ class HybridLLMClient:
                 schema=schema,
                 model_override=fallback_model,
                 fallback_for=model_name,
+                invariant_validator=invariant_validator,
             )
             # A successful fallback is a recovered condition, not an active
             # user-facing error. The original failure remains in debug logs.
@@ -88,6 +91,7 @@ class HybridLLMClient:
             schema=schema,
             model_override=model_override,
             fallback_for=fallback_for,
+            invariant_validator=invariant_validator,
         )
         primary_error = self.ollama_client.last_error_by_task.get(task)
         if not primary_error and not is_structured_fallback(payload):
@@ -113,6 +117,7 @@ class HybridLLMClient:
             schema=schema,
             model_override=fallback_model,
             fallback_for=model_name,
+            invariant_validator=invariant_validator,
         )
 
     def chat(self, *, task: LLMTask, system_prompt: str, user_prompt: str) -> str:

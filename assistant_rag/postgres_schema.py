@@ -301,6 +301,24 @@ Index("idx_chunks_user_topic_deleted", knowledge_chunks.c.user_id, knowledge_chu
 Index("idx_sources_user_status", knowledge_sources.c.user_id, knowledge_sources.c.processing_status)
 Index("idx_sources_user_hash", knowledge_sources.c.user_id, knowledge_sources.c.content_hash)
 Index("idx_chunks_user_source", knowledge_chunks.c.user_id, knowledge_chunks.c.source_id)
+Index(
+    "idx_chunks_user_active_created_id",
+    knowledge_chunks.c.user_id,
+    knowledge_chunks.c.is_deleted,
+    knowledge_chunks.c.created_at.desc(),
+    knowledge_chunks.c.chunk_id.desc(),
+)
+Index("idx_chunks_user_active_created", knowledge_chunks.c.user_id, knowledge_chunks.c.is_deleted, knowledge_chunks.c.created_at.desc())
+Index("idx_outbox_status_updated", indexing_outbox.c.status, indexing_outbox.c.updated_at, indexing_outbox.c.retry_count)
+Index("idx_outbox_entity_status", indexing_outbox.c.entity_type, indexing_outbox.c.entity_id, indexing_outbox.c.status)
+Index(
+    "idx_outbox_entity_operation_created",
+    indexing_outbox.c.entity_type,
+    indexing_outbox.c.entity_id,
+    indexing_outbox.c.operation,
+    indexing_outbox.c.created_at.desc(),
+    indexing_outbox.c.job_id.desc(),
+)
 Index("idx_artifacts_user_status", generated_artifacts.c.user_id, generated_artifacts.c.status)
 Index("idx_reminders_user_status_time", reminders.c.user_id, reminders.c.status, reminders.c.reminder_time)
 Index("idx_reminders_user_status_next_fire", reminders.c.user_id, reminders.c.status, reminders.c.next_fire_time)

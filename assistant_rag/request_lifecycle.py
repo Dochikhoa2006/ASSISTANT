@@ -2,8 +2,7 @@
 
 The pipeline deliberately owns domain reasoning and persistence, while this
 module owns request-scoped idempotency, confirmation hydration, and terminal
-lifecycle bookkeeping.  Mutation classification remains a separate semantic
-signal used by entrypoints for mutation-specific controls such as rate limits.
+lifecycle bookkeeping. It deliberately does not classify free text.
 """
 
 from __future__ import annotations
@@ -17,10 +16,6 @@ from typing import Any, Callable
 from .contracts import BundledResponse, ChatRequest, Intent, ResponseType
 from .database import AssistantRepository
 from .pipeline import AssistantPipeline
-from .request_policy import (
-    has_destructive_mutation_policy_signal,
-    has_explicit_mutation_policy_signal,
-)
 
 
 class RequestLifecycleConflict(ValueError):
@@ -53,27 +48,24 @@ def looks_like_mutation(request: ChatRequest) -> bool:
     if request.confirmation_token:
         return True
     # A reminder-notification reply writes a conversation hop and acknowledges
-    # UI state even when the reply itself contains no action keyword.  Treat the
+    # UI state even when the reply itself contains no repeated action. Treat the
     # explicit, internally-built route marker as a non-destructive mutation so
     # every keyed API/Streamlit reply receives the same exactly-once lifecycle.
     if metadata.get("reminder_reply_context"):
         return True
-    return any(
-        has_explicit_mutation_policy_signal(request, intent)
-        for intent in (Intent.KNOWLEDGE_FACTS, Intent.REMINDER)
-    )
+    # Free-form text is never interpreted here. Domain mutation authorization
+    # belongs to the later structured semantic extractor and validator. The
+    # lifecycle can identify only already-bound internal continuations.
+    return False
 
 
 def looks_destructive(request: ChatRequest) -> bool:
     # A pending knowledge confirmation protects a destructive action. The
-    # plain confirmation query does not repeat the stored action keyword, so
+    # plain confirmation query does not repeat the stored action, so
     # it must remain destructive for request limits.
     if request.confirmation_token:
         return True
-    return any(
-        has_destructive_mutation_policy_signal(request, intent)
-        for intent in (Intent.KNOWLEDGE_FACTS, Intent.REMINDER)
-    )
+    return False
 
 
 def bundled_response_payload(response: BundledResponse) -> dict[str, Any]:
@@ -82,6 +74,7 @@ def bundled_response_payload(response: BundledResponse) -> dict[str, Any]:
     return {
         "final_chat_text": response.final_chat_text,
         "response_type": response.response_type.value,
+        "conversation_id": response.conversation_id,
         "conversation_topic_id": response.conversation_topic_id,
         "conversation_hop_id": response.conversation_hop_id,
         "actions_committed": list(response.actions_committed),
@@ -90,6 +83,28 @@ def bundled_response_payload(response: BundledResponse) -> dict[str, Any]:
         "persistence_instructions": dict(response.persistence_instructions),
         "platform_payload": dict(response.platform_payload),
     }
+
+
+def response_has_irreversible_effects(response: BundledResponse) -> bool:
+    """Return whether retrying could duplicate a durable or external effect."""
+
+    platform_payload = response.platform_payload or {}
+    delivery = platform_payload.get("delivery")
+    delivery_status = str(
+        delivery.get("status") if isinstance(delivery, dict) else ""
+    ).strip()
+    return bool(
+        response.actions_committed
+        or platform_payload.get("artifacts")
+        or delivery_status
+        in {
+            "sent",
+            "partial_failure",
+            "draft_saved",
+            "delivery_unknown",
+        }
+        or response.persistence_instructions.get("database_write_result")
+    )
 
 
 def _confirmation_action_was_committed(
@@ -150,6 +165,21 @@ class ChatRequestLifecycleExecutor:
         owns_idempotency_claim = False
         confirmation_to_mark: str | None = None
         prepared_request = request
+        successful_response: BundledResponse | None = None
+        terminal_response = False
+
+        def add_terminal_warning(
+            response: BundledResponse,
+            payload: dict[str, Any],
+            warning: str,
+        ) -> tuple[BundledResponse, dict[str, Any]]:
+            warned_response = replace(
+                response,
+                warnings=list(dict.fromkeys([*response.warnings, warning])),
+            )
+            warned_payload = dict(payload)
+            warned_payload["warnings"] = list(warned_response.warnings)
+            return warned_response, warned_payload
 
         try:
             # An idempotency key protects the whole user-visible request, not
@@ -190,27 +220,75 @@ class ChatRequestLifecycleExecutor:
             if before_pipeline is not None:
                 before_pipeline(prepared_request)
             response = self.pipeline.handle(prepared_request, self.repository)
-            payload = serialize_response(response, request_id)
+            terminal_response = bool(
+                response.response_type is not ResponseType.ERROR
+                or response_has_irreversible_effects(response)
+            )
+            if terminal_response:
+                # Once the pipeline has returned success, conversation writes,
+                # generated files, domain mutations, or external delivery may
+                # already be irreversible. No later presentation/bookkeeping
+                # failure may make this claim retryable.
+                successful_response = response
+            try:
+                payload = serialize_response(response, request_id)
+            except Exception:
+                if successful_response is None:
+                    raise
+                response = replace(
+                    response,
+                    warnings=list(
+                        dict.fromkeys(
+                            [
+                                *response.warnings,
+                                "post_effect_response_serialization_failed",
+                            ]
+                        )
+                    ),
+                )
+                successful_response = response
+                payload = bundled_response_payload(response)
+                payload["request_id"] = request_id
             if idempotency_request_id and owns_idempotency_claim:
-                if response.response_type is ResponseType.ERROR:
+                if terminal_response:
+                    try:
+                        self.repository.complete_idempotency_request(
+                            request_id=idempotency_request_id,
+                            stored_response_json=json.dumps(payload, default=str),
+                        )
+                    except Exception:
+                        # Keep the durable claim non-retryable. If completion
+                        # did not commit it remains in_progress; if it committed
+                        # before raising it remains completed. Either state
+                        # prevents a duplicate external/domain side effect.
+                        response, payload = add_terminal_warning(
+                            response,
+                            payload,
+                            "post_effect_idempotency_completion_failed",
+                        )
+                        successful_response = response
+                else:
                     self.repository.fail_idempotency_request(
                         request_id=idempotency_request_id,
                         error_message=response.final_chat_text,
-                    )
-                else:
-                    self.repository.complete_idempotency_request(
-                        request_id=idempotency_request_id,
-                        stored_response_json=json.dumps(payload, default=str),
                     )
             if (
                 confirmation_to_mark
                 and response.response_type is not ResponseType.ERROR
                 and _confirmation_action_was_committed(prepared_request, response)
             ):
-                self.repository.mark_confirmation_confirmed(
-                    user_id=prepared_request.user_id,
-                    confirmation_token=confirmation_to_mark,
-                )
+                try:
+                    self.repository.mark_confirmation_confirmed(
+                        user_id=prepared_request.user_id,
+                        confirmation_token=confirmation_to_mark,
+                    )
+                except Exception:
+                    response, payload = add_terminal_warning(
+                        response,
+                        payload,
+                        "post_effect_confirmation_persistence_failed",
+                    )
+                    successful_response = response
             return ChatRequestExecution(
                 request=prepared_request,
                 request_id=request_id,
@@ -220,7 +298,11 @@ class ChatRequestLifecycleExecutor:
                 is_mutation=is_mutation,
             )
         except Exception as exc:
-            if idempotency_request_id and owns_idempotency_claim:
+            if (
+                idempotency_request_id
+                and owns_idempotency_claim
+                and successful_response is None
+            ):
                 self.repository.fail_idempotency_request(
                     request_id=idempotency_request_id,
                     error_message=str(exc),

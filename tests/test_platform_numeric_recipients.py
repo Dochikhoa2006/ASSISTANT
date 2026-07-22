@@ -6,10 +6,8 @@ from typing import Any
 import pytest
 
 from assistant_rag.contracts import BundledResponse, ChatRequest, LastQAState, ResponseType
-from assistant_rag.platform import (
-    PLATFORM_RECIPIENT_EXTRACTION_SCHEMA,
-    PlatformSelector,
-)
+from assistant_rag.platform import PlatformSelector
+from assistant_rag.semantic_actions import grounded_semantic_action_from_payload
 
 
 _RAW_QUERY_SENTINEL = "RAW_SENTINEL audit-only ingress text."
@@ -41,7 +39,40 @@ class RecordingSender:
         }
 
 
-def _bundled_response(rewritten_query: str) -> BundledResponse:
+def _bundled_response(
+    rewritten_query: str,
+    *,
+    channel: str,
+    recipients: tuple[str, ...],
+) -> BundledResponse:
+    raw = {
+        "message": {
+            "operation": "send",
+            "channel": channel,
+            "recipient_update": "replace",
+            "recipients": [
+                {"value": item, "disposition": "include", "evidence": item}
+                for item in recipients
+            ],
+            "global_cancellation": False,
+            "authorization_evidence": [rewritten_query.split(" to ", 1)[0]],
+            "cancellation_evidence": [],
+            "artifact_reference": "none",
+            "copy_revision": False,
+            "confidence": 0.99,
+        },
+        "file": {
+            "operation": "none",
+            "file_type": "none",
+            "authorization_evidence": [],
+            "type_evidence": [],
+            "confidence": 0.99,
+        },
+        "reason_summary": "test fixture",
+    }
+    semantic = grounded_semantic_action_from_payload(
+        raw, canonical_query=rewritten_query
+    )
     return BundledResponse(
         final_chat_text="The requested update is ready.",
         response_type=ResponseType.NORMAL,
@@ -50,6 +81,7 @@ def _bundled_response(rewritten_query: str) -> BundledResponse:
             last_response="",
             response_type=ResponseType.NORMAL,
         ),
+        platform_payload={"semantic_action_decision": semantic.to_payload()},
     )
 
 
@@ -87,7 +119,11 @@ def test_numeric_recipient_ids_are_routed_for_non_email_channels(
     )
 
     result = selector.select(
-        _bundled_response(rewritten_query),
+        _bundled_response(
+            rewritten_query,
+            channel=channel,
+            recipients=(str(recipient),),
+        ),
         ChatRequest(
             user_id="platform-test",
             raw_query=_RAW_QUERY_SENTINEL,
@@ -110,9 +146,7 @@ def test_numeric_recipient_ids_are_routed_for_non_email_channels(
     assert sent_payload["body"] == "The requested update is ready."
     assert sent_payload["mode"] == "send"
     assert sent_context == platform_context
-    assert len(llm.calls) == 2
-    assert llm.calls[1]["schema"] == PLATFORM_RECIPIENT_EXTRACTION_SCHEMA
-    assert set(llm.calls[1]["schema"]["properties"]) == {"recipients"}
+    assert llm.calls == []
 
 
 def test_gmail_recipient_validation_remains_email_only() -> None:
@@ -132,7 +166,11 @@ def test_gmail_recipient_validation_remains_email_only() -> None:
     )
 
     result = selector.select(
-        _bundled_response(rewritten_query),
+        _bundled_response(
+            rewritten_query,
+            channel="gmail",
+            recipients=("alice@example.com",),
+        ),
         ChatRequest(
             user_id="platform-test",
             raw_query=_RAW_QUERY_SENTINEL,

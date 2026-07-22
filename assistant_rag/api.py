@@ -20,7 +20,12 @@ from .pipeline import AssistantPipeline
 from .auth import authenticate_token, get_auth_context
 from .rate_limit import RateLimiter, build_rate_limiter
 from .settings import ProductionSettings
-from .reminder_reply import build_reminder_reply_last_qa, build_reminder_reply_metadata
+from .reminder_reply import (
+    build_reminder_reply_last_qa,
+    build_reminder_reply_metadata,
+    reminder_reply_conversation_id,
+    save_reminder_reply_last_qa,
+)
 from .request_lifecycle import (
     ChatRequestLifecycleExecutor,
     RequestLifecycleConflict,
@@ -81,6 +86,7 @@ def _response_payload(response: Any, *, request_id: str, latency_ms: int, includ
         "request_id": request_id,
         "final_chat_text": response.final_chat_text,
         "response_type": response.response_type.value,
+        "conversation_id": response.conversation_id,
         "conversation_topic_id": response.conversation_topic_id,
         "conversation_hop_id": response.conversation_hop_id,
         "actions_committed": response.actions_committed,
@@ -116,13 +122,12 @@ def build_api_app(
         request: ChatRequest, is_mutation: bool, _is_destructive: bool
     ) -> None:
         if (
-            is_mutation
-            and not str(request.idempotency_key or "").strip()
+            not str(request.idempotency_key or "").strip()
             and not settings.safety.allow_missing_idempotency_key
         ):
             raise HTTPException(
                 status_code=400,
-                detail="idempotency_key is required for mutation requests",
+                detail="idempotency_key is required for chat requests",
             )
 
     def get_repository() -> Iterator[AssistantRepository]:
@@ -540,6 +545,7 @@ def build_api_app(
                 reminder_id=reminder_id,
                 notification_id=notification_id,
             )
+            source_conversation_id = reminder_reply_conversation_id(context)
             idempotency_key = str(payload.get("idempotency_key") or "").strip() or None
             request_id = new_request_id(idempotency_key)
             start_trace(request_id)
@@ -547,6 +553,7 @@ def build_api_app(
             request = ChatRequest(
                 user_id=user_id,
                 raw_query=reply_text,
+                conversation_id=source_conversation_id,
                 reminder_id=reminder_id,
                 notification_id=notification_id,
                 reply_text=reply_text,
@@ -580,7 +587,12 @@ def build_api_app(
             def hydrate_reply_last_qa(_prepared_request: ChatRequest) -> None:
                 # The lifecycle hook runs only after a fresh/failed-retry claim.
                 # Replays and conflicts therefore never rewind Last-QA state.
-                pipeline.last_qa_store.save(user_id, reply_last_qa)
+                save_reminder_reply_last_qa(
+                    pipeline.last_qa_store,
+                    user_id=user_id,
+                    state=reply_last_qa,
+                    conversation_id=source_conversation_id,
+                )
 
             execution = ChatRequestLifecycleExecutor(
                 pipeline=pipeline,

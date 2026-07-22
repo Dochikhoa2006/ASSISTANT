@@ -17,7 +17,7 @@ from .branch_orchestration import KnowledgeTargetResolver, ReminderTargetResolve
 from .bundler import ChatOutput, ResponseBundler
 from .chroma_index import ChromaPersistentVectorIndex
 from .classification import LLMLastQAResolver, LLMQueryRewriter, T5CanardQueryRewriter
-from .config import AssistantConfig, AutoscanConfig, ClassificationConfig, OutboxConfig, RetrievalConfig, QuestionGenerationConfig, MutationPolicyConfig, ContextFilterConfig, GeneralPurposeConfig, LastQAConfig
+from .config import AssistantConfig, AutoscanConfig, OutboxConfig, RetrievalConfig, QuestionGenerationConfig, MutationPolicyConfig, ContextFilterConfig, GeneralPurposeConfig, LastQAConfig
 from .contracts import Intent
 from .database import AssistantRepository
 from .embeddings import SentenceTransformerEmbeddingClient
@@ -27,6 +27,7 @@ from .onnx_llm import ONNXLLMClient
 from .hybrid_llm import HybridLLMClient
 from .pipeline import AssistantPipeline
 from .platform import PlatformSelector
+from .semantic_actions import SemanticActionAnalyzer
 from .prompts import DEFAULT_PROMPT_REGISTRY
 from .retrieval import HybridRetriever
 from .reranking import SentenceTransformerCrossEncoderReranker
@@ -83,6 +84,9 @@ def build_assistant_config(settings: ProductionSettings) -> AssistantConfig:
             conversation_min_confidence_score=(
                 settings.retrieval.conversation_min_confidence_score
             ),
+            sql_fallback_candidate_limit=(
+                settings.retrieval.sql_fallback_candidate_limit
+            ),
         ),
         outbox=OutboxConfig(
             max_attempts=settings.worker.outbox_max_attempts,
@@ -91,7 +95,6 @@ def build_assistant_config(settings: ProductionSettings) -> AssistantConfig:
             processing_timeout_seconds=settings.worker.outbox_processing_timeout_seconds,
         ),
         autoscan=AutoscanConfig(interval_seconds=settings.worker.autoscan_interval_seconds),
-        classification=ClassificationConfig(intent_keywords={}),
         mutation_policy=MutationPolicyConfig(
             partial_execution_policy=settings.prompt_policy.mutation_partial_execution_policy,
             knowledge_relevance_threshold=settings.prompt_policy.knowledge_target_relevance_threshold,
@@ -268,6 +271,9 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
         conversation_min_confidence_score=(
             assistant_config.retrieval.conversation_min_confidence_score
         ),
+        sql_fallback_candidate_limit=(
+            assistant_config.retrieval.sql_fallback_candidate_limit
+        ),
     )
     hard_rule_filter = HardRuleContextFilter(
         allowed_reminder_statuses=settings.prompt_policy.context_filter_allowed_reminder_statuses,
@@ -366,8 +372,10 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
         config=gp_config,
     )
 
+    semantic_action_analyzer = SemanticActionAnalyzer(llm=llm)
     content_composer = DeterministicContentComposer(
         registry=tool_registry,
+        semantic_analyzer=semantic_action_analyzer,
     )
 
     general_hitl = LLMGeneralHITLStrategy(
@@ -440,7 +448,10 @@ def build_production_pipeline(settings: ProductionSettings) -> AssistantPipeline
         router=router,
         context_filter=context_filter,
         bundler=ResponseBundler(prompt_registry),
-        platform_selector=PlatformSelector(llm=llm),
+        platform_selector=PlatformSelector(
+            llm=llm,
+            semantic_analyzer=semantic_action_analyzer,
+        ),
         chat_output=ChatOutput(),
         prompt_registry=prompt_registry,
     )

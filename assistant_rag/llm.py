@@ -7,7 +7,7 @@ from enum import Enum
 import json
 import logging
 import time
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from urllib import error, request
 
 from .contracts import Intent, ResponseType
@@ -64,6 +64,14 @@ class LLMTask(str, Enum):
     ACTION_PLANNING = "action_planning"
 
 
+# Ollama's native JSON-schema grammar is materially more reliable for this
+# allowlisted reminder field-map contract than unconstrained JSON mode. Keep
+# the generic ordering for simpler stages and diversify the bounded fallback.
+_SCHEMA_FIRST_STRUCTURED_TASKS = frozenset(
+    {LLMTask.REMINDER_ACTION_EXTRACTION}
+)
+
+
 def llm_trace_stage_name(
     task: LLMTask,
     *,
@@ -110,6 +118,7 @@ class LLMClient(Protocol):
         schema: dict[str, Any],
         model_override: str | None = None,
         fallback_for: str | None = None,
+        invariant_validator: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         ...
 
@@ -137,6 +146,10 @@ class StructuredFallbackPayload(dict[str, Any]):
         super().__init__(payload)
         self.task = task
         self.reason = reason
+
+
+class StructuredOutputInvariantError(ValueError):
+    """A schema-valid data object violated a caller-owned safe invariant."""
 
 
 def is_structured_fallback(payload: Any) -> bool:
@@ -181,6 +194,7 @@ class OllamaLLMClient:
     settings: OllamaSettings
     router: OllamaModelRouter
     last_error_by_task: dict[LLMTask, str] = field(default_factory=dict)
+    last_invariant_error_by_task: dict[LLMTask, str] = field(default_factory=dict)
 
     def warmup_models(self) -> list[str]:
         """Ask Ollama to load every configured local model and keep it resident."""
@@ -214,23 +228,50 @@ class OllamaLLMClient:
         schema: dict[str, Any],
         model_override: str | None = None,
         fallback_for: str | None = None,
+        invariant_validator: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         with StageTimer(llm_trace_stage_name_for_prompt(task, user_prompt)):
+            if not fallback_for:
+                self.last_invariant_error_by_task.pop(task, None)
             last_error: Exception | None = None
-            retry_count = getattr(self.settings, f"json_retry_count_{task.value}", self.settings.structured_retry_count)
+            retry_count = (
+                0
+                if fallback_for
+                else getattr(
+                    self.settings,
+                    f"json_retry_count_{task.value}",
+                    self.settings.structured_retry_count,
+                )
+            )
             attempt_errors: list[str] = []
             total_attempts = retry_count + 1
+            schema_first = task in _SCHEMA_FIRST_STRUCTURED_TASKS
             attempt_plan = (
                 ["schema"]
-                if fallback_for and total_attempts == 1
-                else _structured_attempt_plan(total_attempts)
+                if fallback_for
+                else _structured_attempt_plan(
+                    total_attempts,
+                    schema_first=schema_first,
+                )
+            )
+            previous_invariant_failure = False
+            repair_hint = (
+                self.last_invariant_error_by_task.get(task, "")
+                if fallback_for
+                else ""
             )
             for attempt_index, attempt_mode in enumerate(attempt_plan, start=1):
+                if previous_invariant_failure and schema_first:
+                    # The transport/schema worked; retain its grammar and ask
+                    # the model to correct only the failed domain invariant.
+                    attempt_mode = "schema"
                 try:
                     attempt_prompt = _structured_attempt_prompt(
                         user_prompt=user_prompt,
                         schema=schema,
                         mode=attempt_mode,
+                        is_retry=bool(fallback_for) or attempt_index > 1,
+                        repair_hint=repair_hint,
                     )
                     raw = self._chat_raw(
                         task=task,
@@ -250,6 +291,8 @@ class OllamaLLMClient:
                         schema,
                     )
                     validate_json_schema(payload, schema)
+                    if invariant_validator is not None:
+                        invariant_validator(payload)
                     trace = current_trace()
                     if trace and trace._active_timers:
                         timer = trace._active_timers[-1]
@@ -261,12 +304,29 @@ class OllamaLLMClient:
                             timer.metadata["structured_previous_failures"] = len(attempt_errors)
                             timer.metadata["structured_last_retry_error"] = attempt_errors[-1]
                     self.last_error_by_task.pop(task, None)
+                    self.last_invariant_error_by_task.pop(task, None)
                     return payload
                 except Exception as exc:
-                    GLOBAL_METRICS.increment("llm_json_parse_failures_total", task=task.value)
+                    invariant_failure = isinstance(
+                        exc, StructuredOutputInvariantError
+                    )
+                    GLOBAL_METRICS.increment(
+                        (
+                            "llm_structured_invariant_failures_total"
+                            if invariant_failure
+                            else "llm_json_parse_failures_total"
+                        ),
+                        task=task.value,
+                    )
                     last_error = exc
                     attempt_errors.append(f"attempt {attempt_index}/{len(attempt_plan)} [{attempt_mode}]: {type(exc).__name__}: {exc}")
                     self.last_error_by_task[task] = attempt_errors[-1]
+                    previous_invariant_failure = invariant_failure
+                    repair_hint = str(exc) if invariant_failure else ""
+                    if invariant_failure:
+                        self.last_invariant_error_by_task[task] = repair_hint
+                    else:
+                        self.last_invariant_error_by_task.pop(task, None)
                     logger.debug("LLM JSON parsing failed on attempt %d/%d for task %s (mode: %s): %s", attempt_index, len(attempt_plan), task.value, attempt_mode, exc)
             
             GLOBAL_METRICS.increment("llm_failures_total", task=task.value)
@@ -425,9 +485,13 @@ class OllamaLLMClient:
             if attempt_mode:
                 timer.metadata["attempt_mode"] = attempt_mode
             if "prompt_eval_count" in payload:
-                timer.metadata["input_count"] = payload["prompt_eval_count"]
+                timer.metadata["input_count"] = int(timer.metadata.get("input_count", 0)) + int(
+                    payload["prompt_eval_count"]
+                )
             if "eval_count" in payload:
-                timer.metadata["output_count"] = payload["eval_count"]
+                timer.metadata["output_count"] = int(timer.metadata.get("output_count", 0)) + int(
+                    payload["eval_count"]
+                )
                 
         msg = payload.get("message", {})
         content = str(msg.get("content", ""))
@@ -479,13 +543,18 @@ def parse_json_object(raw: str) -> dict[str, Any]:
     return advanced_parse_json(raw)
 
 
-def _structured_attempt_plan(configured_attempts: int) -> list[str]:
+def _structured_attempt_plan(
+    configured_attempts: int,
+    *,
+    schema_first: bool = False,
+) -> list[str]:
     """Use varied request strategies instead of repeating one broken shape."""
+    first_two = ["schema", "json"] if schema_first else ["json", "schema"]
     if configured_attempts <= 1:
-        return ["json"]
+        return first_two[:1]
     if configured_attempts == 2:
-        return ["json", "schema"]
-    return ["json", "schema", "plain"]
+        return first_two
+    return [*first_two, "plain"]
 
 
 def _structured_attempt_format(schema: dict[str, Any], mode: str) -> dict[str, Any] | str | None:
@@ -496,8 +565,14 @@ def _structured_attempt_format(schema: dict[str, Any], mode: str) -> dict[str, A
     return None
 
 
-def _structured_attempt_prompt(*, user_prompt: str, schema: dict[str, Any], mode: str) -> str:
-    template = json.dumps(_schema_default_object(schema), indent=2)
+def _structured_attempt_prompt(
+    *,
+    user_prompt: str,
+    schema: dict[str, Any],
+    mode: str,
+    is_retry: bool,
+    repair_hint: str = "",
+) -> str:
     rules = []
     properties = schema.get("properties") or {}
     for key, prop in properties.items():
@@ -513,15 +588,42 @@ def _structured_attempt_prompt(*, user_prompt: str, schema: dict[str, Any], mode
     retry_instruction = (
         "Correction: the previous output was invalid. Return a JSON data object, not a JSON Schema. "
         "Never output keys such as 'type', 'properties', 'required', 'items', or '$schema'.\n"
-        if mode == "schema"
+        if is_retry
         else ""
     )
+    if is_retry and repair_hint:
+        retry_instruction += (
+            "Correct these caller-validated data invariants: "
+            f"{repair_hint}.\n"
+        )
+    if mode == "schema":
+        required = [
+            str(key)
+            for key in schema.get("required", [])
+            if isinstance(key, str)
+        ]
+        contract_instruction = (
+            "A native JSON Schema grammar is attached to this request. Populate "
+            "every required property with task-grounded data; do not copy or "
+            "invent placeholder values."
+        )
+        if required:
+            contract_instruction += (
+                " Required root properties: "
+                f"{json.dumps(required, ensure_ascii=False)}."
+            )
+    else:
+        template = json.dumps(_schema_default_object(schema), indent=2)
+        contract_instruction = (
+            "Return a data instance with exactly this shape:\n"
+            f"{template}"
+        )
     return (
         f"{user_prompt}\n\n"
         f"{retry_instruction}"
         "Structured output instruction:\n"
         "Return exactly one JSON object and nothing else. No markdown, no code fence, no prose.\n"
-        f"Return a data instance with exactly this shape:\n{template}{rules_text}"
+        f"{contract_instruction}{rules_text}"
     )
 
 
@@ -692,7 +794,10 @@ def structured_fallback_payload(
         payload.update({
             "action": "add",
             "retrieval_text": "",
-            "field_values": [],
+            "field_values": {
+                "user_timezone": "",
+                "original_time_text": "",
+            },
             "confidence": 0.0,
         })
     elif task in {

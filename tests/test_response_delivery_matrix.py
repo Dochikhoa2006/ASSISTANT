@@ -47,10 +47,52 @@ from assistant_rag.contracts import (
 from assistant_rag.platform import PlatformSelector
 from assistant_rag.llm import LLMTask
 from assistant_rag.prompts import DEFAULT_PROMPT_REGISTRY
+from assistant_rag.semantic_actions import grounded_semantic_action_from_payload
 
 
 _FILE_TOOLS = ("generate_pdf", "generate_excel", "generate_pptx")
 _RAW_QUERY_SENTINEL = "RAW_SENTINEL audit-only ingress text."
+
+
+def _semantic_payload(
+    query: str,
+    *,
+    message_operation: str = "none",
+    channel: str = "none",
+    message_evidence: str | None = None,
+    recipients: tuple[str, ...] = (),
+    file_type: str = "none",
+    file_evidence: str | None = None,
+    file_type_evidence: str | None = None,
+) -> dict[str, Any]:
+    raw = {
+        "message": {
+            "operation": message_operation,
+            "channel": channel,
+            "recipient_update": "replace",
+            "recipients": [
+                {"value": item, "disposition": "include", "evidence": item}
+                for item in recipients
+            ],
+            "global_cancellation": False,
+            "authorization_evidence": [message_evidence] if message_evidence else [],
+            "cancellation_evidence": [],
+            "artifact_reference": "none",
+            "copy_revision": False,
+            "confidence": 0.99,
+        },
+        "file": {
+            "operation": "create" if file_type != "none" else "none",
+            "file_type": file_type,
+            "authorization_evidence": [file_evidence] if file_evidence else [],
+            "type_evidence": [file_type_evidence] if file_type_evidence else [],
+            "confidence": 0.99,
+        },
+        "reason_summary": "matrix fixture",
+    }
+    return grounded_semantic_action_from_payload(
+        raw, canonical_query=query
+    ).to_payload()
 
 
 @dataclass
@@ -81,7 +123,12 @@ class RecordingContentTool:
         )
 
 
-def _composer_input(query: str, sub_branch: GeneralSubBranch) -> ContentComposerInput:
+def _composer_input(
+    query: str,
+    sub_branch: GeneralSubBranch,
+    *,
+    file_type: str = "none",
+) -> ContentComposerInput:
     persistence_mode = (
         PersistenceMode.CREATE_NEW_TOPIC
         if sub_branch is GeneralSubBranch.NEW_CONVERSATION_TOPIC
@@ -99,7 +146,18 @@ def _composer_input(query: str, sub_branch: GeneralSubBranch) -> ContentComposer
         extracted_expected_response_types=[],
         approved_knowledge_evidence=[],
         approved_reminder_context=[],
-        metadata={},
+        metadata={
+            "semantic_action_decision": _semantic_payload(
+                query,
+                file_type=file_type,
+                file_evidence=(query.split(" ", 1)[0] if file_type != "none" else None),
+                file_type_evidence={
+                    "pdf": "PDF report",
+                    "xlsx": "Excel workbook",
+                    "pptx": "PowerPoint presentation",
+                }.get(file_type),
+            )
+        },
         platform_context={},
         sub_branch_prompt_context=SubBranchPromptContext(
             sub_branch=sub_branch,
@@ -147,7 +205,15 @@ def test_content_composer_sub_branch_and_file_outcome_cross_product(
         registry=ContentToolRegistry(tools=list(tools.values()), config=config)
     )
 
-    result = composer.compose(_composer_input(query, sub_branch), config)
+    semantic_file_type = {
+        "pdf": "pdf",
+        "xlsx": "xlsx",
+        "pptx": "pptx",
+        "disabled": "xlsx",
+    }.get(outcome, "none")
+    result = composer.compose(
+        _composer_input(query, sub_branch, file_type=semantic_file_type), config
+    )
 
     expected_tools = (
         ("answer_generation", expected_file_tool)
@@ -166,7 +232,7 @@ def test_content_composer_sub_branch_and_file_outcome_cross_product(
     trace = json.loads(result.tool_trace_summary)
     assert trace["executed_tools"] == list(expected_tools)
     if outcome == "ambiguous":
-        assert trace["decision"] == "ambiguous_file_types"
+        assert trace["decision"] == "semantic_file_operation_none"
         assert trace["selected_file_tool"] is None
     elif outcome == "disabled":
         assert trace["file_route_status"] == "disabled"
@@ -191,6 +257,9 @@ class RecordingComposer:
             fallback_used=False,
             reason_summary="matrix answer",
             content_warnings=(),
+            semantic_action_decision=dict(
+                composer_input.metadata.get("semantic_action_decision") or {}
+            ),
         )
 
 
@@ -409,7 +478,7 @@ def test_compatibility_general_branch_cannot_reuse_prefilled_answer_metadata(
     assert llm.calls[0]["task"] is LLMTask.ANSWER
 
 
-def test_pre_answer_context_failures_degrade_to_the_mandatory_answer_stage(
+def test_pre_answer_context_failures_run_answer_stage_but_never_use_ungrounded_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fail_context(*_args: Any, **_kwargs: Any) -> Any:
@@ -450,12 +519,96 @@ def test_pre_answer_context_failures_degrade_to_the_mandatory_answer_stage(
 
     assert [call["task"] for call in llm.calls] == [LLMTask.ANSWER]
     assert result.response_type is ResponseType.NORMAL
-    assert result.normal_response_text == "answer generated without optional context"
+    assert result.normal_response_text == DEFAULT_PROMPT_REGISTRY.message(
+        "personal_context_temporarily_unavailable"
+    )
     assert set(result.warnings) == {
         "general_knowledge_retrieval_unavailable:RuntimeError",
         "general_reminder_retrieval_unavailable:RuntimeError",
         "general_context_filter_unavailable:RuntimeError",
+        "personal_context_safe_retry",
     }
+
+
+def test_unavailable_personal_store_does_not_block_semantically_independent_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        branches_module,
+        "retrieve_knowledge",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("synthetic knowledge outage")
+        ),
+    )
+    monkeypatch.setattr(
+        branches_module,
+        "retrieve_reminder_candidates",
+        lambda **_kwargs: [],
+    )
+    context, _decision, *_ = _branch_case(
+        GeneralSubBranch.NEW_CONVERSATION_TOPIC
+    )
+    query = "Explain why daylight scattering changes the apparent sky color."
+    context = replace(
+        context,
+        request=replace(context.request, raw_query=query),
+        rewritten_query=query,
+    )
+
+    class DependencyAwareAnswerLLM:
+        def __init__(self) -> None:
+            self.tasks: list[LLMTask] = []
+
+        def generate_json(self, **kwargs: Any) -> dict[str, Any]:
+            self.tasks.append(kwargs["task"])
+            properties = dict(kwargs["schema"].get("properties") or {})
+            if "requires_unavailable_context" in properties:
+                payload = {
+                    "requires_unavailable_context": False,
+                    "confidence": 0.99,
+                    "reason_summary": (
+                        "The request is answerable from general scientific knowledge."
+                    ),
+                }
+            else:
+                assert "answerable_without_unavailable_context" in properties
+                payload = {
+                    "answerable_without_unavailable_context": True,
+                    "answer_text": (
+                        "Shorter wavelengths scatter more strongly in the atmosphere."
+                    ),
+                    "confidence": 0.99,
+                    "reason_summary": (
+                        "The complete response uses general scientific knowledge."
+                    ),
+                }
+            kwargs["invariant_validator"](payload)
+            return payload
+
+        def chat(self, **kwargs: Any) -> str:
+            raise AssertionError("The certified answer envelope owns degraded prose.")
+
+    llm = DependencyAwareAnswerLLM()
+    result = GeneralResponseBranch(
+        retriever=object(),
+        config=SimpleNamespace(
+            retrieval=SimpleNamespace(
+                general_response_reminder_statuses=("scheduled", "notified"),
+                general_response_reminder_limit=4,
+            )
+        ),
+        context_filter=EmptyContextFilter(),
+        llm=llm,  # type: ignore[arg-type]
+    ).execute(context, RecordingRepository())  # type: ignore[arg-type]
+
+    assert result.response_type is ResponseType.NORMAL
+    assert result.normal_response_text == (
+        "Shorter wavelengths scatter more strongly in the atmosphere."
+    )
+    assert llm.tasks == [LLMTask.RETRIEVAL_VALIDATION, LLMTask.ANSWER]
+    assert result.warnings == [
+        "general_knowledge_retrieval_unavailable:RuntimeError"
+    ]
 
 
 def test_sub_branch_failure_still_runs_real_answer_tool(
@@ -538,7 +691,18 @@ def test_general_branch_runs_real_answer_then_optional_microsoft_writer(
     query = "Create an Excel workbook with Task, Owner, and Status columns."
     context = replace(
         context,
-        request=replace(context.request, raw_query=query),
+        request=replace(
+            context.request,
+            raw_query=query,
+            metadata={
+                "semantic_action_decision": _semantic_payload(
+                    query,
+                    file_type="xlsx",
+                    file_evidence="Create",
+                    file_type_evidence="Excel workbook",
+                )
+            },
+        ),
         rewritten_query=query,
     )
 
@@ -589,6 +753,102 @@ def test_general_branch_runs_real_answer_then_optional_microsoft_writer(
         "answer_generation",
         "generate_excel",
     ]
+
+
+def test_writer_success_never_masks_mandatory_answer_model_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(branches_module, "retrieve_knowledge", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        branches_module,
+        "retrieve_reminder_candidates",
+        lambda **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        content_composer_module.ArtifactGenerator,
+        "generate",
+        lambda _self, **_kwargs: {
+            "artifact_id": "writer-only-workbook",
+            "filename": "writer-only.xlsx",
+            "storage_path": "/private/tmp/writer-only.xlsx",
+            "file_type": "xlsx",
+            "status": "created",
+        },
+    )
+    context, decision, *_ = _branch_case(GeneralSubBranch.NEW_CONVERSATION_TOPIC)
+    query = "Create an Excel workbook with Task and Owner columns."
+    context = replace(
+        context,
+        request=replace(
+            context.request,
+            raw_query=query,
+            metadata={
+                "semantic_action_decision": _semantic_payload(
+                    query,
+                    file_type="xlsx",
+                    file_evidence="Create",
+                    file_type_evidence="Excel workbook",
+                )
+            },
+        ),
+        rewritten_query=query,
+    )
+
+    class WriterOnlyLLM:
+        def __init__(self) -> None:
+            self.calls: list[LLMTask] = []
+
+        def chat(self, **kwargs: Any) -> str:
+            task = kwargs["task"]
+            self.calls.append(task)
+            if task is LLMTask.ANSWER:
+                raise RuntimeError("answer model unavailable")
+            return "Task,Owner"
+
+    llm = WriterOnlyLLM()
+    general_config = GeneralPurposeConfig()
+    composer = DeterministicContentComposer(
+        registry=ContentToolRegistry(
+            tools=[
+                AnswerGenerationTool(
+                    llm=llm,
+                    prompt_registry=DEFAULT_PROMPT_REGISTRY,
+                ),
+                GenerateExcelTool(
+                    llm=llm,
+                    prompt_registry=DEFAULT_PROMPT_REGISTRY,
+                    config=general_config,
+                ),
+            ],
+            config=general_config,
+        )
+    )
+    result = GeneralResponseBranch(
+        retriever=object(),
+        config=SimpleNamespace(
+            retrieval=SimpleNamespace(
+                general_response_reminder_statuses=("scheduled", "notified"),
+                general_response_reminder_limit=4,
+            )
+        ),
+        context_filter=EmptyContextFilter(),
+        sub_branch_detector=FixedSubBranchDetector(decision),
+        content_composer=composer,
+        general_purpose_config=general_config,
+        llm=llm,  # type: ignore[arg-type]
+    ).execute(context, RecordingRepository())  # type: ignore[arg-type]
+
+    assert llm.calls == [LLMTask.ANSWER, LLMTask.WRITING, LLMTask.ANSWER]
+    assert result.platform_payload["content_composition"] == {
+        "answer_attempted": True,
+        "answer_succeeded": False,
+        "writer_attempted": True,
+        "writer_succeeded": True,
+    }
+    assert result.platform_payload["artifacts"][0]["artifact_id"] == (
+        "writer-only-workbook"
+    )
+    assert "answer_model_unavailable" in result.warnings
 
 
 @pytest.mark.parametrize("sub_branch", tuple(GeneralSubBranch))
@@ -672,7 +932,19 @@ def test_explicit_email_request_skips_optional_general_hitl(
     query = "Prepare an email to alex@example.com confirming the approved schedule."
     context = replace(
         context,
-        request=ChatRequest(user_id="matrix-user", raw_query=query),
+        request=ChatRequest(
+            user_id="matrix-user",
+            raw_query=query,
+            metadata={
+                "semantic_action_decision": _semantic_payload(
+                    query,
+                    message_operation="prepare",
+                    channel="gmail",
+                    message_evidence="Prepare an email",
+                    recipients=("alex@example.com",),
+                )
+            },
+        ),
         rewritten_query=query,
     )
     hitl = RecordingGeneralHITL()
@@ -833,6 +1105,60 @@ def test_general_branch_keeps_created_artifact_visible_when_hop_write_fails(
     assert artifact_path.read_bytes() == b"generated-before-hop-write"
 
 
+def test_general_branch_recovers_mandatory_answer_when_composer_crashes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(branches_module, "retrieve_knowledge", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        branches_module,
+        "retrieve_reminder_candidates",
+        lambda **_kwargs: [],
+    )
+    context, decision, *_ = _branch_case(GeneralSubBranch.NEW_CONVERSATION_TOPIC)
+
+    class ExplodingComposer:
+        def compose(self, *_args: Any, **_kwargs: Any) -> ContentComposerResult:
+            raise RuntimeError("composer failed before answer stage")
+
+    @dataclass
+    class AnswerLLM:
+        calls: list[dict[str, Any]] = field(default_factory=list)
+
+        def chat(self, **kwargs: Any) -> str:
+            self.calls.append(dict(kwargs))
+            return "Recovered mandatory answer."
+
+    llm = AnswerLLM()
+    result = GeneralResponseBranch(
+        retriever=object(),
+        config=SimpleNamespace(
+            retrieval=SimpleNamespace(
+                general_response_reminder_statuses=("scheduled", "notified"),
+                general_response_reminder_limit=4,
+            )
+        ),
+        context_filter=EmptyContextFilter(),
+        sub_branch_detector=FixedSubBranchDetector(decision),
+        content_composer=ExplodingComposer(),
+        general_hitl_strategy=None,
+        general_purpose_config=GeneralPurposeConfig(),
+        llm=llm,  # type: ignore[arg-type]
+    ).execute(context, RecordingRepository())  # type: ignore[arg-type]
+
+    assert result.response_type is ResponseType.NORMAL
+    assert result.normal_response_text == "Recovered mandatory answer."
+    assert len(llm.calls) == 1
+    assert llm.calls[0]["task"] is LLMTask.ANSWER
+    assert "content_composer_unavailable:RuntimeError" in result.warnings
+    assert "answer_generation_recovered" in result.warnings
+    assert result.platform_payload["content_composition"] == {
+        "answer_attempted": True,
+        "answer_succeeded": True,
+        "writer_attempted": False,
+        "writer_succeeded": False,
+    }
+
+
 @pytest.mark.parametrize("response_type", tuple(ResponseType))
 def test_response_bundler_all_response_type_shapes(response_type: ResponseType) -> None:
     request = ChatRequest(
@@ -991,6 +1317,11 @@ class ScriptedSender:
 
 def _bundled_platform_response(
     rewritten_query: str = "request",
+    *,
+    message_operation: str = "none",
+    channel: str = "none",
+    message_evidence: str | None = None,
+    recipients: tuple[str, ...] = (),
 ) -> BundledResponse:
     return BundledResponse(
         final_chat_text="Subject: Project update\n\nHello team,\n\nThe update is ready.",
@@ -1000,7 +1331,16 @@ def _bundled_platform_response(
             last_response="response",
             response_type=ResponseType.NORMAL,
         ),
-        platform_payload={"seed": "preserved"},
+        platform_payload={
+            "seed": "preserved",
+            "semantic_action_decision": _semantic_payload(
+                rewritten_query,
+                message_operation=message_operation,
+                channel=channel,
+                message_evidence=message_evidence,
+                recipients=recipients,
+            ),
+        },
     )
 
 
@@ -1026,8 +1366,8 @@ def test_platform_none_route_is_explicit_safe_passthrough() -> None:
 
     assert result["platform_selection"] == {
         "channel": "none",
-        "confidence": 0.0,
-        "source": "safe_fallback_no_llm",
+        "confidence": 0.99,
+        "source": "safe_fallback_no_grounded_message_action",
     }
     assert result["delivery"] == {"channel": "none", "status": "not_requested"}
     assert result["text"].startswith("Subject: Project update")
@@ -1050,7 +1390,13 @@ def test_platform_formatter_receives_rewritten_compatibility_request() -> None:
     selector = PlatformSelector(llm=None)
     selector.register("gmail", RecordingFormatter())
     selector.select(
-        _bundled_platform_response(rewritten_query),
+        _bundled_platform_response(
+            rewritten_query,
+            message_operation="prepare",
+            channel="gmail",
+            message_evidence="Draft an email",
+            recipients=("alex@example.com",),
+        ),
         ChatRequest(user_id="matrix-user", raw_query=_RAW_QUERY_SENTINEL),
     )
 
@@ -1134,7 +1480,25 @@ def test_platform_gmail_status_matrix(
         },
     )
     result = PlatformSelector(llm=llm, senders={"gmail": sender}).select(
-        _bundled_platform_response(query),
+        _bundled_platform_response(
+            query,
+            message_operation=(
+                "save_draft"
+                if case == "saved_draft"
+                else ("prepare" if case == "local_draft" else "send")
+            ),
+            channel="gmail",
+            message_evidence=(
+                "Save a Gmail draft"
+                if case == "saved_draft"
+                else (
+                    "Draft an email"
+                    if case == "local_draft"
+                    else "Send an email"
+                )
+            ),
+            recipients=tuple(recipients),
+        ),
         ChatRequest(
             user_id="matrix-user",
             raw_query=_RAW_QUERY_SENTINEL,
@@ -1195,7 +1559,13 @@ def test_platform_non_email_channel_send_matrix(
     )
 
     result = selector.select(
-        _bundled_platform_response(rewritten_query),
+        _bundled_platform_response(
+            rewritten_query,
+            message_operation="send",
+            channel=channel,
+            message_evidence="Send this update",
+            recipients=(recipient,),
+        ),
         ChatRequest(
             user_id="matrix-user",
             raw_query=_RAW_QUERY_SENTINEL,

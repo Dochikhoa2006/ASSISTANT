@@ -29,6 +29,47 @@ from assistant_rag.database import SQLiteRepository
 from assistant_rag.llm import LLMTask
 from assistant_rag.platform import PlatformSelector
 from assistant_rag.prompts import DEFAULT_PROMPT_REGISTRY
+from assistant_rag.semantic_actions import grounded_semantic_action_from_payload
+
+
+def _semantic(
+    query: str,
+    *,
+    file_type: str = "none",
+    file_action: str | None = None,
+    file_type_evidence: str | None = None,
+    message_operation: str = "none",
+    message_action: str | None = None,
+    recipients: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    raw = {
+        "message": {
+            "operation": message_operation,
+            "channel": "gmail" if message_operation != "none" else "none",
+            "recipient_update": "replace",
+            "recipients": [
+                {"value": item, "disposition": "include", "evidence": item}
+                for item in recipients
+            ],
+            "global_cancellation": False,
+            "authorization_evidence": [message_action] if message_action else [],
+            "cancellation_evidence": [],
+            "artifact_reference": "none",
+            "copy_revision": False,
+            "confidence": 0.99,
+        },
+        "file": {
+            "operation": "create" if file_type != "none" else "none",
+            "file_type": file_type,
+            "authorization_evidence": [file_action] if file_action else [],
+            "type_evidence": [file_type_evidence] if file_type_evidence else [],
+            "confidence": 0.99,
+        },
+        "reason_summary": "test fixture",
+    }
+    return grounded_semantic_action_from_payload(
+        raw, canonical_query=query
+    ).to_payload()
 
 
 class RecordingComposerLLM:
@@ -82,6 +123,7 @@ class RecordingGmailSender:
 def _composer_input(
     query: str,
     repository: SQLiteRepository,
+    semantic_payload: dict[str, Any],
 ) -> ContentComposerInput:
     return ContentComposerInput(
         user_id="artifact-integration-user",
@@ -95,7 +137,7 @@ def _composer_input(
         extracted_expected_response_types=[],
         approved_knowledge_evidence=[],
         approved_reminder_context=[],
-        metadata={},
+        metadata={"semantic_action_decision": semantic_payload},
         platform_context={},
         sub_branch_prompt_context=SubBranchPromptContext(
             sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
@@ -200,7 +242,24 @@ def test_real_artifact_matrix_runs_answer_then_materializes_one_valid_file(
     )
     composer, config, repository = _real_composer(tmp_path, llm)
 
-    result = composer.compose(_composer_input(query, repository), config)
+    type_evidence = {
+        "pdf": "PDF file",
+        "xlsx": "Excel workbook",
+        "pptx": "PowerPoint presentation",
+    }[file_type]
+    result = composer.compose(
+        _composer_input(
+            query,
+            repository,
+            _semantic(
+                query,
+                file_type=file_type,
+                file_action=query.split(" ", 1)[0],
+                file_type_evidence=type_evidence,
+            ),
+        ),
+        config,
+    )
 
     assert [call["task"] for call in llm.calls] == [LLMTask.ANSWER, LLMTask.WRITING]
     assert result.used_tool_names == ("answer_generation", expected_tool)
@@ -240,17 +299,32 @@ def test_compound_email_and_attachment_keep_real_outputs_disjoint(
     llm = RecordingComposerLLM(answer_text=email_copy, file_plan=workbook_plan)
     composer, config, repository = _real_composer(tmp_path, llm)
 
-    result = composer.compose(_composer_input(query, repository), config)
+    result = composer.compose(
+        _composer_input(
+            query,
+            repository,
+            _semantic(
+                query,
+                file_type="xlsx",
+                file_action="attach an Excel budget tracker",
+                file_type_evidence="Excel budget tracker",
+                message_operation="prepare",
+                message_action="Write an email",
+                recipients=("finance@example.com",),
+            ),
+        ),
+        config,
+    )
 
     assert result.used_tool_names == ("answer_generation", "generate_excel")
     assert [call["task"] for call in llm.calls] == [LLMTask.ANSWER, LLMTask.WRITING]
     answer_prompt = str(llm.calls[0]["user_prompt"])
     file_prompt = str(llm.calls[1]["user_prompt"])
     assert "Write an email to finance@example.com explaining the Q3 handoff" in answer_prompt
-    assert "owner, forecast, and actual" not in answer_prompt
+    assert "owner, forecast, and actual" in answer_prompt
     assert "Excel budget tracker with owner, forecast, and actual columns" in file_prompt
-    assert "finance@example.com" not in file_prompt
-    assert "surrounding email" in file_prompt
+    assert "finance@example.com" in file_prompt
+    assert "Do not compose or send an external message" in file_prompt
 
     assert len(result.artifacts) == 1
     artifact_path = Path(result.artifacts[0]["storage_path"])
@@ -275,7 +349,16 @@ def test_compound_email_and_attachment_keep_real_outputs_disjoint(
             last_response=result.final_response_text,
             response_type=ResponseType.NORMAL,
         ),
-        platform_payload={"artifacts": list(result.artifacts)},
+        platform_payload={
+            "artifacts": list(result.artifacts),
+            "answer_generation_text": result.answer_response_text,
+            "semantic_action_decision": _semantic(
+                draft_query,
+                message_operation="prepare",
+                message_action="Draft an email",
+                recipients=("finance@example.com", "operations@example.com"),
+            ),
+        },
     )
 
     draft_sender = RecordingGmailSender()
@@ -316,7 +399,16 @@ def test_compound_email_and_attachment_keep_real_outputs_disjoint(
             last_response=result.final_response_text,
             response_type=ResponseType.NORMAL,
         ),
-        platform_payload={"artifacts": list(result.artifacts)},
+        platform_payload={
+            "artifacts": list(result.artifacts),
+            "answer_generation_text": result.answer_response_text,
+            "semantic_action_decision": _semantic(
+                send_query,
+                message_operation="send",
+                message_action="Email the Excel workbook",
+                recipients=("finance@example.com", "operations@example.com"),
+            ),
+        },
     )
     sent = PlatformSelector(
         llm=send_llm,

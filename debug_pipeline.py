@@ -106,6 +106,7 @@ from assistant_rag.settings import (
     FAST_LLM_MODEL,
     ProductionSettings,
 )
+from assistant_rag.semantic_actions import grounded_semantic_action_from_payload
 
 
 DEBUG_USER = "debug-user"
@@ -114,6 +115,55 @@ logger = logging.getLogger(__name__)
 
 def _debug_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def _scenario_semantic_payload(
+    query: str,
+    *,
+    message_operation: str = "none",
+    channel: str = "none",
+    message_evidence: str | None = None,
+    recipients: tuple[str, ...] = (),
+    excluded_recipients: tuple[str, ...] = (),
+    global_cancellation: bool = False,
+    cancellation_evidence: str | None = None,
+    file_type: str = "none",
+    file_evidence: str | None = None,
+    file_type_evidence: str | None = None,
+) -> dict[str, Any]:
+    raw = {
+        "message": {
+            "operation": message_operation,
+            "channel": channel,
+            "recipient_update": "replace",
+            "recipients": [
+                {"value": item, "disposition": "include", "evidence": item}
+                for item in recipients
+            ] + [
+                {"value": item, "disposition": "exclude", "evidence": item}
+                for item in excluded_recipients
+            ],
+            "global_cancellation": global_cancellation,
+            "authorization_evidence": [message_evidence] if message_evidence else [],
+            "cancellation_evidence": (
+                [cancellation_evidence] if cancellation_evidence else []
+            ),
+            "artifact_reference": "none",
+            "copy_revision": False,
+            "confidence": 0.99,
+        },
+        "file": {
+            "operation": "create" if file_type != "none" else "none",
+            "file_type": file_type,
+            "authorization_evidence": [file_evidence] if file_evidence else [],
+            "type_evidence": [file_type_evidence] if file_type_evidence else [],
+            "confidence": 0.99,
+        },
+        "reason_summary": "debug semantic fixture",
+    }
+    return grounded_semantic_action_from_payload(
+        raw, canonical_query=query
+    ).to_payload()
 
 
 def _debug_trace_lines(trace_summary: Any | None) -> list[str]:
@@ -585,6 +635,26 @@ class ScenarioLLM:
         prompt = str(kwargs.get("user_prompt") or "")
         prefix = "Runtime context:\n"
         payload = json.loads(prompt[len(prefix) :]) if prompt.startswith(prefix) else {}
+        if task is LLMTask.ANSWER:
+            records = list(
+                (payload.get("extra") or {}).get(
+                    "approved_knowledge_records"
+                )
+                or []
+            )
+            for record in records:
+                candidate_key = str(record.get("candidate_key") or "").strip()
+                evidence_text = str(record.get("text") or "").strip()
+                if candidate_key and evidence_text:
+                    return {
+                        "answer_text": evidence_text,
+                        "evidence_references": [
+                            {
+                                "candidate_key": candidate_key,
+                                "verbatim_support": evidence_text,
+                            }
+                        ],
+                    }
         if task is LLMTask.KNOWLEDGE_ACTION_EXTRACTION:
             raw_query = str(
                 payload.get("rewritten_query") or payload.get("raw_query") or ""
@@ -1370,14 +1440,8 @@ def run_request(
     selected_intent = Intent(
         request_metadata.get("intent", Intent.GENERAL_RESPONSE.value)
     )
-    if selected_intent is Intent.CLARIFICATION:
-        if response.conversation_hop_id is not None:
-            raise AssertionError(
-                "the clarification branch unexpectedly persisted a conversation hop"
-            )
-        return response
-
     if selected_intent not in {
+        Intent.CLARIFICATION,
         Intent.GENERAL_RESPONSE,
         Intent.KNOWLEDGE_FACTS,
         Intent.REMINDER,
@@ -1579,7 +1643,11 @@ def scenario_clarification_direct(settings: ProductionSettings) -> ScenarioResul
     assert_response(response, ResponseType.CLARIFICATION, "Which item")
     if "Clarification question:" not in response.final_chat_text:
         raise AssertionError(f"clarification question was not explicitly printed: {response.final_chat_text!r}")
-    return ScenarioResult("clarification_direct", True, "clarification branch returned a question")
+    return ScenarioResult(
+        "clarification_direct",
+        True,
+        "clarification branch returned and persisted its question",
+    )
 
 
 def scenario_general_new_conversation(settings: ProductionSettings) -> ScenarioResult:
@@ -1642,7 +1710,31 @@ def scenario_general_hitl_supporting_question_printed(settings: ProductionSettin
         config=state.pipeline.config.last_qa,
         prompt_registry=DEFAULT_PROMPT_REGISTRY,
     )
-    state.pipeline.platform_selector = PlatformSelector(llm=None)
+    combined_delivery_query = (
+        "Send an email about the migration plan.\n"
+        "Resolved required context: ops@example.com"
+    )
+    resumed_semantic = grounded_semantic_action_from_payload(
+        _scenario_semantic_payload(
+            combined_delivery_query,
+            message_operation="send",
+            channel="gmail",
+            message_evidence="Send an email",
+            recipients=("ops@example.com",),
+        ),
+        canonical_query=combined_delivery_query,
+    )
+
+    class ResolvedSemanticAnalyzer:
+        def analyze(self, query: str, **_kwargs: Any) -> Any:
+            if query != combined_delivery_query:
+                raise AssertionError(f"unexpected resolved platform query: {query!r}")
+            return resumed_semantic
+
+    state.pipeline.platform_selector = PlatformSelector(
+        llm=None,
+        semantic_analyzer=ResolvedSemanticAnalyzer(),  # type: ignore[arg-type]
+    )
     resumed = run_request(
         state,
         "ops@example.com",
@@ -1872,11 +1964,21 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
             last_response="",
             response_type=ResponseType.NORMAL,
         ),
+        platform_payload={
+            "semantic_action_decision": _scenario_semantic_payload(
+                delivery_query,
+                message_operation="send",
+                channel="gmail",
+                message_evidence="Send this by Gmail",
+                recipients=("alice@example.com", "bob@example.com"),
+            )
+        },
     )
 
     def response_for_query(
         response: BundledResponse,
         query: str,
+        semantic_payload: dict[str, Any],
     ) -> BundledResponse:
         return replace(
             response,
@@ -1884,6 +1986,10 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
                 response.last_qa_state,
                 last_user_query=query,
             ),
+            platform_payload={
+                **response.platform_payload,
+                "semantic_action_decision": semantic_payload,
+            },
         )
     original_smtp_ssl = smtplib.SMTP_SSL
     try:
@@ -1905,9 +2011,32 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
             ),
         )
         state = build_scenario_state(settings)
-        pipeline_delivery_llm = ScriptedPlatformLLM("send")
+        pipeline_initial_semantic = grounded_semantic_action_from_payload(
+            bundled.platform_payload["semantic_action_decision"],
+            canonical_query=delivery_query,
+        )
+        follow_up_query = "Please transmit the active draft now."
+        pipeline_follow_up_semantic = grounded_semantic_action_from_payload(
+            _scenario_semantic_payload(
+                follow_up_query,
+                message_operation="send",
+                channel="gmail",
+                message_evidence="transmit the active draft",
+            ),
+            canonical_query=follow_up_query,
+        )
+
+        class PipelineSemanticAnalyzer:
+            def analyze(self, query: str, **_kwargs: Any) -> Any:
+                if query == delivery_query:
+                    return pipeline_initial_semantic
+                if query == follow_up_query:
+                    return pipeline_follow_up_semantic
+                raise AssertionError(f"unexpected pipeline delivery query: {query!r}")
+
         state.pipeline.platform_selector = PlatformSelector(
-            llm=pipeline_delivery_llm,
+            llm=None,
+            semantic_analyzer=PipelineSemanticAnalyzer(),  # type: ignore[arg-type]
             senders={"gmail": GmailSender()},
         )
         pipeline_response = run_request(
@@ -1927,12 +2056,16 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
 
     if sent["delivery"]["status"] != "sent" or sent["delivery"]["recipients"] != ["alice@example.com", "bob@example.com"]:
         raise AssertionError(f"multi-recipient Gmail send failed: {sent!r}")
-    if direct_delivery_llm.calls or pipeline_delivery_llm.calls:
+    if direct_delivery_llm.calls:
         raise AssertionError(
             "explicit Gmail delivery invoked a redundant platform LLM call"
         )
     if len(FakeSMTP.instances) != 2:
-        raise AssertionError("selector and full pipeline did not each create exactly one SMTP delivery")
+        raise AssertionError(
+            "selector and full pipeline did not each create exactly one SMTP "
+            f"delivery: count={len(FakeSMTP.instances)}; "
+            f"pipeline_payload={pipeline_response.platform_payload!r}"
+        )
     smtp_client = FakeSMTP.instances[0]
     if smtp_client.login_args != ("sender@example.com", "app-password-for-test"):
         raise AssertionError("Gmail sender did not use the supplied UI/debug credentials")
@@ -1955,10 +2088,13 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
     if "app-password-for-test" in debug_output:
         raise AssertionError("Gmail app password leaked through debug_pipeline output")
 
-    # A literal-recipient email-writing request must enter Gmail preparation
-    # even if no platform model is available or it would have selected none.
+    # A grounded email-writing decision must enter Gmail preparation even if
+    # no platform model is available at the delivery boundary.
     # This is still draft-only: a write request cannot authorize SMTP sending.
-    exact_request = "Write an email to inform a day-off to vaiojjr@gmail.com and koffdo75@gmail.com."
+    exact_request = (
+        "Write an email to inform a day-off to vaiojjr@gmail.com "
+        "koffdo75@gmail.com and do not send it to minh@gmail.com."
+    )
     day_off_response = BundledResponse(
         final_chat_text=(
             "To inform the recipients about your day off, use this email:\n\n"
@@ -1973,6 +2109,20 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
             last_response="",
             response_type=ResponseType.NORMAL,
         ),
+        platform_payload={
+            "semantic_action_decision": _scenario_semantic_payload(
+                exact_request,
+                message_operation="prepare",
+                channel="gmail",
+                message_evidence="Write an email",
+                recipients=(
+                    "vaiojjr@gmail.com",
+                    "koffdo75@gmail.com",
+                    "minh@gmail.com",
+                ),
+                excluded_recipients=("minh@gmail.com",),
+            )
+        },
     )
     deterministic_draft = PlatformSelector(llm=None).select(
         day_off_response,
@@ -1980,8 +2130,8 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
     )
     if deterministic_draft["platform_selection"] != {
         "channel": "gmail",
-        "confidence": 1.0,
-        "source": "deterministic_explicit_email_request",
+        "confidence": 0.99,
+        "source": "grounded_semantic_contract",
     }:
         raise AssertionError(f"explicit email request did not select Gmail: {deterministic_draft!r}")
     if deterministic_draft["delivery"]["status"] != "draft_ready":
@@ -2011,6 +2161,24 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
             day_off_response.last_qa_state,
             last_user_query=bundle_priority_query,
         ),
+        platform_payload={
+            "outbound_message": {
+                "recipients": [
+                    "mallory@example.com",
+                    "bob@example.com",
+                    "alice@example.com",
+                ],
+                "subject": "Bundled composer subject",
+                "body": "Dear team,\n\nBundled composer body.",
+            },
+            "semantic_action_decision": _scenario_semantic_payload(
+                bundle_priority_query,
+                message_operation="prepare",
+                channel="gmail",
+                message_evidence="Draft an email",
+                recipients=("alice@example.com", "bob@example.com"),
+            )
+        },
     )
     bundle_priority_draft = PlatformSelector(llm=None).select(
         bundle_priority_response,
@@ -2058,6 +2226,11 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
                 day_off_response.last_qa_state,
                 last_user_query=ordinary_query,
             ),
+            platform_payload={
+                "semantic_action_decision": _scenario_semantic_payload(
+                    ordinary_query
+                )
+            },
         ),
         ChatRequest(
             user_id="platform-test",
@@ -2068,18 +2241,49 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
         raise AssertionError("an ordinary email-address question incorrectly entered Gmail delivery")
 
     state = build_scenario_state(settings)
-    state.pipeline.platform_selector = PlatformSelector(llm=None)
+    day_off_semantic = grounded_semantic_action_from_payload(
+        day_off_response.platform_payload["semantic_action_decision"],
+        canonical_query=exact_request,
+    )
+    active_send_query = "Please transmit the active draft now."
+    active_send_semantic = grounded_semantic_action_from_payload(
+        _scenario_semantic_payload(
+            active_send_query,
+            message_operation="send",
+            channel="gmail",
+            message_evidence="transmit the active draft",
+        ),
+        canonical_query=active_send_query,
+    )
+
+    class DayOffSemanticAnalyzer:
+        def analyze(self, query: str, **_kwargs: Any) -> Any:
+            if query == exact_request:
+                return day_off_semantic
+            if query == active_send_query:
+                return active_send_semantic
+            raise AssertionError(f"unexpected day-off platform query: {query!r}")
+
+    state.pipeline.platform_selector = PlatformSelector(
+        llm=None,
+        semantic_analyzer=DayOffSemanticAnalyzer(),  # type: ignore[arg-type]
+    )
     deterministic_pipeline_response = run_request(
         state,
         exact_request,
         metadata={
             "intent": Intent.GENERAL_RESPONSE.value,
             "normal_response_text": day_off_response.final_chat_text,
-            "supporting_question": "This optional HITL question must be suppressed.",
+            "semantic_action_decision": day_off_response.platform_payload[
+                "semantic_action_decision"
+            ],
         },
     )
     if deterministic_pipeline_response.platform_payload["delivery"]["status"] != "draft_ready":
-        raise AssertionError("full pipeline did not preserve the deterministic Gmail draft")
+        raise AssertionError(
+            "full pipeline did not preserve the grounded Gmail draft: "
+            f"{deterministic_pipeline_response.platform_payload!r}"
+        )
     if not deterministic_pipeline_response.final_chat_text.startswith("Gmail draft is ready for review"):
         raise AssertionError(f"full pipeline did not surface Gmail draft status: {deterministic_pipeline_response.final_chat_text!r}")
     if "It has not been sent." not in deterministic_pipeline_response.final_chat_text:
@@ -2114,6 +2318,14 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
         semantic_follow_up = run_request(
             state,
             "Please transmit the active draft now.",
+            metadata={
+                "semantic_action_decision": _scenario_semantic_payload(
+                    "Please transmit the active draft now.",
+                    message_operation="send",
+                    channel="gmail",
+                    message_evidence="transmit the active draft",
+                )
+            },
             platform_context={
                 "gmail_username": "sender@example.com",
                 "gmail_app_password": "app-password-for-test",
@@ -2137,11 +2349,12 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
         raise AssertionError("semantic follow-up changed the active draft subject")
     if follow_up_message.get_body(preferencelist=("plain",)).get_content().strip() != active_draft.body:
         raise AssertionError("semantic follow-up changed the active draft body")
-    if semantic_follow_up.last_qa_state.outbound_state is not None:
-        raise AssertionError("successfully sent outbound state remained active and could be duplicated")
+    sent_outbound = semantic_follow_up.last_qa_state.outbound_state
+    if sent_outbound is None or sent_outbound.status != "sent":
+        raise AssertionError("successfully sent outbound state was not retained as immutable history")
 
-    # Even a bad extractor response cannot turn an explicit do-not-send request
-    # into an SMTP side effect; raw user intent remains authoritative.
+    # A grounded cancellation cannot be overridden by an unrelated extractor
+    # response or turned into an SMTP side effect.
     original_imap_ssl = imaplib.IMAP4_SSL
     draft_query = (
         "Save a Gmail draft update to alice@example.com and bob@example.com; "
@@ -2151,7 +2364,17 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
         imaplib.IMAP4_SSL = FakeIMAP  # type: ignore[assignment]
         draft_selector = PlatformSelector(llm=ScriptedPlatformLLM("send"), senders={"gmail": GmailSender()})
         drafted = draft_selector.select(
-            response_for_query(bundled, draft_query),
+            response_for_query(
+                bundled,
+                draft_query,
+                _scenario_semantic_payload(
+                    draft_query,
+                    message_operation="save_draft",
+                    channel="gmail",
+                    message_evidence="Save a Gmail draft",
+                    recipients=("alice@example.com", "bob@example.com"),
+                ),
+            ),
             ChatRequest(
                 user_id="platform-test",
                 raw_query=draft_query,
@@ -2211,7 +2434,17 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
         failed_draft = PlatformSelector(
             llm=ScriptedPlatformLLM("send"), senders={"gmail": GmailSender()}
         ).select(
-            response_for_query(bundled, draft_query),
+            response_for_query(
+                bundled,
+                draft_query,
+                _scenario_semantic_payload(
+                    draft_query,
+                    message_operation="save_draft",
+                    channel="gmail",
+                    message_evidence="Save a Gmail draft",
+                    recipients=("alice@example.com", "bob@example.com"),
+                ),
+            ),
             ChatRequest(
                 user_id="platform-test",
                 raw_query=draft_query,
@@ -2248,7 +2481,17 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
         attached_delivery = PlatformSelector(
             llm=ScriptedPlatformLLM("send"), senders={"gmail": GmailSender()}
         ).select(
-            response_for_query(attachment_bundled, attachment_query),
+            response_for_query(
+                attachment_bundled,
+                attachment_query,
+                _scenario_semantic_payload(
+                    attachment_query,
+                    message_operation="send",
+                    channel="gmail",
+                    message_evidence="Send the generated file",
+                    recipients=("alice@example.com",),
+                ),
+            ),
             ChatRequest(
                 user_id="platform-test",
                 raw_query=attachment_query,
@@ -2326,7 +2569,17 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
                 llm=IncompleteRecipientPlatformLLM("draft"),
                 senders={"gmail": GmailSender()},
             ).select(
-                response_for_query(workbook_bundled, workbook_send_query),
+                response_for_query(
+                    workbook_bundled,
+                    workbook_send_query,
+                    _scenario_semantic_payload(
+                        workbook_send_query,
+                        message_operation="send",
+                        channel="gmail",
+                        message_evidence="email it",
+                        recipients=("alice@example.com", "bob@example.com"),
+                    ),
+                ),
                 ChatRequest(
                     user_id="platform-test",
                     raw_query=workbook_send_query,
@@ -2362,7 +2615,17 @@ def scenario_platform_gmail_multi_recipient_delivery(settings: ProductionSetting
                 llm=IncompleteRecipientPlatformLLM("send"),
                 senders={"gmail": GmailSender()},
             ).select(
-                response_for_query(workbook_bundled, workbook_draft_query),
+                response_for_query(
+                    workbook_bundled,
+                    workbook_draft_query,
+                    _scenario_semantic_payload(
+                        workbook_draft_query,
+                        message_operation="save_draft",
+                        channel="gmail",
+                        message_evidence="save a Gmail draft",
+                        recipients=("alice@example.com", "bob@example.com"),
+                    ),
+                ),
                 ChatRequest(
                     user_id="platform-test",
                     raw_query=workbook_draft_query,
@@ -2519,7 +2782,14 @@ def scenario_llm_answer_generation_trace(settings: ProductionSettings) -> Scenar
             extracted_expected_response_types=[],
             approved_knowledge_evidence=[],
             approved_reminder_context=[],
-            metadata={},
+            metadata={
+                "semantic_action_decision": _scenario_semantic_payload(
+                    query,
+                    file_type="xlsx",
+                    file_evidence="Create",
+                    file_type_evidence="Excel workbook",
+                )
+            },
             platform_context={},
             sub_branch_prompt_context=SubBranchPromptContext(
                 sub_branch=GeneralSubBranch.NEW_CONVERSATION_TOPIC,
@@ -3034,6 +3304,7 @@ def scenario_clarification_schema_echo_recovery(settings: ProductionSettings) ->
         user_prompt='Runtime context:\n{"stage":"generate_clarification"}',
         schema=schema,
         mode="schema",
+        is_retry=True,
     )
     if "not a JSON Schema" not in repair_prompt or '"properties"' in repair_prompt:
         raise AssertionError(f"schema retry prompt is still likely to trigger a schema echo: {repair_prompt}")
@@ -3365,7 +3636,7 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         LLMTask.KNOWLEDGE_ACTION_EXTRACTION: 24.0,
         LLMTask.KNOWLEDGE_ACTION_VALIDATION: 45.0,
         LLMTask.KNOWLEDGE_CONTENT_FINALIZATION: 90.0,
-        LLMTask.REMINDER_ACTION_EXTRACTION: 24.0,
+        LLMTask.REMINDER_ACTION_EXTRACTION: 36.0,
         LLMTask.REMINDER_ACTION_VALIDATION: 45.0,
         LLMTask.REMINDER_CONTENT_FINALIZATION: 90.0,
         LLMTask.RISKY_ACTION: 35.0,
@@ -3853,6 +4124,14 @@ def scenario_content_composer_deterministic(settings: ProductionSettings) -> Sce
                 composer_input,
                 raw_user_query="Give me an Excel file to track project tasks.",
                 rewritten_query="Give me an Excel file to track project tasks.",
+                metadata={
+                    "semantic_action_decision": _scenario_semantic_payload(
+                        "Give me an Excel file to track project tasks.",
+                        file_type="xlsx",
+                        file_evidence="Give me",
+                        file_type_evidence="Excel file",
+                    )
+                },
                 repository=state.repository,
             ),
             config,

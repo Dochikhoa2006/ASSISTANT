@@ -20,6 +20,7 @@ from assistant_rag.contracts import (
 from assistant_rag.database import SQLiteRepository
 from assistant_rag.llm import (
     LLMTask,
+    StructuredOutputInvariantError,
     structured_fallback_payload,
     validate_json_schema,
 )
@@ -37,6 +38,7 @@ from assistant_rag.reminder_mutation import (
     ReminderContentFinalizationStrategy,
     ReminderMutationCandidate,
     ReminderMutationPipeline,
+    _canonical_utc_from_model_time,
 )
 from assistant_rag.reminder_timing import ReminderTimingPlanner
 from assistant_rag.settings import ProductionSettings
@@ -264,6 +266,30 @@ def _prompt_payload(call: dict[str, Any]) -> dict[str, Any]:
     return json.loads(prompt[len(prefix) :])
 
 
+def _assert_validation_time_context(
+    payload: dict[str, Any],
+    *,
+    trusted_timezone: str = "UTC",
+) -> None:
+    assert set(payload) == {
+        "first_model_response",
+        "reminder_retrieval",
+        "time_context",
+        "validation_policy",
+    }
+    time_context = payload["time_context"]
+    assert time_context == {
+        "runtime_now_utc": time_context["runtime_now_utc"],
+        "trusted_user_timezone": trusted_timezone,
+        "output_timezone": "UTC",
+    }
+    runtime_now = datetime.fromisoformat(time_context["runtime_now_utc"])
+    assert runtime_now.utcoffset() == timezone.utc.utcoffset(runtime_now)
+    assert payload["validation_policy"] == {
+        "minimum_execution_confidence": 0.84,
+    }
+
+
 def test_all_reminder_llm_contracts_are_minimal_and_have_no_clarification_component() -> None:
     assert REMINDER_ACTION_EXTRACTION_SCHEMA["required"] == [
         "action",
@@ -271,9 +297,22 @@ def test_all_reminder_llm_contracts_are_minimal_and_have_no_clarification_compon
         "field_values",
         "confidence",
     ]
-    extraction_fields = set(
-        REMINDER_ACTION_EXTRACTION_SCHEMA["properties"]["field_values"]
-        ["items"]["properties"]["field"]["enum"]
+    field_value_schema = REMINDER_ACTION_EXTRACTION_SCHEMA["properties"][
+        "field_values"
+    ]
+    extraction_fields = set(field_value_schema["properties"])
+    assert REMINDER_ACTION_EXTRACTION_SCHEMA["properties"]["action"]["type"] == (
+        "string"
+    )
+    assert field_value_schema["type"] == "object"
+    assert field_value_schema["additionalProperties"] is False
+    assert field_value_schema["required"] == [
+        "user_timezone",
+        "original_time_text",
+    ]
+    assert all(
+        rules["type"] == "string"
+        for rules in field_value_schema["properties"].values()
     )
     assert {
         "notification_time",
@@ -286,6 +325,7 @@ def test_all_reminder_llm_contracts_are_minimal_and_have_no_clarification_compon
     )
     properties = REMINDER_ACTION_VALIDATION_SCHEMA["properties"]
     decisions = set(properties["validation_result"]["enum"])
+    assert properties["validation_result"]["type"] == "string"
 
     assert REMINDER_ACTION_VALIDATION_SCHEMA["required"] == [
         "validation_result",
@@ -303,6 +343,7 @@ def test_all_reminder_llm_contracts_are_minimal_and_have_no_clarification_compon
         "evidence_field",
         "matched_text",
     }
+    assert assessment_properties["evidence_field"]["type"] == "string"
     assert not decisions & {
         "EXECUTE",
         "SKIP_NOT_FOUND",
@@ -374,6 +415,187 @@ def test_reminder_structured_fallbacks_match_minimal_schemas(
 
 def test_reminder_repository_has_no_standalone_duplicate_detector() -> None:
     assert not hasattr(_repository(), "find_active_reminder_duplicates")
+
+
+def _time_extraction_payload(
+    *,
+    notification_time: str = "2035-04-06T09:00:00",
+    user_timezone: str = "Asia/Ho_Chi_Minh",
+    original_time_text: str = "tomorrow at 9 AM",
+) -> dict[str, Any]:
+    return {
+        "action": "add",
+        "retrieval_text": "submit the expense report",
+        "field_values": [
+            {"field": "subject", "value": "submit the expense report"},
+            {"field": "raw_reminder", "value": "submit the expense report"},
+            {"field": "notification_time", "value": notification_time},
+            {"field": "user_timezone", "value": user_timezone},
+            {"field": "original_time_text", "value": original_time_text},
+        ],
+        "confidence": 0.99,
+    }
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_error"),
+    (
+        (
+            _time_extraction_payload(original_time_text=""),
+            "time_requires_original_time_text",
+        ),
+        (
+            _time_extraction_payload(user_timezone="Europe/Paris"),
+            "time_requires_trusted_user_timezone",
+        ),
+        (
+            _time_extraction_payload(user_timezone="Invalid/Reminder_Zone"),
+            "user_timezone_must_be_iana_timezone",
+        ),
+        (
+            _time_extraction_payload(
+                notification_time="2035-04-06T09:00:00+08:00"
+            ),
+            "notification_time_must_be_unambiguous_local_or_utc",
+        ),
+    ),
+)
+def test_reminder_extraction_invariants_reject_unsafe_time_state(
+    payload: dict[str, Any],
+    expected_error: str,
+) -> None:
+    with pytest.raises(StructuredOutputInvariantError, match=expected_error):
+        LLMReminderActionDetector._validate_model_invariants(
+            payload,
+            rewritten_query=(
+                "Remind me tomorrow at 9 AM to submit the expense report."
+            ),
+            chat_history=[],
+            trusted_timezone="Asia/Ho_Chi_Minh",
+        )
+
+
+def test_reminder_extraction_invariants_accept_grounded_trusted_local_state() -> None:
+    assert (
+        LLMReminderActionDetector._validate_model_invariants(
+            _time_extraction_payload(),
+            rewritten_query=(
+                "Remind me tomorrow at 9 AM to submit the expense report."
+            ),
+            chat_history=[],
+            trusted_timezone="Asia/Ho_Chi_Minh",
+        )
+        is None
+    )
+
+
+def test_model_local_wall_clock_is_canonicalized_by_trusted_iana_zone() -> None:
+    assert _canonical_utc_from_model_time(
+        "2026-07-19T09:00:00",
+        trusted_timezone="Asia/Ho_Chi_Minh",
+    ) == "2026-07-19T02:00:00+00:00"
+
+
+def test_detector_canonicalizes_flat_model_field_map_before_downstream_use() -> None:
+    query = "Remind me tomorrow at 9 AM to submit the expense report."
+    llm = ScriptedLLM(
+        [
+            {
+                "action": "add",
+                "retrieval_text": "submit the expense report",
+                "field_values": {
+                    "notification_time": "2035-04-06T09:00:00",
+                    "user_timezone": "Asia/Ho_Chi_Minh",
+                    "original_time_text": "tomorrow at 9 AM",
+                },
+                "confidence": 0.91,
+            }
+        ]
+    )
+    detector = LLMReminderActionDetector(
+        llm=llm,
+        prompts=DEFAULT_PROMPT_REGISTRY,
+        default_timezone="UTC",
+    )
+
+    result = detector.detect(
+        ChatRequest(
+            user_id=USER_ID,
+            raw_query=query,
+            platform_context={"timezone": "Asia/Ho_Chi_Minh"},
+        ),
+        query,
+        Intent.REMINDER,
+    )
+
+    action = result.metadata["reminder_actions"][0]
+    assert action["notification_time"] == "2035-04-06T02:00:00+00:00"
+    assert action["subject"] == "submit the expense report"
+    assert action["raw_reminder"] == "submit the expense report"
+    assert result.metadata["reminder_action_extraction_response"][
+        "field_values"
+    ] == [
+        {"field": "subject", "value": "submit the expense report"},
+        {"field": "raw_reminder", "value": "submit the expense report"},
+        {"field": "notification_time", "value": "2035-04-06T02:00:00+00:00"},
+        {"field": "user_timezone", "value": "Asia/Ho_Chi_Minh"},
+        {"field": "original_time_text", "value": "tomorrow at 9 AM"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "local_time",
+    (
+        "2026-03-08T02:30:00",
+        "2026-11-01T01:30:00",
+    ),
+)
+def test_model_local_wall_clock_rejects_dst_gap_and_ambiguity(
+    local_time: str,
+) -> None:
+    assert (
+        _canonical_utc_from_model_time(
+            local_time,
+            trusted_timezone="America/New_York",
+        )
+        is None
+    )
+
+
+def test_reminder_extraction_invariants_require_a_grounded_target_description() -> None:
+    payload = _time_extraction_payload()
+    payload["retrieval_text"] = ""
+
+    with pytest.raises(StructuredOutputInvariantError, match="retrieval_text_required"):
+        LLMReminderActionDetector._validate_model_invariants(
+            payload,
+            rewritten_query=(
+                "Remind me tomorrow at 9 AM to submit the expense report."
+            ),
+            chat_history=[],
+            trusted_timezone="Asia/Ho_Chi_Minh",
+        )
+
+
+def test_reminder_extraction_invariants_retry_when_time_source_has_no_time() -> None:
+    payload = _time_extraction_payload()
+    payload["field_values"] = {
+        "user_timezone": "Asia/Ho_Chi_Minh",
+        "original_time_text": "tomorrow at 9 AM",
+    }
+
+    with pytest.raises(
+        StructuredOutputInvariantError,
+        match="time_source_requires_normalized_time",
+    ):
+        LLMReminderActionDetector._validate_model_invariants(
+            payload,
+            rewritten_query=(
+                "Remind me tomorrow at 9 AM to submit the expense report."
+            ),
+            chat_history=[],
+            trusted_timezone="Asia/Ho_Chi_Minh",
+        )
 
 
 def _extraction(
@@ -574,10 +796,9 @@ def test_add_runs_two_stages_with_evidence_isolated_validation_prompt() -> None:
     assert extraction_prompt["chat_history"] == history
     assert forbidden_raw_query not in json.dumps(extraction_prompt)
     validation_payload = _prompt_payload(llm.calls[1])
-    assert validation_payload == {
-        "first_model_response": extraction,
-        "reminder_retrieval": [],
-    }
+    _assert_validation_time_context(validation_payload)
+    assert validation_payload["first_model_response"] == extraction
+    assert validation_payload["reminder_retrieval"] == []
     serialized_validation = json.dumps(validation_payload)
     assert query not in serialized_validation
     assert forbidden_raw_query not in serialized_validation
@@ -886,10 +1107,7 @@ def test_delete_executes_immediately_without_pending_confirmation() -> None:
     assert "confirmation_replay" not in extraction_payload["extra"]
     assert "trusted_confirmation_action_context" not in extraction_payload["extra"]
     validation_payload = _prompt_payload(llm.calls[1])
-    assert set(validation_payload) == {
-        "first_model_response",
-        "reminder_retrieval",
-    }
+    _assert_validation_time_context(validation_payload)
     assert "chat_history" not in validation_payload
     assert "delete-history" not in json.dumps(validation_payload)
     assert _reminder_row(repository, reminder_id)["status"] == "dismissed"
@@ -976,14 +1194,16 @@ def test_first_llm_emits_one_direct_lifecycle_action(
     assert action["toggle_direction"] == direction
     assert action["action"] == direction
     prompt = _prompt_payload(llm.calls[0])
-    assert prompt["extra"]["allowed_actions"] == [
-        "add",
-        "delete",
-        "modify",
-        "turn_on",
-        "turn_off",
-    ]
-    assert "toggle_directions" not in prompt["extra"]
+    assert set(prompt["extra"]) == {"contract_version", "time_context"}
+    assert prompt["extra"]["contract_version"] == 2
+    time_context = prompt["extra"]["time_context"]
+    assert time_context["trusted_user_timezone"] == "UTC"
+    assert time_context["canonical_output_timezone"] == "UTC"
+    assert "without an offset" in time_context["model_time_format"]
+    runtime_now = datetime.fromisoformat(time_context["runtime_now_utc"])
+    assert runtime_now.utcoffset() == timezone.utc.utcoffset(runtime_now)
+    runtime_local = datetime.fromisoformat(time_context["runtime_now_local"])
+    assert runtime_local.utcoffset() == timezone.utc.utcoffset(runtime_local)
 
 
 @pytest.mark.parametrize(
@@ -1218,37 +1438,16 @@ def test_reminder_first_llm_receives_complete_context_and_field_contract() -> No
     assert query not in serialized_prompt
     assert "FORBIDDEN_RAW_HISTORY_QUERY" not in serialized_prompt
     assert "raw_user_query" not in serialized_prompt
-    assert prompt["extra"]["cardinality"] == "exactly_one"
-    assert set(prompt["extra"]["action_content_contract"]) == {
-        "add",
-        "delete",
-        "modify",
-        "turn_on",
-        "turn_off",
-    }
-    model_mutation_fields = set(REMINDER_EDITABLE_FIELDS) - {
-        "supporting_question",
-        "supporting_response",
-    }
-    assert set(prompt["extra"]["editable_fields"]) == model_mutation_fields
-    assert set(prompt["extra"]["field_semantics"]) == model_mutation_fields
-    assert prompt["extra"]["context_policy"] == {
-        "current_turn_defines_action_and_new_values": True,
-        "history_resolves_existing_target_only": True,
-        "platform_context_resolves_trusted_timezone": True,
-        "runtime_now_resolves_relative_time": True,
-        "metadata_cannot_supply_action_payload": True,
-    }
-    assert prompt["extra"]["time_normalization_contract"] == {
-        "owner": "reminder_action_extraction_model",
-        "output_timezone": "UTC",
-        "output_format": "ISO-8601 with explicit +00:00 offset",
-        "required_companion_fields": [
-            "user_timezone",
-            "original_time_text",
-        ],
-        "omit_unresolvable_time_instead_of_guessing": True,
-    }
+    assert set(prompt["extra"]) == {"contract_version", "time_context"}
+    assert prompt["extra"]["contract_version"] == 2
+    time_context = prompt["extra"]["time_context"]
+    assert time_context["trusted_user_timezone"] == "UTC"
+    assert time_context["canonical_output_timezone"] == "UTC"
+    assert "without an offset" in time_context["model_time_format"]
+    runtime_now = datetime.fromisoformat(time_context["runtime_now_utc"])
+    assert runtime_now.utcoffset() == timezone.utc.utcoffset(runtime_now)
+    runtime_local = datetime.fromisoformat(time_context["runtime_now_local"])
+    assert runtime_local.utcoffset() == timezone.utc.utcoffset(runtime_local)
 
 
 def test_llm2_duplicate_fail_reasks_without_finalizer_or_write() -> None:
@@ -1366,10 +1565,16 @@ def test_incomplete_best_effort_extraction_reaches_validator_and_reasks() -> Non
         LLMTask.REMINDER_ACTION_EXTRACTION,
         LLMTask.REMINDER_ACTION_VALIDATION,
     ]
-    assert _prompt_payload(llm.calls[1]) == {
-        "first_model_response": extraction,
-        "reminder_retrieval": [],
+    validation_payload = _prompt_payload(llm.calls[1])
+    _assert_validation_time_context(validation_payload)
+    assert validation_payload["first_model_response"] == {
+        **extraction,
+        "field_values": [
+            {"field": "subject", "value": "Payroll"},
+            {"field": "raw_reminder", "value": "Payroll"},
+        ],
     }
+    assert validation_payload["reminder_retrieval"] == []
     assert repository.table_count("reminders") == 0
 
 
@@ -1594,6 +1799,8 @@ def test_second_guard_accepts_low_confidence_partial_fail_with_question() -> Non
         "action": "delete",
         "changed_fields": [],
         "time_semantics": "unchanged",
+        "runtime_now_utc": "2035-04-01T00:00:00+00:00",
+        "trusted_timezone": "UTC",
         **_empty_record(),
     }
 
@@ -1686,11 +1893,10 @@ def test_model_two_can_authorize_complete_low_confidence_model_one_state() -> No
     "invalid_time",
     (
         "not-a-calendar-time",
-        "2035-04-05T09:30:00",
         "2035-04-05T09:30:00+07:00",
     ),
 )
-def test_second_guard_errors_on_pass_for_non_normalized_model_one_time(
+def test_detector_rejects_invalid_or_model_authored_non_utc_offset_time(
     invalid_time: str,
 ) -> None:
     query = f"Add Payroll at {invalid_time} in UTC."
@@ -1720,10 +1926,52 @@ def test_second_guard_errors_on_pass_for_non_normalized_model_one_time(
     with canonical_chat_history_scope([]):
         result = _branch(llm).execute(_context(query, []), repository)
 
-    assert result.response_type is ResponseType.ERROR
-    assert len(llm.calls) == 2
-    assert _prompt_payload(llm.calls[1])["first_model_response"] == extraction
+    assert result.response_type is ResponseType.SAFE_NOOP
+    assert len(llm.calls) == 1
     assert repository.table_count("reminders") == 0
+
+
+def test_naive_model_local_time_is_canonicalized_before_validation_and_write() -> None:
+    local_time = "2035-04-05T09:30:00"
+    canonical_time = f"{local_time}+00:00"
+    query = f"Add Payroll at {local_time} in UTC."
+    extraction = _extraction(
+        action="add",
+        retrieval_text="Payroll",
+        subject="Payroll",
+        raw_reminder="Payroll",
+        notification_time=local_time,
+        user_timezone="UTC",
+        original_time_text=local_time,
+    )
+    llm = ScriptedLLM(
+        [
+            extraction,
+            _validation(
+                operation="add",
+                result="PASS",
+                selected=[],
+                assessments=[],
+                should_execute=True,
+            ),
+        ]
+    )
+    repository = _repository()
+
+    with canonical_chat_history_scope([]):
+        result = _branch(llm).execute(_context(query, []), repository)
+
+    assert result.response_type is ResponseType.REMINDER_ACTION
+    first_response = _prompt_payload(llm.calls[1])["first_model_response"]
+    assert {item["field"]: item["value"] for item in first_response["field_values"]}[
+        "notification_time"
+    ] == canonical_time
+    row = repository.connection.execute(
+        "SELECT reminder_time FROM reminders WHERE user_id = ?",
+        (USER_ID,),
+    ).fetchone()
+    assert row is not None
+    assert row["reminder_time"] == canonical_time
 
 
 def test_second_guard_errors_on_pass_for_invalid_model_one_timezone() -> None:

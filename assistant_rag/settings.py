@@ -9,12 +9,6 @@ from dataclasses import dataclass, field, fields
 from enum import Enum
 import os
 
-from .content_keywords import (
-    DOCUMENT_FILE_KEYWORDS,
-    EXCEL_FILE_KEYWORDS,
-    FILE_CREATION_VERB_KEYWORDS,
-    POWERPOINT_FILE_KEYWORDS,
-)
 from .retrieval_policy import (
     DEFAULT_CROSS_ENCODER_MIN_SCORE,
     RETRIEVAL_PIPELINE_POLICY,
@@ -135,10 +129,17 @@ class OllamaSettings:
     # Dedicated task settings keep its larger structured reminder payloads
     # isolated from generic extraction, knowledge mutation, and file generation.
     model_reminder_action_extraction: str = FAST_LLM_MODEL
-    timeout_reminder_action_extraction: float = 24.0
+    model_reminder_action_extraction_fallback: str | None = CAPABLE_LLM_MODEL
+    # The primary 4B call usually completes well below this ceiling; the same
+    # bound must also accommodate one 9B correction without timing out at the
+    # old 24-second edge observed on local CPU/GPU transitions.
+    timeout_reminder_action_extraction: float = 36.0
     num_ctx_reminder_action_extraction: int = 8192
     num_predict_reminder_action_extraction: int | None = 2048
     temperature_reminder_action_extraction: float = 0.0
+    # One schema-constrained fast-model call. Hybrid fallback may make one
+    # additional capable-model call after a structural or semantic failure.
+    json_retry_count_reminder_action_extraction: int = 0
 
     model_reminder_action_validation: str = CAPABLE_LLM_MODEL
     model_reminder_action_validation_fallback: str | None = FAST_LLM_MODEL
@@ -245,6 +246,8 @@ class RetrievalSettings:
     semantic_weight: float = 1.0
     rerank_candidate_limit: int = RETRIEVAL_PIPELINE_POLICY.rrf_top_k
     conversation_min_confidence_score: float = 0.50
+    # Strict total active-row budget for an authoritative SQL recovery snapshot.
+    sql_fallback_candidate_limit: int = 200
 
     def __post_init__(self) -> None:
         RetrievalPipelinePolicy(
@@ -258,6 +261,8 @@ class RetrievalSettings:
             raise ValueError(
                 "conversation_min_confidence_score must be between 0 and 1"
             )
+        if self.sql_fallback_candidate_limit <= 0:
+            raise ValueError("sql_fallback_candidate_limit budget must be positive")
 
 
 @dataclass(frozen=True)
@@ -490,7 +495,9 @@ class RetrievalValidationSettings:
 
     reminder_llm_validation_enabled: bool = True
     reminder_llm_validation_model: str | None = None
-    reminder_llm_validation_min_confidence: float = 0.86
+    # Semantic, provenance, cardinality, temporal, and repository guards remain
+    # mandatory in addition to this configurable confidence lower bound.
+    reminder_llm_validation_min_confidence: float = 0.84
     reminder_llm_validation_json_retry_count: int = 1
     reminder_llm_validation_max_candidates: int = 3
 
@@ -607,10 +614,6 @@ class GeneralPurposeSettings:
     )
     content_composer_default_tool: str = "answer_generation"
     content_composer_fallback_tool: str = "answer_generation"
-    file_creation_verb_keywords: tuple[str, ...] = FILE_CREATION_VERB_KEYWORDS
-    document_tool_signal_keywords: tuple[str, ...] = DOCUMENT_FILE_KEYWORDS
-    excel_tool_signal_keywords: tuple[str, ...] = EXCEL_FILE_KEYWORDS
-    pptx_tool_signal_keywords: tuple[str, ...] = POWERPOINT_FILE_KEYWORDS
     hitl_supporting_question_enabled: bool = True
     hitl_supporting_question_confidence_threshold: float = 0.72
     hitl_supporting_question_recent_question_window: int = 2
@@ -757,10 +760,12 @@ class ProductionSettings:
                 num_predict_knowledge_content_finalization=_get_int("OLLAMA_KNOWLEDGE_CONTENT_FINALIZATION_NUM_PREDICT", OllamaSettings.num_predict_knowledge_content_finalization) if os.getenv("OLLAMA_KNOWLEDGE_CONTENT_FINALIZATION_NUM_PREDICT") else OllamaSettings.num_predict_knowledge_content_finalization,
                 temperature_knowledge_content_finalization=_get_float("OLLAMA_KNOWLEDGE_CONTENT_FINALIZATION_TEMPERATURE", OllamaSettings.temperature_knowledge_content_finalization),
                 model_reminder_action_extraction=os.getenv("OLLAMA_REMINDER_ACTION_EXTRACTION_MODEL", OllamaSettings.model_reminder_action_extraction),
+                model_reminder_action_extraction_fallback=os.getenv("OLLAMA_REMINDER_ACTION_EXTRACTION_FALLBACK_MODEL", OllamaSettings.model_reminder_action_extraction_fallback) or None,
                 timeout_reminder_action_extraction=_get_float("OLLAMA_REMINDER_ACTION_EXTRACTION_TIMEOUT", OllamaSettings.timeout_reminder_action_extraction),
                 num_ctx_reminder_action_extraction=_get_int("OLLAMA_REMINDER_ACTION_EXTRACTION_NUM_CTX", OllamaSettings.num_ctx_reminder_action_extraction),
                 num_predict_reminder_action_extraction=_get_int("OLLAMA_REMINDER_ACTION_EXTRACTION_NUM_PREDICT", OllamaSettings.num_predict_reminder_action_extraction) if os.getenv("OLLAMA_REMINDER_ACTION_EXTRACTION_NUM_PREDICT") else OllamaSettings.num_predict_reminder_action_extraction,
                 temperature_reminder_action_extraction=_get_float("OLLAMA_REMINDER_ACTION_EXTRACTION_TEMPERATURE", OllamaSettings.temperature_reminder_action_extraction),
+                json_retry_count_reminder_action_extraction=_get_int("OLLAMA_REMINDER_ACTION_EXTRACTION_JSON_RETRY_COUNT", OllamaSettings.json_retry_count_reminder_action_extraction),
                 model_reminder_action_validation=os.getenv("OLLAMA_REMINDER_ACTION_VALIDATION_MODEL", OllamaSettings.model_reminder_action_validation),
                 model_reminder_action_validation_fallback=os.getenv("OLLAMA_REMINDER_ACTION_VALIDATION_FALLBACK_MODEL", OllamaSettings.model_reminder_action_validation_fallback) or None,
                 timeout_reminder_action_validation=_get_float("OLLAMA_REMINDER_ACTION_VALIDATION_TIMEOUT", OllamaSettings.timeout_reminder_action_validation),
@@ -856,6 +861,10 @@ class ProductionSettings:
                 conversation_min_confidence_score=_get_float(
                     "CONVERSATION_MIN_CONFIDENCE_SCORE",
                     RetrievalSettings.conversation_min_confidence_score,
+                ),
+                sql_fallback_candidate_limit=_get_int(
+                    "ASSISTANT_SQL_KNOWLEDGE_FALLBACK_LIMIT",
+                    RetrievalSettings.sql_fallback_candidate_limit,
                 ),
             ),
             opensearch=OpenSearchSettings(
@@ -1276,13 +1285,6 @@ class ProductionSettings:
                 content_composer_allowed_tools=_get_tuple("CONTENT_COMPOSER_ALLOWED_TOOLS", GeneralPurposeSettings.content_composer_allowed_tools),
                 content_composer_default_tool=os.getenv("CONTENT_COMPOSER_DEFAULT_TOOL", GeneralPurposeSettings.content_composer_default_tool),
                 content_composer_fallback_tool=os.getenv("CONTENT_COMPOSER_FALLBACK_TOOL", GeneralPurposeSettings.content_composer_fallback_tool),
-                file_creation_verb_keywords=_get_tuple("CONTENT_COMPOSER_VERB_KEYWORDS", GeneralPurposeSettings.file_creation_verb_keywords),
-                document_tool_signal_keywords=_get_tuple(
-                    "CONTENT_COMPOSER_DOCUMENT_KEYWORDS",
-                    _get_tuple("CONTENT_COMPOSER_PDF_KEYWORDS", GeneralPurposeSettings.document_tool_signal_keywords),
-                ),
-                excel_tool_signal_keywords=_get_tuple("CONTENT_COMPOSER_EXCEL_KEYWORDS", GeneralPurposeSettings.excel_tool_signal_keywords),
-                pptx_tool_signal_keywords=_get_tuple("CONTENT_COMPOSER_PPTX_KEYWORDS", GeneralPurposeSettings.pptx_tool_signal_keywords),
                 hitl_supporting_question_enabled=_get_bool("HITL_SUPPORTING_QUESTION_ENABLED", GeneralPurposeSettings.hitl_supporting_question_enabled),
                 hitl_supporting_question_confidence_threshold=_get_float("HITL_SUPPORTING_QUESTION_CONFIDENCE_THRESHOLD", GeneralPurposeSettings.hitl_supporting_question_confidence_threshold),
                 hitl_supporting_question_recent_question_window=_get_int("HITL_SUPPORTING_QUESTION_RECENT_QUESTION_WINDOW", GeneralPurposeSettings.hitl_supporting_question_recent_question_window),

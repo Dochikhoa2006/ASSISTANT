@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import json
-from functools import lru_cache
-import re
-import unicodedata
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
@@ -17,24 +14,28 @@ from .prompts import (
     PromptContext,
     PromptRegistry,
 )
+from .semantic_actions import (
+    SemanticActionAnalyzer,
+    SemanticActionDecision,
+    semantic_action_from_internal_payload,
+)
+from .answer_grounding import generate_answer
 
 
 _DOCUMENT_TOOL_NAME = "generate_pdf"
 _EXCEL_TOOL_NAME = "generate_excel"
 _POWERPOINT_TOOL_NAME = "generate_pptx"
-_GENERIC_FILE_KEYWORDS = frozenset(
-    {"file", "artifact", "attachment", "downloadable file", "editable file", "template"}
-)
 _CANONICAL_REWRITTEN_QUERY_KEY = "canonical_rewritten_query"
+_SEMANTIC_ACTION_DECISION_KEY = "semantic_action_decision"
 
 
 @dataclass(frozen=True)
 class FileCreationDecision:
-    """Auditable result of the rewritten-query-only file-intent classifier."""
+    """Auditable projection of one grounded file-action contract."""
 
     selected_tool_name: str | None
-    matched_verb_keywords: tuple[str, ...]
-    matched_file_keywords: tuple[str, ...]
+    authorization_evidence: tuple[str, ...]
+    file_type_evidence: tuple[str, ...]
     matched_file_types: tuple[str, ...]
     reason_summary: str
 
@@ -52,270 +53,61 @@ class ContentCompositionScope:
     file_tool_responsibility: str | None
 
 
-@dataclass(frozen=True)
-class _KeywordMatch:
-    file_type: str
-    keyword: str
-    start: int
-    end: int
-
-
-def _normalize_for_matching(text: str) -> str:
-    return unicodedata.normalize("NFKC", text).casefold()
-
-
-@lru_cache(maxsize=1024)
-def _keyword_pattern(keyword: str) -> re.Pattern[str]:
-    normalized = " ".join(_normalize_for_matching(keyword).split())
-    if not normalized:
-        return re.compile(r"(?!x)x")
-    body = re.escape(normalized).replace(r"\ ", r"\s+")
-    prefix = r"(?<!\w)" if normalized[0].isalnum() or normalized[0] == "_" else ""
-    suffix = r"(?!\w)" if normalized[-1].isalnum() or normalized[-1] == "_" else ""
-    return re.compile(f"{prefix}{body}{suffix}")
-
-
-def _matches(text: str, keywords: tuple[str, ...]) -> tuple[tuple[str, int, int], ...]:
-    found: list[tuple[str, int, int]] = []
-    for keyword in keywords:
-        for match in _keyword_pattern(keyword).finditer(text):
-            found.append((keyword, match.start(), match.end()))
-    return tuple(found)
-
-
 def classify_file_creation_request(
     rewritten_query: str,
     config: GeneralPurposeConfig,
+    semantic_action_decision: SemanticActionDecision | None = None,
 ) -> FileCreationDecision:
-    """Select one file tool only when both required keyword classes are explicit.
+    """Project a grounded semantic contract onto the optional file-tool route.
 
-    The classifier reads only the canonical rewritten query. Independently matched
-    file types fail closed. A longer cross-type phrase suppresses a keyword contained
-    inside it so requests such as ``create an Excel file`` are not made ambiguous by
-    the generic document keyword ``file``.
+    ``config`` remains in the signature for compatibility with tool protocols. It
+    does not contribute language signals. Without a model-produced, query-grounded
+    decision, optional file creation fails closed to the mandatory answer stage.
     """
 
-    text = _normalize_for_matching(rewritten_query)
-    verb_matches = _matches(text, config.file_creation_verb_keywords)
-    matched_verbs = tuple(dict.fromkeys(match[0] for match in verb_matches))
-
-    file_groups = (
-        ("document", _DOCUMENT_TOOL_NAME, config.document_tool_signal_keywords),
-        ("excel", _EXCEL_TOOL_NAME, config.excel_tool_signal_keywords),
-        ("powerpoint", _POWERPOINT_TOOL_NAME, config.pptx_tool_signal_keywords),
-    )
-    all_file_matches = [
-        _KeywordMatch(file_type=file_type, keyword=keyword, start=start, end=end)
-        for file_type, _tool_name, keywords in file_groups
-        for keyword, start, end in _matches(text, keywords)
-    ]
-    effective_file_matches = [
-        candidate
-        for candidate in all_file_matches
-        if not any(
-            other.file_type != candidate.file_type
-            and other.start <= candidate.start
-            and other.end >= candidate.end
-            and (other.end - other.start) > (candidate.end - candidate.start)
-            for other in all_file_matches
-        )
-    ]
-    if any(match.file_type in {"excel", "powerpoint"} for match in effective_file_matches):
-        # Generic artifact nouns establish that a file is wanted but do not override
-        # an explicit Excel or PowerPoint type elsewhere in the same request.
-        effective_file_matches = [
-            match
-            for match in effective_file_matches
-            if not (match.file_type == "document" and match.keyword in _GENERIC_FILE_KEYWORDS)
-        ]
-    matched_file_types = tuple(
-        file_type
-        for file_type, _tool_name, _keywords in file_groups
-        if any(match.file_type == file_type for match in effective_file_matches)
-    )
-    matched_file_keywords = tuple(
-        dict.fromkeys(
-            match.keyword
-            for match in sorted(effective_file_matches, key=lambda item: (item.start, item.end, item.keyword))
-        )
-    )
-
-    if not matched_verbs:
+    del rewritten_query, config
+    semantic = semantic_action_decision
+    if semantic is None or not semantic.grounded:
         return FileCreationDecision(
             selected_tool_name=None,
-            matched_verb_keywords=(),
-            matched_file_keywords=matched_file_keywords,
-            matched_file_types=matched_file_types,
-            reason_summary="missing_verb_keyword",
-        )
-    if not matched_file_types:
-        return FileCreationDecision(
-            selected_tool_name=None,
-            matched_verb_keywords=matched_verbs,
-            matched_file_keywords=(),
+            authorization_evidence=(),
+            file_type_evidence=(),
             matched_file_types=(),
-            reason_summary="missing_file_keyword",
+            reason_summary="semantic_decision_unavailable",
         )
-    if len(matched_file_types) != 1:
+    file_decision = semantic.file
+    if not file_decision.authorizes_creation:
         return FileCreationDecision(
             selected_tool_name=None,
-            matched_verb_keywords=matched_verbs,
-            matched_file_keywords=matched_file_keywords,
-            matched_file_types=matched_file_types,
-            reason_summary="ambiguous_file_types",
-        )
-
-    selected_type = matched_file_types[0]
-    selected_tool_name = next(
-        tool_name for file_type, tool_name, _keywords in file_groups if file_type == selected_type
-    )
-    return FileCreationDecision(
-        selected_tool_name=selected_tool_name,
-        matched_verb_keywords=matched_verbs,
-        matched_file_keywords=matched_file_keywords,
-        matched_file_types=matched_file_types,
-        reason_summary=f"selected_{selected_type}_tool",
-    )
-
-
-_FILE_SCOPE_BOUNDARY_PATTERN = re.compile(
-    r"(?:[;.!?]\s+|\n+|,\s*(?:and|then)\s+|\b(?:and|then)\s+|"
-    r"\b(?:attach|attaching|include|including)\s+(?=(?:an?\s+)?(?:attachment|file|document|excel|spreadsheet|"
-    r"workbook|powerpoint|presentation|deck|report)\b)|"
-    r"\bwith\s+(?=(?:an?\s+)?(?:attachment|file|document|excel|spreadsheet|"
-    r"workbook|powerpoint|presentation|deck|report)\b))",
-    re.IGNORECASE,
-)
-_NON_FILE_DELIVERABLE_AFTER_BOUNDARY = re.compile(
-    r"^(?:please\s+)?(?:also\s+)?(?:"
-    r"(?:write|draft|compose|prepare)\s+(?:an?\s+)?(?:email|e-mail|message|chat message|cover note|reply)\b|"
-    r"(?:send|email)\s+(?:it|this|that|the\s+(?:file|document|workbook|presentation|attachment))\b|"
-    r"(?:an?\s+)?(?:email|e-mail|message|chat message|cover note|reply)\s+to\b"
-    r")",
-    re.IGNORECASE,
-)
-
-
-def _selected_file_keywords(
-    decision: FileCreationDecision,
-    config: GeneralPurposeConfig,
-) -> tuple[str, ...]:
-    if decision.selected_tool_name == _DOCUMENT_TOOL_NAME:
-        return config.document_tool_signal_keywords
-    if decision.selected_tool_name == _EXCEL_TOOL_NAME:
-        return config.excel_tool_signal_keywords
-    if decision.selected_tool_name == _POWERPOINT_TOOL_NAME:
-        return config.pptx_tool_signal_keywords
-    return ()
-
-
-def _derive_composition_scope(
-    rewritten_query: str,
-    decision: FileCreationDecision,
-    config: GeneralPurposeConfig,
-) -> ContentCompositionScope:
-    """Project a compound request into non-file prose and file-only scopes.
-
-    Routing uses the complete canonical rewritten query. This projection happens only after
-    authorization and limits what the optional file planner receives.  The first
-    file keyword anchors the file clause; common compound-request boundaries keep an
-    email/message clause outside the attachment's content.
-    """
-
-    if decision.selected_tool_name is None:
-        return ContentCompositionScope(
-            answer_request_scope=rewritten_query.strip(),
-            answer_generation_required=True,
-            file_request_scope=None,
-            answer_generation_responsibility=(
-                "No Microsoft file tool is assigned. Produce the complete user-facing "
-                "answer or requested prose from this scope. Do not claim that a file "
-                "or any other side effect was created."
+            authorization_evidence=file_decision.authorization_evidence,
+            file_type_evidence=file_decision.type_evidence,
+            matched_file_types=(
+                (file_decision.file_type,)
+                if file_decision.file_type != "none"
+                else ()
             ),
-            file_tool_responsibility=None,
+            reason_summary=f"semantic_file_operation_{file_decision.operation}",
         )
-
-    answer_responsibility = (
-        "Always produce the user-facing non-file deliverable. If the request asks for "
-        "an email, message, cover note, explanation, or other prose outside an "
-        "attachment, compose that prose here. Do not generate the attachment's "
-        "internal document sections, workbook rows, or presentation slides, and do "
-        "not claim that a file was created."
-    )
-
-    normalized = _normalize_for_matching(rewritten_query)
-    file_matches = _matches(normalized, _selected_file_keywords(decision, config))
-    if not file_matches:
-        # Protected by the classifier, but fail closed to an answer-only scope if the
-        # configured keyword policy changes between classification and projection.
-        return ContentCompositionScope(
-            answer_request_scope=rewritten_query.strip(),
-            answer_generation_required=True,
-            file_request_scope=None,
-            answer_generation_responsibility=answer_responsibility,
-            file_tool_responsibility=None,
+    tool_by_type = {
+        "pdf": _DOCUMENT_TOOL_NAME,
+        "xlsx": _EXCEL_TOOL_NAME,
+        "pptx": _POWERPOINT_TOOL_NAME,
+    }
+    selected_tool = tool_by_type.get(file_decision.file_type)
+    if selected_tool is None:
+        return FileCreationDecision(
+            selected_tool_name=None,
+            authorization_evidence=file_decision.authorization_evidence,
+            file_type_evidence=file_decision.type_evidence,
+            matched_file_types=(file_decision.file_type,),
+            reason_summary="semantic_file_type_unsupported",
         )
-
-    first_file_start = min(start for _keyword, start, _end in file_matches)
-    first_file_end = min(
-        end for _keyword, start, end in file_matches if start == first_file_start
-    )
-    boundaries = tuple(_FILE_SCOPE_BOUNDARY_PATTERN.finditer(rewritten_query))
-    prior_boundaries = [boundary for boundary in boundaries if boundary.end() <= first_file_start]
-    prior_boundary = prior_boundaries[-1] if prior_boundaries else None
-    if prior_boundary is not None and len(prior_boundaries) >= 2:
-        previous_boundary = prior_boundaries[-2]
-        boundary_text = prior_boundary.group().strip().casefold()
-        between_boundaries = rewritten_query[previous_boundary.end():prior_boundary.start()]
-        if (
-            boundary_text.startswith(("attach", "include"))
-            and not between_boundaries.strip()
-        ):
-            # Prefer "and/then" so the file scope retains its explicit attach/include
-            # verb while neither connector leaks into the answer projection.
-            prior_boundary = previous_boundary
-    file_start = prior_boundary.end() if prior_boundary else 0
-    answer_prefix_end = prior_boundary.start() if prior_boundary else 0
-    file_end = len(rewritten_query)
-    answer_suffix_start = len(rewritten_query)
-    for boundary in boundaries:
-        if boundary.start() < first_file_end:
-            continue
-        following_text = rewritten_query[boundary.end():].lstrip()
-        if _NON_FILE_DELIVERABLE_AFTER_BOUNDARY.match(following_text):
-            file_end = boundary.start()
-            answer_suffix_start = boundary.end()
-            break
-
-    file_scope = rewritten_query[file_start:file_end].strip(" \t\r\n,;.-")
-    answer_parts = (
-        rewritten_query[:answer_prefix_end].strip(" \t\r\n,;.-"),
-        rewritten_query[answer_suffix_start:].strip(" \t\r\n,;.-"),
-    )
-    answer_scope = " ".join(part for part in answer_parts if part).strip()
-    if not answer_scope:
-        # A file-only request still requires the general answer stage. Give it
-        # the canonical request as context while keeping file-internal content
-        # exclusively owned by the Microsoft tool that runs immediately after.
-        answer_scope = rewritten_query.strip()
-        answer_responsibility = (
-            "Produce a concise user-facing companion response for the requested "
-            "file. Do not reproduce the file's internal sections, rows, slides, or "
-            "other planned contents, and do not claim creation before the authorized "
-            "Microsoft file tool reports its result."
-        )
-
-    return ContentCompositionScope(
-        answer_request_scope=answer_scope,
-        answer_generation_required=True,
-        file_request_scope=file_scope or rewritten_query.strip(),
-        answer_generation_responsibility=answer_responsibility,
-        file_tool_responsibility=(
-            "Construct only content that belongs inside the requested file. Exclude "
-            "any surrounding email, chat message, cover note, recipient greeting or "
-            "sign-off, and delivery instructions unless the file clause explicitly "
-            "states that such content belongs inside the file."
-        ),
+    return FileCreationDecision(
+        selected_tool_name=selected_tool,
+        authorization_evidence=file_decision.authorization_evidence,
+        file_type_evidence=file_decision.type_evidence,
+        matched_file_types=(file_decision.file_type,),
+        reason_summary=f"semantic_selected_{file_decision.file_type}",
     )
 
 
@@ -357,9 +149,17 @@ def _unauthorized_file_tool_result(
     composer_input: ContentComposerInput,
     config: GeneralPurposeConfig,
 ) -> ContentToolResult | None:
+    canonical_query = _canonical_rewritten_query(composer_input)
+    semantic = semantic_action_from_internal_payload(
+        (getattr(composer_input, "metadata", {}) or {}).get(
+            _SEMANTIC_ACTION_DECISION_KEY
+        ),
+        canonical_query=canonical_query,
+    )
     decision = classify_file_creation_request(
-        _canonical_rewritten_query(composer_input),
+        canonical_query,
         config,
+        semantic,
     )
     if decision.selected_tool_name == tool_name:
         return None
@@ -400,6 +200,7 @@ def _artifact_fallback_result(
             confidence=0.0,
             fallback_used=True,
             reason_summary=str(error),
+            warnings=("artifact_plan_fallback",),
         )
     try:
         file_scope = _file_request_scope(composer_input)
@@ -421,6 +222,7 @@ def _artifact_fallback_result(
             confidence=0.0,
             fallback_used=True,
             reason_summary=str(artifact_error),
+            warnings=("artifact_generation_unavailable",),
         )
     return ContentToolResult(
         tool_name=tool_name,
@@ -448,32 +250,53 @@ class AnswerGenerationTool:
 
     def execute(self, composer_input: ContentComposerInput, config: GeneralPurposeConfig) -> ContentToolResult:
         try:
-            output = str(self.llm.chat(
-                task=LLMTask.ANSWER,
-                system_prompt=self.prompt_registry.system("answer_generation"),
-                user_prompt=self.prompt_registry.user(
-                    PromptContext(
-                        stage="answer_generation",
-                        user_id=composer_input.user_id,
-                        rewritten_query=composer_input.rewritten_query,
-                        metadata=composer_input.metadata,
-                        platform_context=composer_input.platform_context,
-                        extra={
-                            "approved_conversation_history": composer_input.approved_conversation_history,
-                            "approved_knowledge_evidence": composer_input.approved_knowledge_evidence,
-                            "approved_reminder_context": composer_input.approved_reminder_context,
-                            "merged_supporting_detail": composer_input.merged_supporting_detail,
-                            "sub_branch_supporting_prompt": composer_input.sub_branch_supporting_prompt,
-                            "human_supporting_questions": [q.text for q in composer_input.human_supporting_questions],
-                            "reminder_supporting_questions": [q.text for q in composer_input.reminder_supporting_questions],
-                            "extracted_expected_response_types": [t.value for t in composer_input.extracted_expected_response_types],
-                            "content_composition_scope": _composition_scope_payload(composer_input),
-                        },
-                    )
+            generation = generate_answer(
+                llm=self.llm,
+                prompt_registry=self.prompt_registry,
+                prompt_context=PromptContext(
+                    stage="answer_generation",
+                    user_id=composer_input.user_id,
+                    rewritten_query=composer_input.rewritten_query,
+                    metadata=composer_input.metadata,
+                    platform_context=composer_input.platform_context,
+                    extra={
+                        "approved_conversation_history": composer_input.approved_conversation_history,
+                        "approved_knowledge_evidence": composer_input.approved_knowledge_evidence,
+                        "approved_knowledge_records": composer_input.approved_knowledge_records,
+                        "approved_reminder_context": composer_input.approved_reminder_context,
+                        "merged_supporting_detail": composer_input.merged_supporting_detail,
+                        "sub_branch_supporting_prompt": composer_input.sub_branch_supporting_prompt,
+                        "human_supporting_questions": [q.text for q in composer_input.human_supporting_questions],
+                        "reminder_supporting_questions": [q.text for q in composer_input.reminder_supporting_questions],
+                        "extracted_expected_response_types": [t.value for t in composer_input.extracted_expected_response_types],
+                        "content_composition_scope": _composition_scope_payload(composer_input),
+                    },
                 ),
-            ) or "").strip()
-            if not output:
-                raise ValueError("answer_generation returned blank output")
+                approved_knowledge_records=composer_input.approved_knowledge_records,
+                approved_knowledge_evidence=composer_input.approved_knowledge_evidence,
+            )
+            output = generation.text.strip()
+            if not generation.model_succeeded:
+                has_approved_knowledge = bool(
+                    composer_input.approved_knowledge_records
+                    or composer_input.approved_knowledge_evidence
+                )
+                return ContentToolResult(
+                    tool_name=self.name,
+                    output_text=output,
+                    confidence=0.0,
+                    fallback_used=True,
+                    reason_summary=(
+                        "answer_generation_used_grounded_fallback"
+                        if has_approved_knowledge
+                        else "answer_generation_failed"
+                    ),
+                    warnings=(
+                        ("answer_grounded_evidence_fallback",)
+                        if has_approved_knowledge
+                        else ("answer_model_unavailable",)
+                    ),
+                )
             return ContentToolResult(
                 tool_name=self.name,
                 output_text=output,
@@ -539,20 +362,33 @@ class GenerateExcelTool:
                 "delivery instructions. "
                 "Do not claim any file was created. Do not reference any filename or path."
             )
-            plan_text = self.llm.chat(
-                task=LLMTask.WRITING,
-                system_prompt=self.prompt_registry.system("content_tool_answer_generation"),
-                user_prompt=self.prompt_registry.user(
-                    PromptContext(
-                        stage="content_tool_answer_generation",
-                        rewritten_query=composer_input.rewritten_query,
-                        extra={
-                            "planning_context": excel_planning_context,
-                            "content_composition_scope": _file_scope_payload(composer_input),
-                        },
-                    )
-                ),
-            )
+            plan_text = str(
+                self.llm.chat(
+                    task=LLMTask.WRITING,
+                    system_prompt=self.prompt_registry.system(
+                        "content_tool_answer_generation"
+                    ),
+                    user_prompt=self.prompt_registry.user(
+                        PromptContext(
+                            stage="content_tool_answer_generation",
+                            rewritten_query=composer_input.rewritten_query,
+                            extra={
+                                "planning_context": excel_planning_context,
+                                "content_composition_scope": _file_scope_payload(
+                                    composer_input
+                                ),
+                                "approved_conversation_history": composer_input.approved_conversation_history,
+                                "approved_knowledge_evidence": composer_input.approved_knowledge_evidence,
+                                "approved_knowledge_records": composer_input.approved_knowledge_records,
+                                "approved_reminder_context": composer_input.approved_reminder_context,
+                            },
+                        )
+                    ),
+                )
+                or ""
+            ).strip()
+            if not plan_text:
+                raise ValueError("generate_excel writer returned blank output")
             artifact = None
             output_text = plan_text
             if composer_input.repository is not None:
@@ -634,20 +470,33 @@ class GeneratePDFTool:
                 "delivery instructions. "
                 "Do not claim any file was created. Do not reference any filename or path."
             )
-            plan_text = self.llm.chat(
-                task=LLMTask.WRITING,
-                system_prompt=self.prompt_registry.system("content_tool_answer_generation"),
-                user_prompt=self.prompt_registry.user(
-                    PromptContext(
-                        stage="content_tool_answer_generation",
-                        rewritten_query=composer_input.rewritten_query,
-                        extra={
-                            "planning_context": pdf_planning_context,
-                            "content_composition_scope": _file_scope_payload(composer_input),
-                        },
-                    )
-                ),
-            )
+            plan_text = str(
+                self.llm.chat(
+                    task=LLMTask.WRITING,
+                    system_prompt=self.prompt_registry.system(
+                        "content_tool_answer_generation"
+                    ),
+                    user_prompt=self.prompt_registry.user(
+                        PromptContext(
+                            stage="content_tool_answer_generation",
+                            rewritten_query=composer_input.rewritten_query,
+                            extra={
+                                "planning_context": pdf_planning_context,
+                                "content_composition_scope": _file_scope_payload(
+                                    composer_input
+                                ),
+                                "approved_conversation_history": composer_input.approved_conversation_history,
+                                "approved_knowledge_evidence": composer_input.approved_knowledge_evidence,
+                                "approved_knowledge_records": composer_input.approved_knowledge_records,
+                                "approved_reminder_context": composer_input.approved_reminder_context,
+                            },
+                        )
+                    ),
+                )
+                or ""
+            ).strip()
+            if not plan_text:
+                raise ValueError("generate_pdf writer returned blank output")
             artifact = None
             output_text = plan_text
             if composer_input.repository is not None:
@@ -735,20 +584,33 @@ class GeneratePPTXTool:
                 "sign-off, or delivery instructions. "
                 "Do not claim any file was created. Do not reference any filename or path."
             )
-            plan_text = self.llm.chat(
-                task=LLMTask.WRITING,
-                system_prompt=self.prompt_registry.system("content_tool_answer_generation"),
-                user_prompt=self.prompt_registry.user(
-                    PromptContext(
-                        stage="content_tool_answer_generation",
-                        rewritten_query=composer_input.rewritten_query,
-                        extra={
-                            "planning_context": pptx_planning_context,
-                            "content_composition_scope": _file_scope_payload(composer_input),
-                        },
-                    )
-                ),
-            )
+            plan_text = str(
+                self.llm.chat(
+                    task=LLMTask.WRITING,
+                    system_prompt=self.prompt_registry.system(
+                        "content_tool_answer_generation"
+                    ),
+                    user_prompt=self.prompt_registry.user(
+                        PromptContext(
+                            stage="content_tool_answer_generation",
+                            rewritten_query=composer_input.rewritten_query,
+                            extra={
+                                "planning_context": pptx_planning_context,
+                                "content_composition_scope": _file_scope_payload(
+                                    composer_input
+                                ),
+                                "approved_conversation_history": composer_input.approved_conversation_history,
+                                "approved_knowledge_evidence": composer_input.approved_knowledge_evidence,
+                                "approved_knowledge_records": composer_input.approved_knowledge_records,
+                                "approved_reminder_context": composer_input.approved_reminder_context,
+                            },
+                        )
+                    ),
+                )
+                or ""
+            ).strip()
+            if not plan_text:
+                raise ValueError("generate_pptx writer returned blank output")
             artifact = None
             output_text = plan_text
             if composer_input.repository is not None:
@@ -809,9 +671,10 @@ class ContentToolRegistry:
 
 @dataclass
 class DeterministicContentComposer:
-    """Execute answer generation, then any deterministically authorized file tool."""
+    """Execute the mandatory answer and any semantically authorized file tool."""
 
     registry: ContentToolRegistry
+    semantic_analyzer: SemanticActionAnalyzer | None = None
     _answer_tool: ContentTool = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -840,10 +703,25 @@ class DeterministicContentComposer:
             rewritten_query=canonical_query,
             metadata=canonical_metadata,
         )
+        semantic_decision = semantic_action_from_internal_payload(
+            canonical_metadata.get(_SEMANTIC_ACTION_DECISION_KEY),
+            canonical_query=canonical_query,
+        )
+        if self.semantic_analyzer is not None:
+            semantic_decision = self.semantic_analyzer.analyze(
+                canonical_query,
+                approved_conversation_history=(
+                    composer_input.approved_conversation_history
+                ),
+            )
+        canonical_metadata[_SEMANTIC_ACTION_DECISION_KEY] = (
+            semantic_decision.to_payload()
+        )
+        composer_input = replace(composer_input, metadata=canonical_metadata)
         decision = FileCreationDecision(
             selected_tool_name=None,
-            matched_verb_keywords=(),
-            matched_file_keywords=(),
+            authorization_evidence=(),
+            file_type_evidence=(),
             matched_file_types=(),
             reason_summary="routing_failed_answer_only",
         )
@@ -863,7 +741,11 @@ class DeterministicContentComposer:
         file_route_status = "not_requested"
         routing_warning: str | None = None
         try:
-            decision = classify_file_creation_request(canonical_query, config)
+            decision = classify_file_creation_request(
+                canonical_query,
+                config,
+                semantic_decision,
+            )
             desired_file_tool_name = decision.selected_tool_name
             if desired_file_tool_name is not None:
                 if not config.content_composer_enabled:
@@ -881,18 +763,32 @@ class DeterministicContentComposer:
                 if file_tool is not None
                 else replace(decision, selected_tool_name=None)
             )
-            composition_scope = _derive_composition_scope(
-                canonical_query,
-                scope_decision,
-                config,
-            )
-            if file_tool is not None and composition_scope.file_request_scope is None:
-                file_tool = None
-                file_route_status = "scope_projection_failed"
-                composition_scope = _derive_composition_scope(
-                    canonical_query,
-                    replace(decision, selected_tool_name=None),
-                    config,
+            if scope_decision.selected_tool_name is None:
+                composition_scope = ContentCompositionScope(
+                    answer_request_scope=canonical_query,
+                    answer_generation_required=True,
+                    file_request_scope=None,
+                    answer_generation_responsibility=(
+                        "Produce the complete user-facing answer. Do not claim a "
+                        "file or external side effect was completed unless its "
+                        "validated tool result is present."
+                    ),
+                    file_tool_responsibility=None,
+                )
+            else:
+                composition_scope = ContentCompositionScope(
+                    answer_request_scope=canonical_query,
+                    answer_generation_required=True,
+                    file_request_scope=canonical_query,
+                    answer_generation_responsibility=(
+                        "Produce all requested prose and message copy from the "
+                        "complete request. The file tool separately owns file "
+                        "creation; do not fabricate its completion result."
+                    ),
+                    file_tool_responsibility=(
+                        "Create exactly the semantically authorized file from the "
+                        "complete request. Do not compose or send an external message."
+                    ),
                 )
         except Exception as exc:
             # Deterministic file routing is optional. A malformed runtime policy
@@ -903,9 +799,8 @@ class DeterministicContentComposer:
             file_route_status = "routing_failed"
             routing_warning = f"content_routing_failed:{type(exc).__name__}"
         answer_metadata = dict(composer_input.metadata)
-        # The canonical full query is private authorization state for routing
-        # and file tools. The prose stage receives only its projected rewritten
-        # scope, so file-only instructions cannot bleed into the answer prompt.
+        # The answer and file planners receive the same canonical request. Their
+        # typed responsibilities prevent content loss in compound, unseen turns.
         answer_metadata.pop(_CANONICAL_REWRITTEN_QUERY_KEY, None)
         answer_metadata["content_composition_scope"] = {
             "answer_request_scope": composition_scope.answer_request_scope,
@@ -937,9 +832,8 @@ class DeterministicContentComposer:
         results.append(answer_result)
         selected_file_tool_name: str | None = None
         if file_tool is not None and desired_file_tool_name is not None:
-            # The complete rewritten query is retained so each Microsoft tool can
-            # independently re-check deterministic authorization. Only the
-            # file clause reaches its content-planning prompt and fallback.
+            # Each Microsoft tool independently revalidates the serialized,
+            # grounded semantic authorization before producing an artifact.
             file_metadata = dict(composer_input.metadata)
             file_metadata["content_composition_scope"] = {
                 "file_request_scope": composition_scope.file_request_scope,
@@ -969,7 +863,11 @@ class DeterministicContentComposer:
             selected_file_tool_name = desired_file_tool_name
             file_route_status = "executed"
 
-        output_parts = [result.output_text.strip() for result in results if result.output_text.strip()]
+        normalized_outputs = [
+            str(result.output_text or "").strip()
+            for result in results
+        ]
+        output_parts = [output for output in normalized_outputs if output]
         artifacts = tuple(
             result.artifact
             for result in results
@@ -989,15 +887,43 @@ class DeterministicContentComposer:
             "scope_projection_failed",
             "routing_failed",
         }
+        stage_outcomes = {
+            result.tool_name: {
+                "attempted": True,
+                # A fallback may still contribute safe text or a basic artifact,
+                # but it is not proof that the requested model stage succeeded.
+                "succeeded": bool(
+                    not result.fallback_used
+                    and (normalized_output or result.artifact is not None)
+                ),
+                "fallback_used": result.fallback_used,
+                "output_contributed": bool(normalized_output),
+                "artifact_contributed": result.artifact is not None,
+                "warnings": list(result.warnings),
+            }
+            for result, normalized_output in zip(results, normalized_outputs)
+        }
         trace = {
-            "classifier": "deterministic_keyword_pipeline",
+            "classifier": "grounded_semantic_contract",
             "decision": decision.reason_summary,
-            "matched_verbs": decision.matched_verb_keywords,
-            "matched_file_keywords": decision.matched_file_keywords,
+            "authorization_evidence": decision.authorization_evidence,
+            "file_type_evidence": decision.file_type_evidence,
             "matched_file_types": decision.matched_file_types,
             "selected_file_tool": selected_file_tool_name,
             "file_route_status": file_route_status,
             "executed_tools": used_tool_names,
+            "attempted_tools": used_tool_names,
+            "successful_tools": [
+                name
+                for name, outcome in stage_outcomes.items()
+                if outcome["succeeded"]
+            ],
+            "output_contributing_tools": [
+                name
+                for name, outcome in stage_outcomes.items()
+                if outcome["output_contributed"] or outcome["artifact_contributed"]
+            ],
+            "stage_outcomes": stage_outcomes,
             "answer_request_scope": composition_scope.answer_request_scope,
             "answer_generation_required": composition_scope.answer_generation_required,
             "file_request_scope": composition_scope.file_request_scope,
@@ -1011,4 +937,6 @@ class DeterministicContentComposer:
             reason_summary="; ".join(result.reason_summary for result in results),
             content_warnings=warnings,
             artifacts=artifacts,
+            answer_response_text=normalized_outputs[0],
+            semantic_action_decision=semantic_decision.to_payload(),
         )

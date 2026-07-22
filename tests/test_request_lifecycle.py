@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -282,6 +284,144 @@ def test_keyed_general_delivery_artifact_and_conversation_side_effects_replay_on
     assert rate_limit_signals == [(False, False), (False, False)]
 
 
+def test_two_sqlite_connections_cannot_both_claim_the_same_new_key(
+    tmp_path: Path,
+) -> None:
+    database_path = str(tmp_path / "idempotency-race.sqlite3")
+    first_repository = SQLiteRepository.persistent(
+        database_path,
+        enable_wal=True,
+        busy_timeout_ms=5_000,
+    )
+    first_repository.initialize_schema()
+    second_repository = SQLiteRepository.persistent(
+        database_path,
+        enable_wal=True,
+        busy_timeout_ms=5_000,
+    )
+    barrier = Barrier(2)
+
+    def claim(repository: SQLiteRepository) -> object:
+        barrier.wait()
+        return repository.claim_idempotency_key(
+            user_id="race-user",
+            idempotency_key="same-new-key",
+            payload_hash="same-payload",
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            claims = list(
+                executor.map(claim, (first_repository, second_repository))
+            )
+    finally:
+        first_repository.connection.close()
+        second_repository.connection.close()
+
+    assert sorted(claim.status for claim in claims) == [
+        "in_progress",
+        "started",
+    ]
+    assert len({claim.request_id for claim in claims}) == 1
+
+
+def test_chat_request_canonicalizes_conversation_and_operation_ids() -> None:
+    request = ChatRequest(
+        user_id="  user-1  ",
+        raw_query="hello",
+        conversation_id="  conversation-a  ",
+        parent_hop_id="  hop-a  ",
+        idempotency_key="  key-a  ",
+        reminder_id="   ",
+    )
+
+    assert request.user_id == "user-1"
+    assert request.conversation_id == "conversation-a"
+    assert request.parent_hop_id == "hop-a"
+    assert request.idempotency_key == "key-a"
+    assert request.reminder_id is None
+
+
+def test_post_send_serialization_failure_completes_with_safe_replay_payload(
+    repository: SQLiteRepository,
+) -> None:
+    sent_response = _response(
+        "Sent exactly once.",
+        ResponseType.NORMAL,
+        committed_action=None,
+    )
+    sent_response.platform_payload["delivery"] = {
+        "channel": "gmail",
+        "status": "sent",
+        "recipient": "alice@example.com",
+    }
+    pipeline = RecordingPipeline([sent_response])
+    executor = ChatRequestLifecycleExecutor(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        repository=repository,
+    )
+    request = ChatRequest(
+        user_id="user-1",
+        raw_query="Send it.",
+        idempotency_key="post-send-serialization",
+    )
+
+    first = executor.execute(
+        request,
+        fallback_request_id="first",
+        serialize_response=lambda _response, _request_id: (_ for _ in ()).throw(
+            RuntimeError("presentation failed after SMTP")
+        ),
+    )
+    replay = executor.execute(request, fallback_request_id="replay")
+
+    assert first.response is not None
+    assert "post_effect_response_serialization_failed" in first.response.warnings
+    assert first.payload["request_id"] == first.request_id
+    assert replay.replayed is True
+    assert replay.payload == first.payload
+    assert len(pipeline.requests) == 1
+    assert _mutation_status(repository, "post-send-serialization") == "completed"
+
+
+def test_post_send_completion_failure_stays_non_retryable(
+    repository: SQLiteRepository,
+) -> None:
+    sent_response = _response(
+        "Sent exactly once.",
+        ResponseType.NORMAL,
+        committed_action=None,
+    )
+    sent_response.platform_payload["delivery"] = {
+        "channel": "gmail",
+        "status": "sent",
+        "recipient": "alice@example.com",
+    }
+    pipeline = RecordingPipeline([sent_response])
+    executor = ChatRequestLifecycleExecutor(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        repository=repository,
+    )
+    request = ChatRequest(
+        user_id="user-1",
+        raw_query="Send it.",
+        idempotency_key="post-send-completion",
+    )
+
+    def fail_completion(**_kwargs: object) -> None:
+        raise RuntimeError("idempotency store unavailable after SMTP")
+
+    repository.complete_idempotency_request = fail_completion  # type: ignore[method-assign]
+    first = executor.execute(request, fallback_request_id="first")
+
+    assert first.response is not None
+    assert "post_effect_idempotency_completion_failed" in first.response.warnings
+    assert _mutation_status(repository, "post-send-completion") == "in_progress"
+    with pytest.raises(RequestLifecycleConflict, match="request_in_progress"):
+        executor.execute(request, fallback_request_id="retry")
+    assert len(pipeline.requests) == 1
+
+
 def test_legacy_reminder_confirmation_domain_is_rejected_without_replay(
     repository: SQLiteRepository,
 ) -> None:
@@ -402,7 +542,11 @@ def test_error_response_does_not_consume_pending_confirmation(
     token = _pending_confirmation(repository)
     pipeline = RecordingPipeline(
         [
-            _response("The transaction failed.", ResponseType.ERROR),
+            _response(
+                "The transaction failed.",
+                ResponseType.ERROR,
+                committed_action=None,
+            ),
             _response("Deleted after retry."),
         ]
     )
@@ -439,6 +583,59 @@ def test_error_response_does_not_consume_pending_confirmation(
     assert retried.response is not None
     assert _confirmation_status(repository, token) == "confirmed"
     assert _mutation_status(repository, f"error:{token}") == "completed"
+
+
+@pytest.mark.parametrize(
+    "effect",
+    ("artifact", "partial_failure", "draft_saved"),
+)
+def test_error_after_irreversible_effect_is_completed_and_replayed_once(
+    repository: SQLiteRepository,
+    effect: str,
+) -> None:
+    platform_payload: dict[str, object] = {}
+    conversation_hop_id = None
+    if effect == "artifact":
+        platform_payload["artifacts"] = [
+            {"artifact_id": "artifact-1", "filename": "trip.pptx"}
+        ]
+    else:
+        platform_payload["delivery"] = {
+            "channel": "gmail",
+            "status": effect,
+            "recipient": "alice@example.com",
+        }
+    response = BundledResponse(
+        final_chat_text="A later stage failed after an irreversible effect.",
+        response_type=ResponseType.ERROR,
+        last_qa_state=LastQAState(
+            last_user_query="Create or deliver it.",
+            last_response="A later stage failed after an irreversible effect.",
+            response_type=ResponseType.ERROR,
+        ),
+        platform_payload=platform_payload,
+        conversation_hop_id=conversation_hop_id,
+    )
+    pipeline = RecordingPipeline([response])
+    executor = ChatRequestLifecycleExecutor(
+        pipeline=pipeline,  # type: ignore[arg-type]
+        repository=repository,
+    )
+    request = ChatRequest(
+        user_id="user-1",
+        raw_query="Create or deliver it.",
+        idempotency_key=f"terminal-error-{effect}",
+    )
+
+    first = executor.execute(request, fallback_request_id="first")
+    replay = executor.execute(request, fallback_request_id="retry")
+
+    assert first.response is response
+    assert replay.replayed is True
+    assert replay.response is None
+    assert replay.payload == first.payload
+    assert len(pipeline.requests) == 1
+    assert _mutation_status(repository, request.idempotency_key or "") == "completed"
 
 
 @pytest.mark.parametrize(
@@ -543,7 +740,7 @@ def test_expired_confirmation_fails_closed_and_marks_request_failed(
     assert not pipeline.requests
 
 
-def test_mutation_without_idempotency_key_preserves_compatibility_warning(
+def test_free_form_text_is_not_preclassified_as_mutation_by_lifecycle(
     repository: SQLiteRepository,
 ) -> None:
     pipeline = RecordingPipeline([_response()])
@@ -561,9 +758,8 @@ def test_mutation_without_idempotency_key_preserves_compatibility_warning(
     )
 
     assert result.response is not None
-    assert result.request.metadata["warnings"] == [
-        "Mutation request had no idempotency_key; processed in compatibility mode."
-    ]
+    assert result.is_mutation is False
+    assert "warnings" not in result.request.metadata
 
 
 def test_every_user_entrypoint_uses_the_shared_lifecycle_executor() -> None:

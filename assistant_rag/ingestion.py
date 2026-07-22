@@ -18,7 +18,7 @@ from typing import Any
 from xml.etree import ElementTree
 
 from .contracts import IngestionResult, KnowledgeSourceStatus
-from .database import now_iso
+from .database import now_iso, require_stable_user_id
 from .metrics import GLOBAL_METRICS
 from .repository import AssistantRepository
 from .settings import KnowledgeChunkSettings
@@ -124,6 +124,7 @@ class KnowledgeIngestionService:
         metadata: dict[str, Any] | None = None,
         file_type: str | None = None,
     ) -> IngestionResult:
+        user_id = require_stable_user_id(user_id)
         resolved_type = (file_type or Path(filename).suffix.lstrip(".") or "txt").casefold()
         source_hash = _content_sha256(data)
         source_id: str | None = None
@@ -139,10 +140,17 @@ class KnowledgeIngestionService:
                         )
                     )
                     GLOBAL_METRICS.increment("ingestion_success_total", file_type=resolved_type, deduped="true")
+                    outbox_job_ids = tuple(
+                        self.repository.reindex_knowledge_source(
+                            user_id=user_id,
+                            source_id=existing["source_id"],
+                        )
+                    )
                     return IngestionResult(
                         source_id=existing["source_id"],
                         status=KnowledgeSourceStatus.INDEXED,
                         chunk_ids=chunk_ids,
+                        outbox_job_ids=outbox_job_ids,
                     )
             with self.repository.transaction() as cursor:
                 source_id = self.repository.create_knowledge_source(

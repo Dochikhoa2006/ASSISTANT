@@ -183,6 +183,7 @@ class ResponseBundler:
             response_type=branch_result.response_type,
             last_qa_state=last_qa_state,
             platform_payload=dict(branch_result.platform_payload),
+            conversation_id=request.conversation_id,
             conversation_topic_id=branch_result.linked_topic_id,
             conversation_hop_id=branch_result.linked_hop_id,
             actions_committed=committed_actions,

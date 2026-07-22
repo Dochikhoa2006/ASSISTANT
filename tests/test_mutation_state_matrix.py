@@ -538,6 +538,11 @@ def test_knowledge_add_and_exact_duplicate_are_idempotent(
     )
 
     first = _knowledge_transaction(repository, [action])
+    failed_job_id = first.results[0].indexing_outbox_ids[0]
+    repository.mark_outbox_job_failed(
+        job_id=failed_job_id,
+        error_message="derived index unavailable",
+    )
     second = _knowledge_transaction(repository, [action])
 
     assert first.committed and second.committed
@@ -545,6 +550,14 @@ def test_knowledge_add_and_exact_duplicate_are_idempotent(
     assert second.results[0].status == "committed"
     assert second.results[0].user_safe_summary == "Knowledge was already known."
     assert first.results[0].domain_entity_id == second.results[0].domain_entity_id
+    assert second.results[0].indexing_outbox_ids
+    assert second.results[0].indexing_outbox_ids[0] != failed_job_id
+    repair_status = repository.connection.execute(
+        "SELECT status FROM indexing_outbox WHERE job_id = ?",
+        (second.results[0].indexing_outbox_ids[0],),
+    ).fetchone()
+    assert repair_status is not None
+    assert repair_status["status"] == "pending"
     assert repository.table_count("knowledge_chunks") == 1
 
 
