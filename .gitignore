@@ -1,1 +1,10 @@
+
+__pycache__/
 .onnx_models/
+.DS_Store
+.venv/
+venv/
+env/
+*.env
+.pytest_cache
+.qodo/
