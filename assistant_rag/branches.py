@@ -952,7 +952,7 @@ class GeneralResponseBranch:
         context: PipelineContext,
         unavailable_domains: set[str],
     ) -> _DegradedContextAuthorization:
-        """Require a fast denial plus a capable-model answer certificate.
+        """Require a dependency denial plus an independent answer certificate.
 
         RETRIEVAL_VALIDATION can only provisionally deny dependency.  The
         independently routed ANSWER task must then certify and supply the exact

@@ -102,8 +102,7 @@ from assistant_rag.request_lifecycle import (
 )
 from assistant_rag.retrieval_validation import KnowledgeRetrievalValidationStrategy
 from assistant_rag.settings import (
-    CAPABLE_LLM_MODEL,
-    FAST_LLM_MODEL,
+    PRODUCTION_LLM_MODEL,
     ProductionSettings,
 )
 from assistant_rag.semantic_actions import grounded_semantic_action_from_payload
@@ -2846,8 +2845,8 @@ def scenario_structured_clarification_fallback_policy(settings: ProductionSettin
         raise AssertionError("human supporting-question JSON generation needs enough token budget")
     if default_settings.ollama.temperature_generate_clarification != 0.0:
         raise AssertionError("clarification JSON generation must use deterministic sampling")
-    if default_settings.ollama.model_generate_clarification_fallback != "qwen3.5:4b":
-        raise AssertionError("clarification generation needs an Ollama recovery model")
+    if default_settings.ollama.model_generate_clarification_fallback is not None:
+        raise AssertionError("single-model clarification must not configure a fake fallback")
     answer_prompt = DEFAULT_PROMPT_REGISTRY.system("answer_generation")
     if "dedicated HITL stage owns every conversational question" not in answer_prompt:
         raise AssertionError("answer generation can still compete with HITL question ownership")
@@ -2900,19 +2899,19 @@ def scenario_structured_clarification_fallback_policy(settings: ProductionSettin
         LLMTask.REMINDER_CONTENT_FINALIZATION,
         LLMTask.RETRIEVAL_VALIDATION,
     ):
-        fallback_model = getattr(
+        retry_count = getattr(
             default_settings.ollama,
-            f"model_{task.value}_fallback",
-            None,
+            f"json_retry_count_{task.value}",
+            default_settings.ollama.structured_retry_count,
         )
-        if not fallback_model or uses_onnx_runtime(fallback_model):
+        if retry_count < 1:
             raise AssertionError(
-                f"{task.value} needs a non-ONNX structured recovery model"
+                f"{task.value} needs one bounded same-model correction attempt"
             )
     return ScenarioResult(
         "structured_clarification_fallback_policy",
         True,
-        "terminal structured fallback is marked, non-questioning, and cross-engine recoverable",
+        "terminal structured fallback is marked, non-questioning, and has bounded same-model repair",
     )
 
 
@@ -3313,6 +3312,7 @@ def scenario_clarification_schema_echo_recovery(settings: ProductionSettings) ->
     onnx_settings = replace(
         default_settings.ollama,
         model_generate_clarification="microsoft/Phi-4-mini-instruct-onnx",
+        model_generate_clarification_fallback=PRODUCTION_LLM_MODEL,
     )
     router = OllamaModelRouter(onnx_settings)
     onnx_client = ONNXLLMClient(router)
@@ -3449,28 +3449,7 @@ def scenario_structured_fallback_terminal_quiet(settings: ProductionSettings) ->
 def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResult:
     default_settings = ProductionSettings()
     router = OllamaModelRouter(default_settings.ollama)
-    expected_models = {
-        LLMTask.QUERY_REWRITE: FAST_LLM_MODEL,
-        LLMTask.LAST_QA: CAPABLE_LLM_MODEL,
-        LLMTask.INTENT: FAST_LLM_MODEL,
-        LLMTask.ACTION_EXTRACTION: FAST_LLM_MODEL,
-        LLMTask.KNOWLEDGE_ACTION_EXTRACTION: FAST_LLM_MODEL,
-        LLMTask.KNOWLEDGE_ACTION_VALIDATION: CAPABLE_LLM_MODEL,
-        LLMTask.KNOWLEDGE_CONTENT_FINALIZATION: CAPABLE_LLM_MODEL,
-        LLMTask.REMINDER_ACTION_EXTRACTION: FAST_LLM_MODEL,
-        LLMTask.REMINDER_ACTION_VALIDATION: CAPABLE_LLM_MODEL,
-        LLMTask.REMINDER_CONTENT_FINALIZATION: CAPABLE_LLM_MODEL,
-        LLMTask.GENERATE_CLARIFICATION: FAST_LLM_MODEL,
-        LLMTask.GENERATE_HUMAN_SUPPORTING: FAST_LLM_MODEL,
-        LLMTask.CLARIFICATION_MERGE: FAST_LLM_MODEL,
-        LLMTask.ANSWER: CAPABLE_LLM_MODEL,
-        LLMTask.WRITING: CAPABLE_LLM_MODEL,
-        LLMTask.RISKY_ACTION: FAST_LLM_MODEL,
-        LLMTask.RETRIEVAL_VALIDATION: CAPABLE_LLM_MODEL,
-        LLMTask.GENERAL_SUB_BRANCH_DETECTION: FAST_LLM_MODEL,
-        LLMTask.CONTENT_COMPOSER_REACT: FAST_LLM_MODEL,
-        LLMTask.ACTION_PLANNING: CAPABLE_LLM_MODEL,
-    }
+    expected_models = {task: PRODUCTION_LLM_MODEL for task in LLMTask}
     actual_models = {task: router.model_for_task(task) for task in expected_models}
     mismatches = {
         task.value: {"expected": expected_model, "actual": actual_models[task]}
@@ -3485,19 +3464,19 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         if field_info.name.startswith("model_")
         and getattr(default_settings.ollama, field_info.name)
     }
-    if configured_models != {FAST_LLM_MODEL, CAPABLE_LLM_MODEL}:
+    if configured_models != {PRODUCTION_LLM_MODEL}:
         raise AssertionError(
-            f"production must resolve exactly the two-model pool: {configured_models}"
+            f"production must resolve exactly one model: {configured_models}"
         )
     if any(uses_onnx_runtime(model) for model in actual_models.values()):
         raise AssertionError("default production routes must not retain ONNX LLM weights")
     if default_settings.ollama.keep_alive != "5m":
         raise AssertionError("idle Ollama weights should expire after five minutes")
-    if default_settings.ollama.model_last_qa_fallback != FAST_LLM_MODEL:
-        raise AssertionError("Last-QA needs a local cross-model recovery route")
-    if default_settings.ollama.json_retry_count_last_qa != 0:
+    if default_settings.ollama.model_last_qa_fallback is not None:
+        raise AssertionError("Last-QA must not configure a duplicate-model fallback")
+    if default_settings.ollama.json_retry_count_last_qa != 1:
         raise AssertionError(
-            "Last-QA should fail over models instead of repeating the same malformed output"
+            "Last-QA needs one format-diversified same-model correction"
         )
 
     # Check some basic policy settings
@@ -3593,26 +3572,26 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
     if router.decision_for_task(LLMTask.ANSWER).num_ctx != default_settings.ollama.num_ctx_answer:
         raise AssertionError("answer task should use writing context window")
     task_capacity = {
-        LLMTask.QUERY_REWRITE: (1024, 128),
-        LLMTask.LAST_QA: (2048, 128),
-        LLMTask.INTENT: (1536, 64),
-        LLMTask.ACTION_EXTRACTION: (1536, 160),
+        LLMTask.QUERY_REWRITE: (2048, 128),
+        LLMTask.LAST_QA: (4096, 128),
+        LLMTask.INTENT: (4096, 64),
+        LLMTask.ACTION_EXTRACTION: (4096, 160),
         LLMTask.KNOWLEDGE_ACTION_EXTRACTION: (8192, 2048),
-        LLMTask.KNOWLEDGE_ACTION_VALIDATION: (8192, 1024),
-        LLMTask.KNOWLEDGE_CONTENT_FINALIZATION: (12288, 2048),
+        LLMTask.KNOWLEDGE_ACTION_VALIDATION: (16384, 1024),
+        LLMTask.KNOWLEDGE_CONTENT_FINALIZATION: (16384, 2048),
         LLMTask.REMINDER_ACTION_EXTRACTION: (8192, 2048),
-        LLMTask.REMINDER_ACTION_VALIDATION: (12288, 1024),
-        LLMTask.REMINDER_CONTENT_FINALIZATION: (4096, 128),
-        LLMTask.GENERATE_CLARIFICATION: (1536, 160),
-        LLMTask.GENERATE_HUMAN_SUPPORTING: (2048, 160),
-        LLMTask.CLARIFICATION_MERGE: (1536, 256),
-        LLMTask.ANSWER: (4096, 1024),
-        LLMTask.WRITING: (4096, 1024),
-        LLMTask.RISKY_ACTION: (1024, 192),
-        LLMTask.RETRIEVAL_VALIDATION: (4096, 512),
-        LLMTask.GENERAL_SUB_BRANCH_DETECTION: (1024, 96),
-        LLMTask.CONTENT_COMPOSER_REACT: (768, 160),
-        LLMTask.ACTION_PLANNING: (2048, 256),
+        LLMTask.REMINDER_ACTION_VALIDATION: (16384, 1024),
+        LLMTask.REMINDER_CONTENT_FINALIZATION: (8192, 128),
+        LLMTask.GENERATE_CLARIFICATION: (4096, 160),
+        LLMTask.GENERATE_HUMAN_SUPPORTING: (4096, 160),
+        LLMTask.CLARIFICATION_MERGE: (4096, 256),
+        LLMTask.ANSWER: (8192, 1536),
+        LLMTask.WRITING: (8192, 2048),
+        LLMTask.RISKY_ACTION: (4096, 192),
+        LLMTask.RETRIEVAL_VALIDATION: (8192, 512),
+        LLMTask.GENERAL_SUB_BRANCH_DETECTION: (2048, 96),
+        LLMTask.CONTENT_COMPOSER_REACT: (2048, 160),
+        LLMTask.ACTION_PLANNING: (4096, 256),
     }
     for task, expected in task_capacity.items():
         decision = router.decision_for_task(task)
@@ -3621,10 +3600,10 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
                 f"{task.value} capacity mismatch: "
                 f"{(decision.num_ctx, decision.num_predict)}"
             )
-    if default_settings.ollama.model_intent != FAST_LLM_MODEL:
+    if default_settings.ollama.model_intent != PRODUCTION_LLM_MODEL:
         raise AssertionError("intent must use the validated semantic routing model")
-    if default_settings.ollama.model_intent_fallback != FAST_LLM_MODEL:
-        raise AssertionError("intent must have a non-ONNX recovery model")
+    if default_settings.ollama.model_intent_fallback is not None:
+        raise AssertionError("intent must use structured retries, not a duplicate fallback")
     if default_settings.ollama.preload_onnx_models:
         raise AssertionError("ONNX model preloading must remain opt-in")
 
@@ -3642,7 +3621,7 @@ def scenario_model_routing_policy(settings: ProductionSettings) -> ScenarioResul
         LLMTask.RISKY_ACTION: 35.0,
         LLMTask.RETRIEVAL_VALIDATION: 35.0,
         LLMTask.ANSWER: 75.0,
-        LLMTask.WRITING: 90.0,
+        LLMTask.WRITING: 120.0,
     }
     timeout_mismatches = {
         task.value: {"expected": expected_timeout, "actual": router.decision_for_task(task).timeout_seconds}
@@ -3964,11 +3943,11 @@ def scenario_debug_hybrid_llm_compatibility(settings: ProductionSettings) -> Sce
         "onnx_cache_dir: .onnx_models",
         "onnx_loaded_models: []",
         "onnx_routes: []",
-        "answer=qwen3.5:9b",
-        "last_qa=qwen3.5:9b",
-        "query_rewrite=qwen3.5:4b",
+        "answer=qwen3.5:2b",
+        "last_qa=qwen3.5:2b",
+        "query_rewrite=qwen3.5:2b",
         "synthetic ONNX compatibility error",
-        '"model": "qwen3.5:9b"',
+        '"model": "qwen3.5:2b"',
     )
     missing = [fragment for fragment in required_fragments if fragment not in text]
     if missing:
@@ -3984,6 +3963,7 @@ def scenario_hybrid_structured_onnx_failover(settings: ProductionSettings) -> Sc
     onnx_route_settings = replace(
         default_settings.ollama,
         model_intent="microsoft/Phi-4-mini-instruct-onnx",
+        model_intent_fallback=PRODUCTION_LLM_MODEL,
     )
     router = OllamaModelRouter(onnx_route_settings)
     ollama_client = OllamaLLMClient(onnx_route_settings, router)
@@ -5054,7 +5034,7 @@ def run_llm_smoke_test(settings: ProductionSettings) -> int:
         response = llm.chat(
             task=LLMTask.ANSWER,
             system_prompt="You are a concise compatibility smoke test.",
-            user_prompt="Reply with the exact words: Qwen two-model smoke test passed.",
+            user_prompt="Reply with the exact words: Qwen single-model smoke test passed.",
         )
     except Exception as exc:
         print_current_debug_trace()

@@ -16,12 +16,10 @@ from .retrieval_policy import (
 )
 
 
-# Production intentionally uses one fast structured model and one stronger
-# reasoning/generation model.  Keeping these identifiers centralized prevents
-# task defaults from silently growing the resident generative-model set.
-FAST_LLM_MODEL = "qwen3.5:4b"
-CAPABLE_LLM_MODEL = "qwen3.5:9b"
-MAX_CONFIGURED_LLM_MODELS = 2
+# Every production generative route is intentionally pinned to one installed
+# Ollama tag.  This is stricter than a one-item warm-up pool: environment and
+# call-time overrides may not silently replace the model with another tag.
+PRODUCTION_LLM_MODEL = "qwen3.5:2b"
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -62,8 +60,11 @@ class DatabaseSettings:
 class OllamaSettings:
     base_url: str = "http://localhost:11434"
     structured_retry_count: int = 1
-    # Five minutes keeps both models hot during an active conversation without
-    # retaining their weights for half an hour after the assistant becomes idle.
+    # Retry a transient unstructured generation failure once on the same model.
+    # Structured calls have their own bounded, format-diversified retry policy.
+    chat_retry_count: int = 1
+    # Five minutes keeps the single model hot during an active conversation
+    # without retaining its weights long after the assistant becomes idle.
     keep_alive: int | str = "5m"
     disable_thinking: bool = True
     # Standalone ONNX clients remain lazy. The production pipeline performs its
@@ -71,167 +72,164 @@ class OllamaSettings:
     preload_onnx_models: bool = False
 
     # Task: QUERY_REWRITE
-    model_query_rewrite: str = FAST_LLM_MODEL
+    model_query_rewrite: str = PRODUCTION_LLM_MODEL
     timeout_query_rewrite: float = 12.0
-    num_ctx_query_rewrite: int = 1024
+    num_ctx_query_rewrite: int = 2048
     num_predict_query_rewrite: int | None = 128
     temperature_query_rewrite: float = 0.0
 
     # Task: LAST_QA
-    model_last_qa: str = CAPABLE_LLM_MODEL
-    model_last_qa_fallback: str | None = FAST_LLM_MODEL
+    model_last_qa: str = PRODUCTION_LLM_MODEL
+    model_last_qa_fallback: str | None = None
     timeout_last_qa: float = 30.0
-    num_ctx_last_qa: int = 2048
+    num_ctx_last_qa: int = 4096
     num_predict_last_qa: int | None = 128
     temperature_last_qa: float = 0.0
-    json_retry_count_last_qa: int = 0
+    json_retry_count_last_qa: int = 1
 
     # Task: INTENT
-    model_intent: str = FAST_LLM_MODEL
-    model_intent_fallback: str | None = FAST_LLM_MODEL
+    model_intent: str = PRODUCTION_LLM_MODEL
+    model_intent_fallback: str | None = None
     timeout_intent: float = 20.0
-    num_ctx_intent: int = 1536
+    num_ctx_intent: int = 4096
     num_predict_intent: int | None = 64
     temperature_intent: float = 0.0
 
     # Task: ACTION_EXTRACTION
-    model_action_extraction: str = FAST_LLM_MODEL
+    model_action_extraction: str = PRODUCTION_LLM_MODEL
     timeout_action_extraction: float = 24.0
-    num_ctx_action_extraction: int = 1536
+    num_ctx_action_extraction: int = 4096
     num_predict_action_extraction: int | None = 160
     temperature_action_extraction: float = 0.0
 
     # Knowledge-only three-stage mutation pipeline. These dedicated tasks keep
     # larger lossless context and strict output capacity from changing reminder
     # validation, generic extraction, or Microsoft file planners.
-    model_knowledge_action_extraction: str = FAST_LLM_MODEL
+    model_knowledge_action_extraction: str = PRODUCTION_LLM_MODEL
     timeout_knowledge_action_extraction: float = 24.0
     num_ctx_knowledge_action_extraction: int = 8192
     num_predict_knowledge_action_extraction: int | None = 2048
     temperature_knowledge_action_extraction: float = 0.0
 
-    model_knowledge_action_validation: str = CAPABLE_LLM_MODEL
-    model_knowledge_action_validation_fallback: str | None = FAST_LLM_MODEL
+    model_knowledge_action_validation: str = PRODUCTION_LLM_MODEL
+    model_knowledge_action_validation_fallback: str | None = None
     timeout_knowledge_action_validation: float = 45.0
-    num_ctx_knowledge_action_validation: int = 8192
+    num_ctx_knowledge_action_validation: int = 16384
     num_predict_knowledge_action_validation: int | None = 1024
     temperature_knowledge_action_validation: float = 0.0
     json_retry_count_knowledge_action_validation: int = 1
 
-    model_knowledge_content_finalization: str = CAPABLE_LLM_MODEL
-    model_knowledge_content_finalization_fallback: str | None = FAST_LLM_MODEL
+    model_knowledge_content_finalization: str = PRODUCTION_LLM_MODEL
+    model_knowledge_content_finalization_fallback: str | None = None
     timeout_knowledge_content_finalization: float = 90.0
-    num_ctx_knowledge_content_finalization: int = 12288
+    num_ctx_knowledge_content_finalization: int = 16384
     num_predict_knowledge_content_finalization: int | None = 2048
     temperature_knowledge_content_finalization: float = 0.0
 
     # Reminder mutation pipeline; the third LLM stage is reserved for MODIFY only.
     # Dedicated task settings keep its larger structured reminder payloads
     # isolated from generic extraction, knowledge mutation, and file generation.
-    model_reminder_action_extraction: str = FAST_LLM_MODEL
-    model_reminder_action_extraction_fallback: str | None = CAPABLE_LLM_MODEL
-    # The primary 4B call usually completes well below this ceiling; the same
-    # bound must also accommodate one 9B correction without timing out at the
-    # old 24-second edge observed on local CPU/GPU transitions.
+    model_reminder_action_extraction: str = PRODUCTION_LLM_MODEL
+    model_reminder_action_extraction_fallback: str | None = None
+    # The schema-first 2B call usually completes below this ceiling; one bounded
+    # same-model correction is allowed for malformed or invariant-invalid data.
     timeout_reminder_action_extraction: float = 36.0
     num_ctx_reminder_action_extraction: int = 8192
     num_predict_reminder_action_extraction: int | None = 2048
     temperature_reminder_action_extraction: float = 0.0
-    # One schema-constrained fast-model call. Hybrid fallback may make one
-    # additional capable-model call after a structural or semantic failure.
-    json_retry_count_reminder_action_extraction: int = 0
+    json_retry_count_reminder_action_extraction: int = 1
 
-    model_reminder_action_validation: str = CAPABLE_LLM_MODEL
-    model_reminder_action_validation_fallback: str | None = FAST_LLM_MODEL
+    model_reminder_action_validation: str = PRODUCTION_LLM_MODEL
+    model_reminder_action_validation_fallback: str | None = None
     timeout_reminder_action_validation: float = 45.0
-    num_ctx_reminder_action_validation: int = 12288
+    num_ctx_reminder_action_validation: int = 16384
     num_predict_reminder_action_validation: int | None = 1024
     temperature_reminder_action_validation: float = 0.0
     json_retry_count_reminder_action_validation: int = 1
 
-    model_reminder_content_finalization: str = CAPABLE_LLM_MODEL
-    model_reminder_content_finalization_fallback: str | None = FAST_LLM_MODEL
+    model_reminder_content_finalization: str = PRODUCTION_LLM_MODEL
+    model_reminder_content_finalization_fallback: str | None = None
     timeout_reminder_content_finalization: float = 90.0
-    num_ctx_reminder_content_finalization: int = 4096
+    num_ctx_reminder_content_finalization: int = 8192
     num_predict_reminder_content_finalization: int | None = 128
     temperature_reminder_content_finalization: float = 0.0
 
     # Task: GENERATE_CLARIFICATION
-    model_generate_clarification: str = FAST_LLM_MODEL
-    model_generate_clarification_fallback: str | None = FAST_LLM_MODEL
+    model_generate_clarification: str = PRODUCTION_LLM_MODEL
+    model_generate_clarification_fallback: str | None = None
     timeout_generate_clarification: float = 15.0
-    num_ctx_generate_clarification: int = 1536
+    num_ctx_generate_clarification: int = 4096
     num_predict_generate_clarification: int | None = 160
     temperature_generate_clarification: float = 0.0
     json_retry_count_generate_clarification: int = 1
 
     # Task: GENERATE_HUMAN_SUPPORTING
-    model_generate_human_supporting: str = FAST_LLM_MODEL
+    model_generate_human_supporting: str = PRODUCTION_LLM_MODEL
     timeout_generate_human_supporting: float = 15.0
-    num_ctx_generate_human_supporting: int = 2048
+    num_ctx_generate_human_supporting: int = 4096
     num_predict_generate_human_supporting: int | None = 160
     temperature_generate_human_supporting: float = 0.25
     json_retry_count_generate_human_supporting: int = 1
 
     # Task: CLARIFICATION_MERGE
-    model_clarification_merge: str = FAST_LLM_MODEL
+    model_clarification_merge: str = PRODUCTION_LLM_MODEL
     timeout_clarification_merge: float = 24.0
-    num_ctx_clarification_merge: int = 1536
+    num_ctx_clarification_merge: int = 4096
     num_predict_clarification_merge: int | None = 256
     temperature_clarification_merge: float = 0.0
     json_retry_count_clarification_merge: int = 1
 
     # Task: ANSWER
-    model_answer: str = CAPABLE_LLM_MODEL
-    model_answer_fallback: str | None = FAST_LLM_MODEL
+    model_answer: str = PRODUCTION_LLM_MODEL
+    model_answer_fallback: str | None = None
     timeout_answer: float = 75.0
-    num_ctx_answer: int = 4096
-    num_predict_answer: int | None = 1024
+    num_ctx_answer: int = 8192
+    num_predict_answer: int | None = 1536
     temperature_answer: float = 0.22
 
     # Task: WRITING
-    model_writing: str = CAPABLE_LLM_MODEL
-    model_writing_fallback: str | None = FAST_LLM_MODEL
-    timeout_writing: float = 90.0
-    num_ctx_writing: int = 4096
-    num_predict_writing: int | None = 1024
+    model_writing: str = PRODUCTION_LLM_MODEL
+    model_writing_fallback: str | None = None
+    timeout_writing: float = 120.0
+    num_ctx_writing: int = 8192
+    num_predict_writing: int | None = 2048
     temperature_writing: float = 0.38
 
     # Task: RISKY_ACTION
-    model_risky_action: str = FAST_LLM_MODEL
+    model_risky_action: str = PRODUCTION_LLM_MODEL
     timeout_risky_action: float = 35.0
-    num_ctx_risky_action: int = 1024
+    num_ctx_risky_action: int = 4096
     num_predict_risky_action: int | None = 192
     temperature_risky_action: float = 0.0
     json_retry_count_risky_action: int = 1
 
     # Task: RETRIEVAL_VALIDATION
-    model_retrieval_validation: str = CAPABLE_LLM_MODEL
-    model_retrieval_validation_fallback: str | None = FAST_LLM_MODEL
+    model_retrieval_validation: str = PRODUCTION_LLM_MODEL
+    model_retrieval_validation_fallback: str | None = None
     timeout_retrieval_validation: float = 35.0
-    num_ctx_retrieval_validation: int = 4096
+    num_ctx_retrieval_validation: int = 8192
     num_predict_retrieval_validation: int | None = 512
     temperature_retrieval_validation: float = 0.0
 
     # Task: GENERAL_SUB_BRANCH_DETECTION
-    model_general_sub_branch_detection: str = FAST_LLM_MODEL
+    model_general_sub_branch_detection: str = PRODUCTION_LLM_MODEL
     timeout_general_sub_branch_detection: float = 30.0
-    num_ctx_general_sub_branch_detection: int = 1024
+    num_ctx_general_sub_branch_detection: int = 2048
     num_predict_general_sub_branch_detection: int | None = 96
     temperature_general_sub_branch_detection: float = 0.0
 
     # Task: CONTENT_COMPOSER_REACT
-    model_content_composer_react: str = FAST_LLM_MODEL
+    model_content_composer_react: str = PRODUCTION_LLM_MODEL
     timeout_content_composer_react: float = 35.0
-    num_ctx_content_composer_react: int = 768
+    num_ctx_content_composer_react: int = 2048
     num_predict_content_composer_react: int | None = 160
     temperature_content_composer_react: float = 0.0
 
     # Task: ACTION_PLANNING
-    model_action_planning: str = CAPABLE_LLM_MODEL
-    model_action_planning_fallback: str | None = FAST_LLM_MODEL
+    model_action_planning: str = PRODUCTION_LLM_MODEL
+    model_action_planning_fallback: str | None = None
     timeout_action_planning: float = 35.0
-    num_ctx_action_planning: int = 2048
+    num_ctx_action_planning: int = 4096
     num_predict_action_planning: int | None = 256
     temperature_action_planning: float = 0.0
 
@@ -654,21 +652,36 @@ class ProductionSettings:
     general_purpose: GeneralPurposeSettings = field(default_factory=GeneralPurposeSettings)
 
     def __post_init__(self) -> None:
-        """Keep every production LLM route inside one warmed two-model pool."""
+        """Pin every production generative route to the one supported model."""
 
-        configured_models: list[str] = []
+        configured_routes: dict[str, str] = {}
+        missing_primary_routes: list[str] = []
         for field_info in fields(self.ollama):
             if not field_info.name.startswith("model_"):
                 continue
             model = str(getattr(self.ollama, field_info.name) or "").strip()
-            if model and model not in configured_models:
-                configured_models.append(model)
+            if not model:
+                if not field_info.name.endswith("_fallback"):
+                    missing_primary_routes.append(field_info.name)
+                continue
+            configured_routes[field_info.name] = model
 
-        if len(configured_models) > MAX_CONFIGURED_LLM_MODELS:
+        if missing_primary_routes:
             raise ValueError(
-                "Production may configure at most two generative LLM models; "
-                f"resolved {configured_models}. Reuse the fast/capable model pool "
-                "for every primary and fallback route."
+                "Every production generative route must use "
+                f"{PRODUCTION_LLM_MODEL}; missing primary routes: "
+                f"{missing_primary_routes}."
+            )
+
+        invalid_routes = {
+            name: model
+            for name, model in configured_routes.items()
+            if model != PRODUCTION_LLM_MODEL
+        }
+        if invalid_routes:
+            raise ValueError(
+                "Production supports only the qwen3.5:2b generative model; "
+                f"invalid routes: {invalid_routes}."
             )
 
         model_overrides = {
@@ -682,16 +695,15 @@ class ProductionSettings:
                 self.reminder_resolver.reminder_llm_rerank_model
             ),
         }
-        unwarmed_overrides = {
+        invalid_overrides = {
             name: str(model).strip()
             for name, model in model_overrides.items()
-            if model and str(model).strip() not in configured_models
+            if model and str(model).strip() != PRODUCTION_LLM_MODEL
         }
-        if unwarmed_overrides:
+        if invalid_overrides:
             raise ValueError(
-                "Per-call LLM model overrides must reuse the configured two-model "
-                f"warmup pool {configured_models}; invalid overrides: "
-                f"{unwarmed_overrides}."
+                "Per-call LLM overrides must use the production model "
+                f"{PRODUCTION_LLM_MODEL}; invalid overrides: {invalid_overrides}."
             )
 
     @classmethod
@@ -712,6 +724,7 @@ class ProductionSettings:
             ollama=OllamaSettings(
                 base_url=os.getenv("OLLAMA_BASE_URL", OllamaSettings.base_url),
                 structured_retry_count=_get_int("OLLAMA_STRUCTURED_RETRY_COUNT", OllamaSettings.structured_retry_count),
+                chat_retry_count=_get_int("OLLAMA_CHAT_RETRY_COUNT", OllamaSettings.chat_retry_count),
                 keep_alive=-1 if os.getenv("OLLAMA_KEEP_ALIVE", str(OllamaSettings.keep_alive)) == "-1" else os.getenv("OLLAMA_KEEP_ALIVE", OllamaSettings.keep_alive),
                 disable_thinking=_get_bool("OLLAMA_DISABLE_THINKING", OllamaSettings.disable_thinking),
                 preload_onnx_models=_get_bool("ASSISTANT_PRELOAD_ONNX_MODELS", OllamaSettings.preload_onnx_models),

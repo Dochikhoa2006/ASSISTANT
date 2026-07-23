@@ -43,9 +43,10 @@ To run the Streamlit web interface:
 
 Normal runtime uses these central defaults from `assistant_rag/settings.py`:
 
-* Fast structured work uses `qwen3.5:4b`: query rewrite, intent classification, action extraction, clarification, supporting-question generation, merge, risk checks, and sub-branch/composer detection.
-* Strong semantic and generative work uses `qwen3.5:9b`: Last-QA, final answers, long-form writing, mutation validation/finalization, retrieval validation, and action planning. These routes recover through `qwen3.5:4b` where supported.
-* Production validates every primary, fallback, and call-time override against this two-model pool. The hybrid Ollama/ONNX architecture remains available, but no ONNX LLM is routed or loaded by default. Before consolidation, these strong routes used `microsoft/Phi-4-mini-instruct-onnx`, which created a third resident LLM allocation.
+* Every generative task uses the exact Ollama tag `qwen3.5:2b`, including routing, extraction, Last-QA, final answers, writing, mutation validation/finalization, retrieval validation, and action planning.
+* Production rejects any different primary, fallback, environment, or call-time model override. Optional fallback fields are empty by default because pointing them to the same tag would not provide a real fallback.
+* Structured stages recover through one bounded, format-diversified retry on `qwen3.5:2b`; unstructured generation retries one transient failure on that same model. The hybrid Ollama/ONNX implementation remains available for compatibility tests, but production neither routes nor preloads an ONNX generative model.
+* Thinking is explicitly disabled. Qwen3.5-2B defaults to non-thinking mode, and keeping that mode explicit avoids hidden reasoning loops and makes schema-constrained output more predictable.
 * Embeddings: `BAAI/bge-m3`
 * Cross-encoder reranking: `BAAI/bge-reranker-v2-m3` (the embedding and reranker are retrieval models, not generative LLMs)
 
@@ -55,9 +56,9 @@ Runtime policy defaults:
 * Final answer temperature: `0.22`
 * Long-form writing temperature: `0.38`
 * Ollama idle retention: `5m`; override with `OLLAMA_KEEP_ALIVE` when a deployment deliberately trades RAM for fewer cold starts.
-* Timeouts: routing `12-30s`, extraction `24s`, validation/planning `35-45s`, answer `75s`, finalization/writing `90s`
-* Context windows: compact routing `768-2048`, extraction `1536-8192`, candidate validation `4096-12288`, answer/writing `4096`
-* Output caps (`num_predict`): compact routing `64-256`, validation `128-1024`, answer/writing `1024`, lossless knowledge content `2048`
+* Timeouts: routing `12-30s`, extraction `24-36s`, validation/planning `35-45s`, answer `75s`, finalization `90s`, writing `120s`
+* Context windows: compact routing `2048-4096`, extraction `4096-8192`, candidate validation `8192-16384`, answer/writing `8192`. These stay well below the model's native 256K window to bound KV-cache use while leaving room for system prompts, schemas, and runtime evidence.
+* Output caps (`num_predict`): compact routing `64-256`, validation `128-1024`, answer `1536`, writing/lossless knowledge content `2048`
 * Retrieval: BM25 `20`, Chroma `20`, RRF constant `40`, RRF candidates `15`, reranker min score `0.30`, final context `5`
 * Confidence floors: reranker `0.30`, conversation retrieval `0.50`
 * Last-QA: minimum `0.80`, clarification merge `0.84`, broad-retrieval skip `0.90`

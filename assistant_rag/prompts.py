@@ -1756,7 +1756,7 @@ def _default_templates() -> dict[str, PromptTemplate]:
                 "When true, answer_text is the complete final user-facing prose and must not assert, infer, or guess any unavailable personal fact, state, history, target, record, or side effect.",
                 "Return false when accuracy, composition, targeting, retrieval, or execution needs any fact, state, history, or record from an unavailable domain; answer_text must then be empty.",
                 "Evaluate compound writing, file, and delivery requests as a whole; one dependent part makes the complete request non-independent.",
-                "Make an independent capable-model decision; do not assume another classifier's decision.",
+                "Make an independent answerability decision; do not assume another classifier's decision.",
                 "When uncertain, return false.",
             ),
             safety_rules=_answer_safety_rules(),

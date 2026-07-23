@@ -152,6 +152,10 @@ class StructuredOutputInvariantError(ValueError):
     """A schema-valid data object violated a caller-owned safe invariant."""
 
 
+class UnconfiguredModelError(ValueError):
+    """A call attempted to bypass the configured model allowlist."""
+
+
 def is_structured_fallback(payload: Any) -> bool:
     """Return whether a structured result is terminal recovery, not model data."""
 
@@ -197,7 +201,7 @@ class OllamaLLMClient:
     last_invariant_error_by_task: dict[LLMTask, str] = field(default_factory=dict)
 
     def warmup_models(self) -> list[str]:
-        """Ask Ollama to load every configured local model and keep it resident."""
+        """Ask Ollama to load each configured local model and keep it resident."""
         models: list[str] = []
         for field_info in fields(self.settings):
             if not field_info.name.startswith("model_"):
@@ -357,20 +361,33 @@ class OllamaLLMClient:
 
     def chat(self, *, task: LLMTask, system_prompt: str, user_prompt: str) -> str:
         with StageTimer(llm_trace_stage_name_for_prompt(task, user_prompt)):
-            try:
-                response = self._chat_raw(
-                    task=task,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    format_schema=None,
-                )
-            except Exception as exc:
-                fallback_model = self._fallback_model_for_task(task)
-                primary_model = self.router.model_for_task(task)
-                if not fallback_model or fallback_model == primary_model:
-                    GLOBAL_METRICS.increment("llm_failures_total", task=task.value)
-                    self.last_error_by_task[task] = str(exc)
-                    raise
+            primary_model = self.router.model_for_task(task)
+            primary_error: Exception | None = None
+            primary_attempts = max(0, int(self.settings.chat_retry_count)) + 1
+            primary_attempts_made = 0
+            for attempt_index in range(1, primary_attempts + 1):
+                primary_attempts_made = attempt_index
+                try:
+                    response = self._chat_raw(
+                        task=task,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        format_schema=None,
+                        attempt_index=attempt_index,
+                        total_attempts=primary_attempts,
+                        attempt_mode="chat",
+                    )
+                    self.last_error_by_task.pop(task, None)
+                    return response
+                except Exception as exc:
+                    primary_error = exc
+                    # Configuration/model-policy errors are deterministic; a
+                    # second identical request cannot repair them.
+                    if isinstance(exc, UnconfiguredModelError):
+                        break
+
+            fallback_model = self._fallback_model_for_task(task)
+            if fallback_model and fallback_model != primary_model:
                 try:
                     response = self._chat_raw(
                         task=task,
@@ -380,15 +397,30 @@ class OllamaLLMClient:
                         model_override=fallback_model,
                         fallback_for=primary_model,
                     )
+                    self.last_error_by_task.pop(task, None)
+                    return response
                 except Exception as fallback_exc:
                     GLOBAL_METRICS.increment("llm_failures_total", task=task.value)
                     self.last_error_by_task[task] = (
-                        f"{primary_model} failed: {exc}; fallback {fallback_model} failed: {fallback_exc}"
+                        f"{primary_model} failed after {primary_attempts_made} attempt(s): "
+                        f"{primary_error}; fallback {fallback_model} failed: {fallback_exc}"
                     )
-                    logger.error("Severe failure: LLM chat failed for task %s on both primary (%s) and fallback (%s). Errors: %s, %s", task.value, primary_model, fallback_model, exc, fallback_exc)
+                    logger.error(
+                        "Severe failure: LLM chat failed for task %s on primary (%s) "
+                        "and fallback (%s). Errors: %s, %s",
+                        task.value,
+                        primary_model,
+                        fallback_model,
+                        primary_error,
+                        fallback_exc,
+                    )
                     raise
-            self.last_error_by_task.pop(task, None)
-            return response
+
+            GLOBAL_METRICS.increment("llm_failures_total", task=task.value)
+            self.last_error_by_task[task] = str(primary_error)
+            if primary_error is None:  # pragma: no cover - defensive invariant
+                raise RuntimeError(f"LLM chat failed without an error for task {task.value}")
+            raise primary_error
 
     def list_models(self) -> list[str]:
         payload = self._get_json("/api/tags")
@@ -439,6 +471,12 @@ class OllamaLLMClient:
     ) -> str:
         decision = self.router.decision_for_task(task)
         model = model_override or decision.model
+        configured_models = set(self._configured_models().values())
+        if model not in configured_models:
+            raise UnconfiguredModelError(
+                f"Model override {model!r} is not one of the configured routes: "
+                f"{sorted(configured_models)}"
+            )
         attempt_suffix = ""
         if attempt_index is not None and total_attempts is not None:
             mode_text = f", mode: {attempt_mode}" if attempt_mode else ""

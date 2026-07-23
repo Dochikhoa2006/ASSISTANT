@@ -18,7 +18,7 @@ from assistant_rag.llm import (
 )
 from assistant_rag.observability import start_trace
 from assistant_rag.prompts import REMINDER_ACTION_EXTRACTION_SCHEMA
-from assistant_rag.settings import CAPABLE_LLM_MODEL, FAST_LLM_MODEL, OllamaSettings
+from assistant_rag.settings import OllamaSettings, PRODUCTION_LLM_MODEL
 
 
 def test_structured_normalization_is_lossless_and_schema_authorized() -> None:
@@ -173,7 +173,7 @@ def test_reminder_extraction_valid_first_result_uses_one_schema_attempt() -> Non
     assert calls[0]["attempt_mode"] == "schema"
     assert calls[0]["format_schema"] == REMINDER_ACTION_EXTRACTION_SCHEMA
     assert calls[0]["attempt_index"] == 1
-    assert calls[0]["total_attempts"] == 1
+    assert calls[0]["total_attempts"] == 2
     assert "previous output was invalid" not in calls[0]["user_prompt"]
     assert "native JSON Schema" in calls[0]["user_prompt"]
     assert "exactly this shape" not in calls[0]["user_prompt"]
@@ -211,9 +211,9 @@ def test_reminder_extraction_does_not_coerce_legacy_field_value_objects() -> Non
         validate_json_schema(normalized, REMINDER_ACTION_EXTRACTION_SCHEMA)
 
 
-def test_reminder_extraction_invariant_failure_recovers_once_with_capable_model() -> None:
+def test_reminder_extraction_invariant_failure_recovers_once_on_same_model() -> None:
     settings = OllamaSettings()
-    assert settings.json_retry_count_reminder_action_extraction == 0
+    assert settings.json_retry_count_reminder_action_extraction == 1
     ollama = OllamaLLMClient(
         settings=settings,
         router=OllamaModelRouter(settings),
@@ -224,7 +224,7 @@ def test_reminder_extraction_invariant_failure_recovers_once_with_capable_model(
     def scripted_chat_raw(self: OllamaLLMClient, **kwargs: Any) -> str:
         del self
         calls.append(kwargs)
-        if kwargs.get("fallback_for"):
+        if len(calls) > 1:
             return (
                 '{"action":"add","retrieval_text":"submit the expense report",'
                 '"field_values":{"subject":"Submit the expense report",'
@@ -262,17 +262,16 @@ def test_reminder_extraction_invariant_failure_recovers_once_with_capable_model(
     assert validations == ["", "submit the expense report"]
     assert len(calls) == 2
     assert [call["attempt_mode"] for call in calls] == ["schema", "schema"]
-    assert [call["total_attempts"] for call in calls] == [1, 1]
-    assert calls[0]["model_override"] is None
-    assert calls[1]["model_override"] == CAPABLE_LLM_MODEL
-    assert calls[1]["fallback_for"] == FAST_LLM_MODEL
+    assert [call["total_attempts"] for call in calls] == [2, 2]
+    assert all(call.get("model_override") is None for call in calls)
+    assert all(call["fallback_for"] is None for call in calls)
     assert "retrieval_text must be grounded" in calls[1]["user_prompt"]
     assert LLMTask.REMINDER_ACTION_EXTRACTION not in ollama.last_error_by_task
 
 
-@pytest.mark.parametrize("fallback_succeeds", (True, False))
-def test_last_qa_cross_model_recovery_is_one_json_then_one_schema_attempt(
-    fallback_succeeds: bool,
+@pytest.mark.parametrize("second_attempt_succeeds", (True, False))
+def test_last_qa_same_model_recovery_is_one_json_then_one_schema_attempt(
+    second_attempt_succeeds: bool,
 ) -> None:
     settings = OllamaSettings()
     ollama = OllamaLLMClient(
@@ -284,7 +283,7 @@ def test_last_qa_cross_model_recovery_is_one_json_then_one_schema_attempt(
     def scripted_chat_raw(self: OllamaLLMClient, **kwargs: Any) -> str:
         del self
         calls.append(kwargs)
-        if kwargs.get("fallback_for") and fallback_succeeds:
+        if len(calls) > 1 and second_attempt_succeeds:
             return '{"relationship":"normal_follow_up","confidence":0.96}'
         return "not-json"
 
@@ -312,10 +311,9 @@ def test_last_qa_cross_model_recovery_is_one_json_then_one_schema_attempt(
 
     assert len(calls) == 2
     assert [call["attempt_mode"] for call in calls] == ["json", "schema"]
-    assert calls[0]["model_override"] is None
-    assert calls[1]["model_override"] == settings.model_last_qa_fallback
-    assert calls[1]["fallback_for"] == settings.model_last_qa
-    if fallback_succeeds:
+    assert all(call["model_override"] is None for call in calls)
+    assert all(call["fallback_for"] is None for call in calls)
+    if second_attempt_succeeds:
         assert payload == {
             "relationship": "normal_follow_up",
             "confidence": 0.96,
@@ -327,6 +325,46 @@ def test_last_qa_cross_model_recovery_is_one_json_then_one_schema_attempt(
             "relationship": "unrelated_or_uncertain",
             "confidence": 0.0,
         }
+
+
+def test_unstructured_chat_retries_once_on_the_same_model() -> None:
+    settings = OllamaSettings()
+    ollama = OllamaLLMClient(settings, OllamaModelRouter(settings))
+    calls: list[dict[str, Any]] = []
+
+    def scripted_chat_raw(self: OllamaLLMClient, **kwargs: Any) -> str:
+        del self
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise ConnectionError("synthetic transient Ollama failure")
+        return "recovered response"
+
+    ollama._chat_raw = MethodType(scripted_chat_raw, ollama)  # type: ignore[method-assign]
+
+    assert ollama.chat(
+        task=LLMTask.ANSWER,
+        system_prompt="system",
+        user_prompt="user",
+    ) == "recovered response"
+    assert len(calls) == 2
+    assert [call["attempt_index"] for call in calls] == [1, 2]
+    assert all(call["total_attempts"] == 2 for call in calls)
+    assert all(call.get("model_override") is None for call in calls)
+    assert LLMTask.ANSWER not in ollama.last_error_by_task
+
+
+def test_ollama_request_rejects_an_unconfigured_model_override() -> None:
+    settings = OllamaSettings()
+    ollama = OllamaLLMClient(settings, OllamaModelRouter(settings))
+
+    with pytest.raises(ValueError, match="not one of the configured routes"):
+        ollama._chat_raw(
+            task=LLMTask.ANSWER,
+            system_prompt="system",
+            user_prompt="user",
+            format_schema=None,
+            model_override="other-model:latest",
+        )
 
 
 class _Router:
@@ -342,7 +380,8 @@ class _FallbackOllama:
         self.calls: list[dict[str, Any]] = []
 
     def _fallback_model_for_task(self, task: LLMTask) -> str | None:
-        return getattr(self.settings, f"model_{task.value}_fallback", None)
+        del task
+        return PRODUCTION_LLM_MODEL
 
     def generate_json(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(kwargs)
@@ -387,28 +426,18 @@ def test_hybrid_recovers_onnx_finalization_through_configured_ollama_model() -> 
     assert len(ollama.calls) == 1
     assert (
         ollama.calls[0]["model_override"]
-        == OllamaSettings.model_knowledge_content_finalization_fallback
+        == PRODUCTION_LLM_MODEL
     )
     assert LLMTask.KNOWLEDGE_CONTENT_FINALIZATION not in onnx.last_error_by_task
 
 
-def test_every_capable_task_has_fast_cross_model_recovery() -> None:
+def test_every_production_task_uses_qwen_and_has_no_duplicate_fallback() -> None:
     settings = OllamaSettings()
-    for task in (
-        LLMTask.LAST_QA,
-        LLMTask.KNOWLEDGE_ACTION_VALIDATION,
-        LLMTask.KNOWLEDGE_CONTENT_FINALIZATION,
-        LLMTask.REMINDER_ACTION_VALIDATION,
-        LLMTask.REMINDER_CONTENT_FINALIZATION,
-        LLMTask.ANSWER,
-        LLMTask.WRITING,
-        LLMTask.RETRIEVAL_VALIDATION,
-        LLMTask.ACTION_PLANNING,
-    ):
+    for task in LLMTask:
         primary = getattr(settings, f"model_{task.value}")
-        fallback = getattr(settings, f"model_{task.value}_fallback")
-        assert primary == CAPABLE_LLM_MODEL
-        assert fallback == FAST_LLM_MODEL
+        fallback = getattr(settings, f"model_{task.value}_fallback", None)
+        assert primary == PRODUCTION_LLM_MODEL
+        assert fallback is None
 
 
 class _FailingChatOnnx:
@@ -429,7 +458,7 @@ class _FallbackChatOllama:
         self.calls: list[dict[str, Any]] = []
 
     def _fallback_model_for_task(self, _task: LLMTask) -> str:
-        return "qwen3.5:4b"
+        return PRODUCTION_LLM_MODEL
 
     def _chat_raw(self, **kwargs: Any) -> str:
         self.calls.append(kwargs)
